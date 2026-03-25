@@ -20,9 +20,7 @@
 #include <cstdio>
 #include <cstring>
 #include <fstream>
-#include <functional>
 #include <map>
-#include <numeric>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -119,8 +117,8 @@ struct sam3_vit_block {
 };
 
 struct sam3_vit {
-    struct ggml_tensor * patch_embed_w = nullptr;  // [embed, 3, patch, patch]
-    struct ggml_tensor * pos_embed     = nullptr;  // [1, H, W, embed]
+    struct ggml_tensor * patch_embed_w = nullptr;  // [patch, patch, 3, embed] (ggml conv kernel)
+    struct ggml_tensor * pos_embed     = nullptr;  // [embed, 24, 24, 1] (pretrained res, tiled at runtime)
     struct ggml_tensor * ln_pre_w      = nullptr;
     struct ggml_tensor * ln_pre_b      = nullptr;
     std::vector<sam3_vit_block> blocks;
@@ -522,10 +520,10 @@ struct sam3_model {
 struct sam3_state {
     // cached backbone outputs
     struct ggml_tensor * vit_output     = nullptr;   // [1, embed, H, W]
-    struct ggml_tensor * neck_det[3]    = {};         // FPN levels (det path)
-    struct ggml_tensor * neck_trk[3]    = {};         // FPN levels (trk path)
-    struct ggml_tensor * neck_det_pe[3] = {};         // sinusoidal PE
-    struct ggml_tensor * neck_trk_pe[3] = {};
+    struct ggml_tensor * neck_det[4]    = {};         // FPN levels (det path)
+    struct ggml_tensor * neck_trk[4]    = {};         // FPN levels (trk path)
+    struct ggml_tensor * neck_det_pe[4] = {};         // sinusoidal PE
+    struct ggml_tensor * neck_trk_pe[4] = {};
 
     int orig_width  = 0;
     int orig_height = 0;
@@ -534,6 +532,10 @@ struct sam3_state {
     ggml_backend_t            backend = nullptr;
     ggml_backend_buffer_t     buffer  = nullptr;
     struct ggml_gallocr     * galloc  = nullptr;
+
+    // PE buffer: holds sinusoidal PE tensors for neck outputs
+    struct ggml_context     * pe_ctx  = nullptr;
+    ggml_backend_buffer_t     pe_buf  = nullptr;
 };
 
 // ── Video tracker state ──────────────────────────────────────────────────────
@@ -596,7 +598,9 @@ static struct ggml_tensor * sam3_layer_norm_2d(struct ggml_context * ctx,
 // ═══════════════════════════════════════════════════════════════════════════════
 
 static void sam3_graph_compute(ggml_backend_t backend, struct ggml_cgraph * graph, int n_threads) {
-    ggml_backend_cpu_set_n_threads(backend, n_threads);
+    if (ggml_backend_is_cpu(backend)) {
+        ggml_backend_cpu_set_n_threads(backend, n_threads);
+    }
     ggml_backend_graph_compute(backend, graph);
 }
 
@@ -1240,8 +1244,13 @@ static void sam3_register_tensors(sam3_model & model) {
     model.vit.blocks.resize(hp.vit_depth);
 
     model.vit.patch_embed_w = T4("vit.patch_embed.proj.weight", hp.patch_size, hp.patch_size, 3, E);
-    // pos_embed: pretrained [1, 577, 1024] but stored as-is; will be interpolated at runtime if needed
-    model.vit.pos_embed     = T3f("vit.pos_embed", E, 577, 1);
+    // pos_embed: Hiera stores [1, 24, 24, 1024] at pretrained resolution (no cls token).
+    // Conversion script writes reversed dims → ggml [E, 24, 24, 1].
+    // Tiled 3x at runtime to [E, 72, 72, 1].
+    {
+        const int pretrained_grid = hp.img_size / hp.patch_size / 3;  // 1008/14/3 = 24
+        model.vit.pos_embed = T4f("vit.pos_embed", E, pretrained_grid, pretrained_grid, 1);
+    }
     model.vit.ln_pre_w      = T1f("vit.ln_pre.weight", E);
     model.vit.ln_pre_b      = T1f("vit.ln_pre.bias", E);
 
@@ -2047,6 +2056,14 @@ void sam3_free_state(sam3_state & state) {
         ggml_backend_buffer_free(state.buffer);
         state.buffer = nullptr;
     }
+    if (state.pe_buf) {
+        ggml_backend_buffer_free(state.pe_buf);
+        state.pe_buf = nullptr;
+    }
+    if (state.pe_ctx) {
+        ggml_free(state.pe_ctx);
+        state.pe_ctx = nullptr;
+    }
     if (state.ctx) {
         ggml_free(state.ctx);
         state.ctx = nullptr;
@@ -2133,14 +2150,15 @@ static void sam3_compute_axial_cis(float * out,
     // Compute frequency bases: 1.0 / (theta ^ (arange(0,dim,4)[:dim//4] / dim))
     std::vector<float> freqs(half_dim);
     for (int i = 0; i < half_dim; ++i) {
-        freqs[i] = 1.0f / powf(theta, (float)(i * 4) / dim);
+        freqs[i] = 1.0f / powf(theta, (float)(i * 4) / (float)dim);
     }
 
     // For each spatial position, compute axial frequencies
     const int N = end_x * end_y;
     for (int idx = 0; idx < N; ++idx) {
         float t_x = (float)(idx % end_x) * scale_pos;
-        float t_y = (float)(idx / end_x) * scale_pos;
+        int row = idx / end_x;  // intentional integer floor division (row index)
+        float t_y = (float)row * scale_pos;
 
         // X frequencies → first 16 complex values (stored as cos, sin)
         for (int i = 0; i < half_dim; ++i) {
@@ -2161,8 +2179,11 @@ static void sam3_compute_axial_cis(float * out,
 //  Sinusoidal 2D positional encoding (for FPN neck outputs)
 // ═══════════════════════════════════════════════════════════════════════════════
 
-// Generates [d_model, H, W] sinusoidal PE matching PositionEmbeddingSine from Python.
-// num_pos_feats = d_model / 2 = 128, temperature = 10000, normalize = true, scale = 2π.
+// Generates sinusoidal PE matching PositionEmbeddingSine from Python.
+// num_pos_feats = d_model / 2 = 128, temperature = 10000, normalize = true, scale = 2pi.
+// Returns data in ggml column-major layout for a tensor with ne = {d_model, W, H, 1},
+// i.e. element (c, w, h) at flat index c + w*d_model + h*d_model*W.
+// First half channels (0..half-1) encode y, second half (half..d_model-1) encode x.
 static std::vector<float> sam3_sinusoidal_pe_2d(int H, int W, int d_model) {
     const int half = d_model / 2;  // 128
     const float scale = 2.0f * (float)M_PI;
@@ -2177,7 +2198,8 @@ static std::vector<float> sam3_sinusoidal_pe_2d(int H, int W, int d_model) {
             float pos_x = ((float)(x + 1) / (float)(W)) * scale;
 
             for (int i = 0; i < half; ++i) {
-                float dim_t = powf(temperature, 2.0f * (float)(i / 2) / (float)half);
+                int paired = i & ~1;  // 0,0,2,2,4,4,… (pairs sin/cos channels, matches Python // 2)
+                float dim_t = powf(temperature, (float)paired / (float)half);
 
                 float val_x, val_y;
                 if (i % 2 == 0) {
@@ -2188,9 +2210,11 @@ static std::vector<float> sam3_sinusoidal_pe_2d(int H, int W, int d_model) {
                     val_y = cosf(pos_y / dim_t);
                 }
 
-                // Layout: [d_model, H, W] — first half channels are y, second half are x
-                pe[(i)       * H * W + y * W + x] = val_y;
-                pe[(i + half) * H * W + y * W + x] = val_x;
+                // ggml layout: ne = {d_model, W, H, 1}
+                // element (c, x, y, 0) at flat index: c + x*d_model + y*d_model*W
+                // First half channels are y, second half are x.
+                pe[(i)       + x * d_model + y * d_model * W] = val_y;
+                pe[(i + half) + x * d_model + y * d_model * W] = val_x;
             }
         }
     }
@@ -2233,17 +2257,20 @@ static struct ggml_tensor * sam3_apply_rope(struct ggml_context * ctx,
     // freqs_cis: [2, 32, N] → [2, half, N, 1] for broadcast
     auto * fc = ggml_reshape_4d(ctx, freqs_cis, 2, half, N, 1);
 
-    // Extract cos (offset 0) and sin (offset 1) from dim0
+    // Extract cos (offset 0) and sin (offset 1) from dim0.
+    // fc is [2, half, N, 1] — to slice dim0 we keep strides of dims 1,2,3
+    // as nb1,nb2,nb3 of the view, so the view walks over (half, N, 1) correctly.
     auto * cos_f = ggml_view_4d(ctx, fc, 1, half, N, 1,
-                                 fc->nb[0], fc->nb[1], fc->nb[2], 0);
+                                 fc->nb[1], fc->nb[2], fc->nb[3], 0);
     auto * sin_f = ggml_view_4d(ctx, fc, 1, half, N, 1,
-                                 fc->nb[0], fc->nb[1], fc->nb[2], fc->nb[0]);
+                                 fc->nb[1], fc->nb[2], fc->nb[3], fc->nb[0]);
 
-    // Extract x_re (offset 0) and x_im (offset 1) from dim0
+    // Extract x_re (offset 0) and x_im (offset 1) from dim0.
+    // x_pairs is [2, half, N, nheads_B] — same slicing logic.
     auto * x_re = ggml_view_4d(ctx, x_pairs, 1, half, N, nheads_B,
-                                x_pairs->nb[0], x_pairs->nb[1], x_pairs->nb[2], 0);
+                                x_pairs->nb[1], x_pairs->nb[2], x_pairs->nb[3], 0);
     auto * x_im = ggml_view_4d(ctx, x_pairs, 1, half, N, nheads_B,
-                                x_pairs->nb[0], x_pairs->nb[1], x_pairs->nb[2], x_pairs->nb[0]);
+                                x_pairs->nb[1], x_pairs->nb[2], x_pairs->nb[3], x_pairs->nb[0]);
 
     // Complex multiply: (x_re + j*x_im) * (cos + j*sin)
     auto * out_re = ggml_sub(ctx, ggml_mul(ctx, x_re, cos_f), ggml_mul(ctx, x_im, sin_f));
@@ -2293,10 +2320,10 @@ static struct ggml_tensor * sam3_vit_block_forward(struct ggml_context * ctx,
         // cur: [3*E, W_cur, H_cur, B_cur]
 
         // Reshape and permute to separate Q, K, V (following sam.cpp pattern)
-        // [3*E, W*H, B_cur] → [E, 3, W*H, B_cur] → permute(0,3,1,2) → [E, B_cur, 3, W*H]
+        // [3*E, W*H, B_cur] → [E, 3, W*H, B_cur] → permute(0,3,1,2) → [E, W*H, B_cur, 3]
         cur = ggml_reshape_4d(ctx, cur, E, 3, W_cur * H_cur, B_cur);
         cur = ggml_cont(ctx, ggml_permute(ctx, cur, 0, 3, 1, 2));
-        // cur: [E, B_cur, 3, W*H]
+        // cur: [E, W*H, B_cur, 3]  (ne[3]=3 separates Q/K/V)
 
         auto * Q = ggml_view_3d(ctx, cur, E, W_cur * H_cur, B_cur,
                                  cur->nb[1], cur->nb[2], 0);
@@ -2390,19 +2417,12 @@ static struct ggml_tensor * sam3_build_vit_graph(struct ggml_context * ctx,
     x = ggml_cont(ctx, ggml_permute(ctx, x, 1, 2, 0, 3));
 
     // ── Positional embedding (tiled) ──────────────────────────────────────
-    // pos_embed: [E, 577, 1] (pretrained 24×24 + 1 cls token)
-    // Skip cls token, reshape to [E, 24, 24, 1], tile 3× to get [E, 72, 72, 1]
-    auto * pos_full = model.vit.pos_embed;  // [E, 577, 1]
-    auto * pos_spatial = ggml_view_3d(ctx, pos_full, E, 576, 1,
-                                       pos_full->nb[1], pos_full->nb[2],
-                                       E * ggml_element_size(pos_full));
-    pos_spatial = ggml_cont(ctx, pos_spatial);
-
-    // Reshape to [E, 24, 24, 1]
-    auto * pos_2d = ggml_reshape_4d(ctx, pos_spatial, E, 24, 24, 1);
+    // pos_embed: [E, 24, 24, 1] — Hiera pretrained resolution, no cls token.
+    // Tile 3x3 to match [E, 72, 72, 1].
+    auto * pos_2d = model.vit.pos_embed;  // [E, 24, 24, 1]
 
     // Tile 3×3 using ggml_repeat to match [E, 72, 72, 1]
-    auto * pos_target = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, E, 72, 72, 1);
+    auto * pos_target = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, E, W, H, 1);
     auto * pos_tiled = ggml_repeat(ctx, pos_2d, pos_target);
 
     x = ggml_add(ctx, x, pos_tiled);
@@ -2450,7 +2470,7 @@ static void sam3_build_neck_graph(struct ggml_context * ctx,
     {
         auto * s0 = ggml_conv_transpose_2d_p0(ctx, neck.scales[0].deconv1_w, x, 2);
         s0 = add_bias(s0, neck.scales[0].deconv1_b);
-        s0 = ggml_gelu(ctx, s0);
+        s0 = ggml_gelu_erf(ctx, s0);
         s0 = ggml_conv_transpose_2d_p0(ctx, neck.scales[0].deconv2_w, s0, 2);
         s0 = add_bias(s0, neck.scales[0].deconv2_b);
         s0 = ggml_conv_2d_sk_p0(ctx, neck.scales[0].conv1x1_w, s0);
@@ -2603,13 +2623,69 @@ bool sam3_encode_image(sam3_state       & state,
     state.vit_output = vit_out;
 
     // Store neck outputs
-    for (int i = 0; i < 3; ++i) {
+    for (int i = 0; i < 4; ++i) {
         state.neck_det[i] = neck_det_out[i];
         state.neck_trk[i] = neck_trk_out[i];
     }
 
-    // Compute sinusoidal PEs for each neck scale
-    // TODO: these should be precomputed and stored, not recomputed each time
+    // Compute sinusoidal PEs for each neck scale.
+    // Neck output layout is [C, W, H, B] where C=neck_dim=256.
+    // Allocate a separate ggml context + backend buffer for PEs so they
+    // survive independently of the graph allocator.
+    {
+        const int neck_dim = hp.neck_dim;  // 256
+        const int scale_sizes[4] = {
+            hp.n_img_embd() * 4,   // 288
+            hp.n_img_embd() * 2,   // 144
+            hp.n_img_embd(),       //  72
+            hp.n_img_embd() / 2,   //  36
+        };
+
+        // Compute total bytes needed for all 4 PE tensors
+        size_t pe_total = 0;
+        for (int i = 0; i < 4; ++i) {
+            pe_total += (size_t)neck_dim * scale_sizes[i] * scale_sizes[i] * sizeof(float);
+        }
+
+        // Free previous PE resources if re-encoding
+        if (state.pe_buf) { ggml_backend_buffer_free(state.pe_buf); state.pe_buf = nullptr; }
+        if (state.pe_ctx) { ggml_free(state.pe_ctx);                state.pe_ctx = nullptr; }
+
+        // Create a ggml context for PE tensor metadata (4 tensors + overhead)
+        struct ggml_init_params pe_params = {
+            /*.mem_size   =*/ ggml_tensor_overhead() * 4 + 256,
+            /*.mem_buffer =*/ nullptr,
+            /*.no_alloc   =*/ true,
+        };
+        state.pe_ctx = ggml_init(pe_params);
+
+        // Create tensor descriptors
+        struct ggml_tensor * pe_tensors[4];
+        for (int i = 0; i < 4; ++i) {
+            const int S = scale_sizes[i];
+            pe_tensors[i] = ggml_new_tensor_4d(state.pe_ctx, GGML_TYPE_F32, neck_dim, S, S, 1);
+            char name[64];
+            snprintf(name, sizeof(name), "pe_%d", i);
+            ggml_set_name(pe_tensors[i], name);
+        }
+
+        // Allocate a single backend buffer and assign tensors
+        state.pe_buf = ggml_backend_alloc_ctx_tensors(state.pe_ctx, model.backend);
+        if (!state.pe_buf) {
+            fprintf(stderr, "%s: failed to allocate PE buffer\n", __func__);
+        } else {
+            // Upload PE data
+            for (int i = 0; i < 4; ++i) {
+                const int S = scale_sizes[i];
+                auto pe_data = sam3_sinusoidal_pe_2d(S, S, neck_dim);
+                ggml_backend_tensor_set(pe_tensors[i], pe_data.data(), 0, pe_data.size() * sizeof(float));
+
+                state.neck_det_pe[i] = pe_tensors[i];
+                // Tracker shares the same spatial dimensions → same PE
+                state.neck_trk_pe[i] = pe_tensors[i];
+            }
+        }
+    }
 
     fprintf(stderr, "%s: image encoded successfully\n", __func__);
     return true;
