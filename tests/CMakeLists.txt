@@ -12,3 +12,6 @@ target_link_libraries(test_phase5 PRIVATE sam3)
 
 add_executable(test_phase3 test_phase3.cpp)
 target_link_libraries(test_phase3 PRIVATE sam3)
+
+add_executable(test_phase4 test_phase4.cpp)
+target_link_libraries(test_phase4 PRIVATE sam3)

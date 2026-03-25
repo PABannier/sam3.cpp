@@ -485,6 +485,7 @@ struct sam3_bpe_tokenizer {
 
 struct sam3_model {
     sam3_hparams hparams;
+    ggml_type weight_type = GGML_TYPE_F16;
 
     sam3_vit vit;
     sam3_neck neck_det;
@@ -621,6 +622,15 @@ static void sam3_graph_compute(ggml_backend_t backend, struct ggml_cgraph* graph
         ggml_backend_cpu_set_n_threads(backend, n_threads);
     }
     ggml_backend_graph_compute(backend, graph);
+}
+
+static void sam3_name_tensorf(struct ggml_tensor * t, const char * fmt, int index) {
+    if (!t) {
+        return;
+    }
+    char name[64];
+    snprintf(name, sizeof(name), fmt, index);
+    ggml_set_name(t, name);
 }
 
 static struct ggml_tensor* sam3_layer_norm(struct ggml_context* ctx,
@@ -1236,20 +1246,22 @@ static void sam3_register_tensors(sam3_model& model) {
         tensors[name] = t;
         return t;
     };
+    const ggml_type WTYPE = model.weight_type;
+
     auto T2 = [&](const std::string& name, int64_t d0, int64_t d1) -> ggml_tensor* {
-        auto* t = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, d0, d1);
+        auto* t = ggml_new_tensor_2d(ctx, WTYPE, d0, d1);
         ggml_set_name(t, name.c_str());
         tensors[name] = t;
         return t;
     };
     auto T3 = [&](const std::string& name, int64_t d0, int64_t d1, int64_t d2) -> ggml_tensor* {
-        auto* t = ggml_new_tensor_3d(ctx, GGML_TYPE_F16, d0, d1, d2);
+        auto* t = ggml_new_tensor_3d(ctx, WTYPE, d0, d1, d2);
         ggml_set_name(t, name.c_str());
         tensors[name] = t;
         return t;
     };
     auto T4 = [&](const std::string& name, int64_t d0, int64_t d1, int64_t d2, int64_t d3) -> ggml_tensor* {
-        auto* t = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, d0, d1, d2, d3);
+        auto* t = ggml_new_tensor_4d(ctx, WTYPE, d0, d1, d2, d3);
         ggml_set_name(t, name.c_str());
         tensors[name] = t;
         return t;
@@ -1964,6 +1976,7 @@ std::shared_ptr<sam3_model> sam3_load_model(const sam3_params& params) {
             __func__, version, ftype, n_tensors);
 
     auto model = std::make_shared<sam3_model>();
+    model->weight_type = (ftype == 0) ? GGML_TYPE_F32 : GGML_TYPE_F16;
 
     // ── Read hyperparameters ─────────────────────────────────────────────
     if (!sam3_load_hparams(fin, model->hparams)) {
@@ -2586,7 +2599,8 @@ static struct ggml_tensor* sam3_text_block_forward(struct ggml_context* ctx,
                                                    struct ggml_tensor* x,
                                                    const sam3_text_block& blk,
                                                    const sam3_hparams& hp,
-                                                   struct ggml_tensor* causal_mask) {
+                                                   struct ggml_tensor* causal_mask,
+                                                   int block_idx) {
     const int E = hp.text_width;   // 1024
     const int NH = hp.text_heads;  // 16
     const int HD = E / NH;         // 64
@@ -2597,10 +2611,12 @@ static struct ggml_tensor* sam3_text_block_forward(struct ggml_context* ctx,
 
     // Pre-norm
     x = sam3_layer_norm(ctx, x, blk.ln1_w, blk.ln1_b);
+    sam3_name_tensorf(x, "text_block_%02d_after_ln1", block_idx);
 
     // QKV projection: [E, L] → [3*E, L]
     auto* qkv = ggml_mul_mat(ctx, blk.attn_in_proj_w, x);
     qkv = ggml_add(ctx, qkv, blk.attn_in_proj_b);
+    sam3_name_tensorf(qkv, "text_block_%02d_qkv", block_idx);
 
     // Split Q, K, V: reshape [3*E, L] → [E, 3, L] → permute → [E, L, 3]
     qkv = ggml_reshape_3d(ctx, qkv, E, 3, L);
@@ -2643,20 +2659,25 @@ static struct ggml_tensor* sam3_text_block_forward(struct ggml_context* ctx,
     if (blk.ls1) {
         x = ggml_mul(ctx, x, blk.ls1);
     }
+    sam3_name_tensorf(x, "text_block_%02d_attn_out", block_idx);
 
     // Residual
     x = ggml_add(ctx, shortcut, x);
+    sam3_name_tensorf(x, "text_block_%02d_after_attn_residual", block_idx);
 
     // ── MLP ─────────────────────────────────────────────────────────────
     shortcut = x;
 
     // Pre-norm
     x = sam3_layer_norm(ctx, x, blk.ln2_w, blk.ln2_b);
+    sam3_name_tensorf(x, "text_block_%02d_after_ln2", block_idx);
 
     // MLP: fc1(1024→4096) → GELU → fc2(4096→1024)
     x = ggml_mul_mat(ctx, blk.mlp_fc1_w, x);
     x = ggml_add(ctx, x, blk.mlp_fc1_b);
+    sam3_name_tensorf(x, "text_block_%02d_mlp_fc1", block_idx);
     x = ggml_gelu_erf(ctx, x);
+    sam3_name_tensorf(x, "text_block_%02d_mlp_gelu", block_idx);
     x = ggml_mul_mat(ctx, blk.mlp_fc2_w, x);
     x = ggml_add(ctx, x, blk.mlp_fc2_b);
 
@@ -2664,9 +2685,11 @@ static struct ggml_tensor* sam3_text_block_forward(struct ggml_context* ctx,
     if (blk.ls2) {
         x = ggml_mul(ctx, x, blk.ls2);
     }
+    sam3_name_tensorf(x, "text_block_%02d_mlp_out", block_idx);
 
     // Residual
     x = ggml_add(ctx, shortcut, x);
+    sam3_name_tensorf(x, "text_block_%02d_out", block_idx);
 
     return x;
 }
@@ -2686,25 +2709,29 @@ static struct ggml_tensor* sam3_build_text_encoder_graph(struct ggml_context* ct
     // ── Token embedding: lookup [vocab, E] → [E, L] ─────────────────────
     auto* x = ggml_get_rows(ctx, enc.token_embed_w, token_ids);
     // x: [E, L] = [1024, 32]
+    ggml_set_name(x, "text_token_embed");
 
     // ── Add positional embedding ─────────────────────────────────────────
     // pos_embed: [E, ctx_len] = [1024, 32]
     x = ggml_add(ctx, x, enc.pos_embed);
+    ggml_set_name(x, "text_after_pos_embed");
 
     // ── Build causal mask ────────────────────────────────────────────────
     auto* causal_mask = sam3_build_causal_mask(ctx, L);
 
     // ── 24 transformer blocks ────────────────────────────────────────────
     for (int i = 0; i < hp.text_layers; ++i) {
-        x = sam3_text_block_forward(ctx, x, enc.blocks[i], hp, causal_mask);
+        x = sam3_text_block_forward(ctx, x, enc.blocks[i], hp, causal_mask, i);
     }
 
     // ── Final LayerNorm ──────────────────────────────────────────────────
     x = sam3_layer_norm(ctx, x, enc.ln_final_w, enc.ln_final_b);
+    ggml_set_name(x, "text_final_ln");
 
     // ── Resizer projection: Linear(1024 → 256) ──────────────────────────
     x = ggml_mul_mat(ctx, enc.resizer_w, x);
     x = ggml_add(ctx, x, enc.resizer_b);
+    ggml_set_name(x, "text_features_2d");
     // x: [OD, L] = [256, 32]
 
     return x;
@@ -5964,6 +5991,180 @@ std::vector<int32_t> sam3_test_tokenize(const std::string& text) {
     return sam3_tokenize(g_test_tokenizer, text, 32);
 }
 
+static bool sam3_dump_tensor_to_path(struct ggml_tensor * t,
+                                     const std::string & tensor_name,
+                                     const std::string & output_path) {
+    if (!t) {
+        fprintf(stderr, "%s: tensor '%s' is null\n", __func__, tensor_name.c_str());
+        return false;
+    }
+
+    int64_t numel = 1;
+    for (int i = 0; i < GGML_MAX_DIMS; ++i) {
+        if (t->ne[i] > 0) {
+            numel *= t->ne[i];
+        }
+    }
+
+    std::vector<float> data(numel);
+    if (t->type == GGML_TYPE_F16) {
+        std::vector<ggml_fp16_t> f16_data(numel);
+        ggml_backend_tensor_get(t, f16_data.data(), 0, numel * sizeof(ggml_fp16_t));
+        ggml_fp16_to_fp32_row(f16_data.data(), data.data(), numel);
+    } else if (t->type == GGML_TYPE_F32) {
+        ggml_backend_tensor_get(t, data.data(), 0, numel * sizeof(float));
+    } else {
+        fprintf(stderr, "%s: unsupported tensor type %d for '%s'\n",
+                __func__, (int) t->type, tensor_name.c_str());
+        return false;
+    }
+
+    {
+        std::ofstream f(output_path + ".bin", std::ios::binary);
+        if (!f) return false;
+        f.write(reinterpret_cast<const char *>(data.data()), numel * sizeof(float));
+    }
+
+    {
+        std::ofstream f(output_path + ".shape");
+        if (!f) return false;
+        int ndims = ggml_n_dims(t);
+        for (int i = 0; i < ndims; ++i) {
+            if (i > 0) f << ",";
+            f << t->ne[i];
+        }
+        f << "\n";
+    }
+
+    fprintf(stderr, "%s: dumped '%s' [", __func__, tensor_name.c_str());
+    for (int i = 0; i < ggml_n_dims(t); ++i) {
+        if (i > 0) fprintf(stderr, ", ");
+        fprintf(stderr, "%lld", (long long) t->ne[i]);
+    }
+    fprintf(stderr, "] to %s\n", output_path.c_str());
+
+    return true;
+}
+
+bool sam3_test_dump_text_encoder(const sam3_model & model,
+                                 const std::vector<int32_t> & token_ids,
+                                 const std::string & output_dir,
+                                 int n_threads) {
+    const int L = model.hparams.text_ctx_len;
+    if ((int) token_ids.size() != L) {
+        fprintf(stderr, "%s: expected %d token IDs, got %zu\n",
+                __func__, L, token_ids.size());
+        return false;
+    }
+
+    const size_t buf_size = ggml_tensor_overhead() * 8192 + ggml_graph_overhead() * 2;
+    struct ggml_init_params gparams = {
+        /*.mem_size   =*/buf_size,
+        /*.mem_buffer =*/nullptr,
+        /*.no_alloc   =*/true,
+    };
+    struct ggml_context * ctx0 = ggml_init(gparams);
+    if (!ctx0) {
+        fprintf(stderr, "%s: failed to init compute context\n", __func__);
+        return false;
+    }
+
+    auto * inp_tokens = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, L);
+    ggml_set_name(inp_tokens, "text_token_ids");
+    ggml_set_input(inp_tokens);
+
+    auto * text_features = sam3_build_text_encoder_graph(ctx0, inp_tokens, model);
+    std::vector<std::string> tensor_names = {
+        "causal_mask",
+        "text_token_embed",
+        "text_after_pos_embed",
+        "text_final_ln",
+        "text_features_2d",
+    };
+    for (int i = 0; i < model.hparams.text_layers; ++i) {
+        char name[64];
+
+        snprintf(name, sizeof(name), "text_block_%02d_after_ln1", i);
+        tensor_names.emplace_back(name);
+
+        snprintf(name, sizeof(name), "text_block_%02d_qkv", i);
+        tensor_names.emplace_back(name);
+
+        snprintf(name, sizeof(name), "text_block_%02d_attn_out", i);
+        tensor_names.emplace_back(name);
+
+        snprintf(name, sizeof(name), "text_block_%02d_after_attn_residual", i);
+        tensor_names.emplace_back(name);
+
+        snprintf(name, sizeof(name), "text_block_%02d_after_ln2", i);
+        tensor_names.emplace_back(name);
+
+        snprintf(name, sizeof(name), "text_block_%02d_mlp_fc1", i);
+        tensor_names.emplace_back(name);
+
+        snprintf(name, sizeof(name), "text_block_%02d_mlp_gelu", i);
+        tensor_names.emplace_back(name);
+
+        snprintf(name, sizeof(name), "text_block_%02d_mlp_out", i);
+        tensor_names.emplace_back(name);
+
+        snprintf(name, sizeof(name), "text_block_%02d_out", i);
+        tensor_names.emplace_back(name);
+    }
+
+    ggml_set_output(text_features);
+    for (const auto & name : tensor_names) {
+        auto * t = ggml_get_tensor(ctx0, name.c_str());
+        if (t && t != inp_tokens) {
+            ggml_set_output(t);
+        }
+    }
+
+    struct ggml_cgraph * graph = ggml_new_graph_custom(ctx0, 8192, false);
+    ggml_build_forward_expand(graph, text_features);
+
+    auto * galloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(model.backend));
+    if (!ggml_gallocr_reserve(galloc, graph) || !ggml_gallocr_alloc_graph(galloc, graph)) {
+        fprintf(stderr, "%s: failed to allocate text encoder graph\n", __func__);
+        ggml_gallocr_free(galloc);
+        ggml_free(ctx0);
+        return false;
+    }
+
+    ggml_backend_tensor_set(inp_tokens, token_ids.data(), 0, L * sizeof(int32_t));
+
+    auto * causal_mask = ggml_get_tensor(ctx0, "causal_mask");
+    if (!causal_mask) {
+        fprintf(stderr, "%s: causal_mask tensor not found\n", __func__);
+        ggml_gallocr_free(galloc);
+        ggml_free(ctx0);
+        return false;
+    }
+
+    std::vector<ggml_fp16_t> mask_data(L * L);
+    sam3_fill_causal_mask(mask_data.data(), L);
+    ggml_backend_tensor_set(causal_mask, mask_data.data(), 0, L * L * sizeof(ggml_fp16_t));
+
+    sam3_graph_compute(model.backend, graph, n_threads);
+
+    bool ok = true;
+    for (const auto & name : tensor_names) {
+        auto * t = ggml_get_tensor(ctx0, name.c_str());
+        if (!t) {
+            fprintf(stderr, "%s: tensor '%s' not found in graph\n", __func__, name.c_str());
+            ok = false;
+            continue;
+        }
+        if (!sam3_dump_tensor_to_path(t, name, output_dir + "/" + name)) {
+            ok = false;
+        }
+    }
+
+    ggml_gallocr_free(galloc);
+    ggml_free(ctx0);
+    return ok;
+}
+
 // ═══════════════════════════════════════════════════════════════════════════════
 //  Debug: dump state tensors
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -6014,49 +6215,5 @@ bool sam3_dump_state_tensor(const sam3_state& state,
         fprintf(stderr, "%s: tensor '%s' not found in state\n", __func__, tensor_name.c_str());
         return false;
     }
-
-    // Read data from backend
-    int64_t numel = 1;
-    for (int i = 0; i < GGML_MAX_DIMS; ++i) {
-        if (t->ne[i] > 0) numel *= t->ne[i];
-    }
-
-    fprintf(stderr, "%s: tensor type=%d (0=f32, 1=f16)\n", __func__, (int)t->type);
-
-    std::vector<float> data(numel);
-    if (t->type == GGML_TYPE_F16) {
-        // Read f16 and convert
-        std::vector<ggml_fp16_t> f16_data(numel);
-        ggml_backend_tensor_get(t, f16_data.data(), 0, numel * sizeof(ggml_fp16_t));
-        ggml_fp16_to_fp32_row(f16_data.data(), data.data(), numel);
-    } else {
-        ggml_backend_tensor_get(t, data.data(), 0, numel * sizeof(float));
-    }
-
-    // Write binary file
-    {
-        std::ofstream f(output_path + ".bin", std::ios::binary);
-        if (!f) return false;
-        f.write(reinterpret_cast<const char*>(data.data()), numel * sizeof(float));
-    }
-
-    // Write shape file
-    {
-        std::ofstream f(output_path + ".shape");
-        if (!f) return false;
-        int ndims = ggml_n_dims(t);
-        for (int i = 0; i < ndims; ++i) {
-            if (i > 0) f << ",";
-            f << t->ne[i];
-        }
-        f << "\n";
-    }
-
-    fprintf(stderr, "%s: dumped '%s' [", __func__, tensor_name.c_str());
-    for (int i = 0; i < ggml_n_dims(t); ++i) {
-        if (i > 0) fprintf(stderr, ", ");
-        fprintf(stderr, "%lld", (long long)t->ne[i]);
-    }
-    fprintf(stderr, "] to %s\n", output_path.c_str());
-    return true;
+    return sam3_dump_tensor_to_path(t, tensor_name, output_path);
 }

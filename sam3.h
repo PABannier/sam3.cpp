@@ -163,6 +163,13 @@ sam3_video_info sam3_get_video_info(const std::string & video_path);
 bool                  sam3_test_load_tokenizer(const std::string & dir);
 std::vector<int32_t>  sam3_test_tokenize(const std::string & text);
 
+// Test-only: run the text encoder on fixed token IDs and dump standard
+// intermediate tensors to <output_dir>/<tensor_name>.{bin,shape}.
+bool sam3_test_dump_text_encoder(const sam3_model & model,
+                                 const std::vector<int32_t> & token_ids,
+                                 const std::string & output_dir,
+                                 int n_threads = 4);
+
 // ─── Debug: dump state tensors to files for verification ───
 
 bool sam3_dump_state_tensor(const sam3_state & state,
