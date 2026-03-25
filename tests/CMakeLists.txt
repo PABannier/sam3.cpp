@@ -10,6 +10,9 @@ target_link_libraries(test_vit PRIVATE sam3)
 add_executable(test_phase5 test_phase5.cpp)
 target_link_libraries(test_phase5 PRIVATE sam3)
 
+add_executable(test_phase6 test_phase6.cpp)
+target_link_libraries(test_phase6 PRIVATE sam3)
+
 add_executable(test_phase3 test_phase3.cpp)
 target_link_libraries(test_phase3 PRIVATE sam3)
 

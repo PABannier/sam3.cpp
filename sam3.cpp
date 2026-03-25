@@ -650,13 +650,18 @@ static struct ggml_tensor* sam3_layer_norm_2d(struct ggml_context* ctx,
                                               struct ggml_tensor* w,
                                               struct ggml_tensor* b) {
     // x is [C, H, W, B] in ggml layout — norm over C dimension (dim 0)
-    x = ggml_norm(ctx, x, 1e-5f);
+    x = ggml_norm(ctx, x, 1e-6f);
     // w, b are [C, 1, 1] — broadcast multiply/add
     x = ggml_mul(ctx, x, w);
     if (b) {
         x = ggml_add(ctx, x, b);
     }
     return x;
+}
+
+static struct ggml_tensor* sam3_conv_transpose_weight(struct ggml_context * ctx,
+                                                      struct ggml_tensor * w) {
+    return w->type == GGML_TYPE_F16 ? w : ggml_cast(ctx, w, GGML_TYPE_F16);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -2521,10 +2526,10 @@ static void sam3_build_neck_graph(struct ggml_context* ctx,
 
     // Scale 0 (4×): ConvTranspose(1024→512, k=2, s=2) → GELU → ConvTranspose(512→256, k=2, s=2) → Conv1x1 → Conv3x3
     {
-        auto* s0 = ggml_conv_transpose_2d_p0(ctx, neck.scales[0].deconv1_w, x, 2);
+        auto* s0 = ggml_conv_transpose_2d_p0(ctx, sam3_conv_transpose_weight(ctx, neck.scales[0].deconv1_w), x, 2);
         s0 = add_bias(s0, neck.scales[0].deconv1_b);
         s0 = ggml_gelu_erf(ctx, s0);
-        s0 = ggml_conv_transpose_2d_p0(ctx, neck.scales[0].deconv2_w, s0, 2);
+        s0 = ggml_conv_transpose_2d_p0(ctx, sam3_conv_transpose_weight(ctx, neck.scales[0].deconv2_w), s0, 2);
         s0 = add_bias(s0, neck.scales[0].deconv2_b);
         s0 = ggml_conv_2d_sk_p0(ctx, neck.scales[0].conv1x1_w, s0);
         s0 = add_bias(s0, neck.scales[0].conv1x1_b);
@@ -2536,7 +2541,7 @@ static void sam3_build_neck_graph(struct ggml_context* ctx,
 
     // Scale 1 (2×): ConvTranspose(1024→512, k=2, s=2) → Conv1x1(512→256) → Conv3x3
     {
-        auto* s1 = ggml_conv_transpose_2d_p0(ctx, neck.scales[1].deconv1_w, x, 2);
+        auto* s1 = ggml_conv_transpose_2d_p0(ctx, sam3_conv_transpose_weight(ctx, neck.scales[1].deconv1_w), x, 2);
         s1 = add_bias(s1, neck.scales[1].deconv1_b);
         s1 = ggml_conv_2d_sk_p0(ctx, neck.scales[1].conv1x1_w, s1);
         s1 = add_bias(s1, neck.scales[1].conv1x1_b);
@@ -4924,7 +4929,7 @@ static struct ggml_tensor* sam3_sam_attention(
 // ═══════════════════════════════════════════════════════════════════════════════
 
 // Random Fourier positional encoding for a single (x, y) coordinate
-// coords_norm: normalized to [0, 1], pe_gaussian: [2, 128]
+// coords_norm: normalized to [0, 1], pe_gaussian: PyTorch row-major [2, 128]
 // Output: [256] = [sin(128); cos(128)]
 static void sam3_pe_encode_coord(float* out, float x_norm, float y_norm,
                                  const float* pe_gauss, int num_pos_feats) {
@@ -4933,7 +4938,8 @@ static void sam3_pe_encode_coord(float* out, float x_norm, float y_norm,
 
     // coords @ pe_gaussian → [128]
     for (int i = 0; i < num_pos_feats; ++i) {
-        float dot = coords[0] * pe_gauss[i * 2 + 0] + coords[1] * pe_gauss[i * 2 + 1];
+        float dot = coords[0] * pe_gauss[i] +
+                    coords[1] * pe_gauss[num_pos_feats + i];
         dot *= 2.0f * (float)M_PI;
         out[i] = sinf(dot);
         out[i + num_pos_feats] = cosf(dot);
@@ -5019,8 +5025,44 @@ static void sam3_populate_pe_cache(sam3_state & state, const sam3_model & model)
             __func__, pe_nel, 2.0f * D * H * H * sizeof(float) / 1024.0f);
 }
 
+// Match the official image predictor prompt ordering:
+//   box corners (if any) → user points → trailing padding point.
+// Even when a box is present, SAM keeps the final padding token because boxes
+// are merged into the point stream before calling PromptEncoder(points=..., boxes=None).
+static void sam3_collect_pvs_prompt_tokens(const sam3_pvs_params & params,
+                                           std::vector<float> & all_coords,
+                                           std::vector<int> & all_labels) {
+    all_coords.clear();
+    all_labels.clear();
+
+    if (params.use_box) {
+        all_coords.push_back(params.box.x0);
+        all_coords.push_back(params.box.y0);
+        all_labels.push_back(2);
+
+        all_coords.push_back(params.box.x1);
+        all_coords.push_back(params.box.y1);
+        all_labels.push_back(3);
+    }
+
+    for (const auto & pt : params.pos_points) {
+        all_coords.push_back(pt.x);
+        all_coords.push_back(pt.y);
+        all_labels.push_back(1);
+    }
+    for (const auto & pt : params.neg_points) {
+        all_coords.push_back(pt.x);
+        all_coords.push_back(pt.y);
+        all_labels.push_back(0);
+    }
+
+    all_coords.push_back(0.0f);
+    all_coords.push_back(0.0f);
+    all_labels.push_back(-1);
+}
+
 // Build sparse and dense embeddings from point/box prompts
-// sparse_out: [D, N_pts, 1] where N_pts = n_pos + n_neg + pad + (use_box ? 2 : 0)
+// sparse_out: [D, N_pts, 1] where N_pts = n_pos + n_neg + (use_box ? 2 : 0) + pad
 // dense_out:  [D, H, H, 1] (no-mask default or mask downsample)
 struct sam3_pe_result {
     struct ggml_tensor* sparse;    // [D, N_pts, 1]
@@ -5038,9 +5080,8 @@ static sam3_pe_result sam3_build_sam_pe(
     const int H = feat_size;  // 72
 
     // ── Count prompt tokens ──────────────────────────────────────────────
-    int N_pts = (int)(params.pos_points.size() + params.neg_points.size());
-    if (!params.use_box) N_pts += 1;    // padding point
-    if (params.use_box)  N_pts += 2;    // box corners
+    int N_pts = (int)(params.pos_points.size() + params.neg_points.size()) + 1;  // pad
+    if (params.use_box) N_pts += 2;                                             // box corners
 
     // ── Create input tensors (data uploaded by caller after allocation) ──
     auto * sparse = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, D, N_pts, 1);
@@ -5155,6 +5196,7 @@ struct sam3_dec_result {
     struct ggml_tensor* iou_pred;   // [N_masks, 1]
     struct ggml_tensor* obj_score;  // [1, 1]
     struct ggml_tensor* sam_token;  // [D, 1] — for object pointer
+    struct ggml_tensor* mask_tokens;  // [D, N_masks, 1] — raw SAM mask tokens
 };
 
 static sam3_dec_result sam3_build_sam_dec_graph(
@@ -5194,6 +5236,7 @@ static sam3_dec_result sam3_build_sam_dec_graph(
     // sparse_emb is already [D, N_pts, 1]
     // tokens = cat(output_tokens, sparse_emb) along dim 1 → [D, 6+N_pts, 1]
     auto* tokens = ggml_concat(ctx, output_tokens, sparse_emb, 1);
+    ggml_set_name(tokens, "sam_dec_tokens_initial");
 
     const int N_tok = 6 + N_pts;
 
@@ -5215,6 +5258,8 @@ static sam3_dec_result sam3_build_sam_dec_graph(
         sam3_twoway_block_forward(ctx, queries, keys, query_pe, key_pe,
                                   dec.twoway_blocks[i], n_heads,
                                   /*skip_first_layer_pe=*/(i == 0));
+        sam3_name_tensorf(queries, "sam_dec_block%d_queries", i);
+        sam3_name_tensorf(keys, "sam_dec_block%d_keys", i);
     }
 
     // Final attention: tokens → image
@@ -5224,6 +5269,7 @@ static sam3_dec_result sam3_build_sam_dec_graph(
         auto* attn_out = sam3_sam_attention(ctx, q, k, keys, dec.final_attn, n_heads);
         queries = ggml_add(ctx, queries, attn_out);
         queries = sam3_layer_norm(ctx, queries, dec.final_norm_w, dec.final_norm_b);
+        ggml_set_name(queries, "sam_dec_final_queries");
     }
 
     // ── Extract output tokens ────────────────────────────────────────────
@@ -5242,6 +5288,7 @@ static sam3_dec_result sam3_build_sam_dec_graph(
                                          queries->nb[1], queries->nb[2],
                                          2 * queries->nb[1]);
     mask_tokens_out = ggml_cont(ctx, mask_tokens_out);  // [D, 4, 1]
+    ggml_set_name(mask_tokens_out, "sam_dec_mask_tokens");
 
     auto* obj_in = ggml_view_3d(ctx, queries, D, 1, 1,
                                 queries->nb[1], queries->nb[2], 0);
@@ -5251,6 +5298,7 @@ static sam3_dec_result sam3_build_sam_dec_graph(
     auto* sam_token = ggml_view_2d(ctx, queries, D, 1,
                                    queries->nb[1], 2 * queries->nb[1]);
     sam_token = ggml_cont(ctx, sam_token);  // [D, 1]
+    ggml_set_name(sam_token, "sam_dec_sam_token");
 
     // ── Upscale mask embeddings ──────────────────────────────────────────
     // src (keys after transformer): [D, H*H, 1] → [D, H, H, 1]
@@ -5261,13 +5309,14 @@ static sam3_dec_result sam3_build_sam_dec_graph(
     src_img = ggml_cont(ctx, ggml_permute(ctx, src_img, 2, 0, 1, 3));  // [H, H, D, 1]
 
     // dc1: ConvTranspose2d(256, 64, k=2, s=2) → output [W, H, C, B] = [144, 144, 64, 1]
-    auto * up1 = ggml_conv_transpose_2d_p0(ctx, dec.up1_w, src_img, 2);
+    auto * up1 = ggml_conv_transpose_2d_p0(ctx, sam3_conv_transpose_weight(ctx, dec.up1_w), src_img, 2);
     up1 = ggml_add(ctx, up1, ggml_reshape_4d(ctx, dec.up1_b, 1, 1, ggml_nelements(dec.up1_b), 1));
 
     // conv_s1: 1x1 conv on feat_s1 (256→64). feat_s1 is [C, W, H, B] — permute for conv.
     auto * fs1 = ggml_cont(ctx, ggml_permute(ctx, feat_s1, 2, 0, 1, 3));  // [W, H, C, B]
     auto * hs1 = ggml_conv_2d_sk_p0(ctx, dec.conv_s1_w, fs1);  // [W, H, 64, B]
     hs1 = ggml_add(ctx, hs1, ggml_reshape_4d(ctx, dec.conv_s1_b, 1, 1, 64, 1));
+    ggml_set_name(hs1, "sam_dec_feat_s1_proj");
 
     // Python: act1(ln1(dc1(src) + feat_s1)) — add feat_s1 BEFORE LayerNorm
     up1 = ggml_add(ctx, up1, hs1);  // both [W, H, 64, B]
@@ -5283,13 +5332,14 @@ static sam3_dec_result sam3_build_sam_dec_graph(
     up1 = ggml_cont(ctx, ggml_permute(ctx, up1, 2, 0, 1, 3));  // [144, 144, 64, 1]
 
     // dc2: ConvTranspose2d(64, 32, k=2, s=2) → [288, 288, 32, 1]
-    auto * up2 = ggml_conv_transpose_2d_p0(ctx, dec.up2_w, up1, 2);
+    auto * up2 = ggml_conv_transpose_2d_p0(ctx, sam3_conv_transpose_weight(ctx, dec.up2_w), up1, 2);
     up2 = ggml_add(ctx, up2, ggml_reshape_4d(ctx, dec.up2_b, 1, 1, ggml_nelements(dec.up2_b), 1));
 
     // conv_s0: 1x1 conv on feat_s0 (256→32). feat_s0 is [C, W, H, B] — permute for conv.
     auto * fs0 = ggml_cont(ctx, ggml_permute(ctx, feat_s0, 2, 0, 1, 3));  // [W, H, C, B]
     auto * hs0 = ggml_conv_2d_sk_p0(ctx, dec.conv_s0_w, fs0);  // [W, H, 32, B]
     hs0 = ggml_add(ctx, hs0, ggml_reshape_4d(ctx, dec.conv_s0_b, 1, 1, 32, 1));
+    ggml_set_name(hs0, "sam_dec_feat_s0_proj");
 
     // Python: act2(dc2(upscaled_embedding) + feat_s0) — no LayerNorm here
     up2 = ggml_add(ctx, up2, hs0);  // both [W, H, 32, B]
@@ -5301,6 +5351,7 @@ static sam3_dec_result sam3_build_sam_dec_graph(
     up2 = ggml_gelu_erf(ctx, up2);
 
     // up2: [32, 288, 288, 1] — this is our upscaled_embedding
+    ggml_set_name(up2, "sam_dec_upscaled");
 
     // ── Hypernetwork: predict masks ──────────────────────────────────────
     // For each mask token i, pass through 3-layer MLP to get [32] vector
@@ -5339,7 +5390,8 @@ static sam3_dec_result sam3_build_sam_dec_graph(
     // ── IoU prediction ───────────────────────────────────────────────────
     // iou_token_out: [D, 1, 1]
     auto* iou_pred = sam3_mlp_forward(ctx, iou_token_out,
-                                      dec.iou_head_w, dec.iou_head_b, 3);
+                                      dec.iou_head_w, dec.iou_head_b, 3,
+                                      /*sigmoid_output=*/true);
     // iou_pred: [4, 1, 1] → reshape to [4, 1]
     iou_pred = ggml_reshape_2d(ctx, iou_pred, num_mask_tokens, 1);
     ggml_set_name(iou_pred, "sam_dec_iou");
@@ -5357,6 +5409,7 @@ static sam3_dec_result sam3_build_sam_dec_graph(
     res.iou_pred = iou_pred;
     res.obj_score = obj_score;
     res.sam_token = sam_token;
+    res.mask_tokens = mask_tokens_out;
     return res;
 }
 
@@ -5404,9 +5457,15 @@ sam3_result sam3_segment_pvs(sam3_state& state,
     // ── SAM prompt encoder (CPU pre-compute + input tensors) ─────────────
     auto pe_out = sam3_build_sam_pe(ctx0, params, D, H);
 
+    // Match the Python image predictor: add the learned no-memory token to the
+    // lowest-resolution tracker feature map before the SAM decoder.
+    auto * no_mem = ggml_reshape_4d(ctx0, model.tensors.at("no_mem_embed"), D, 1, 1, 1);
+    auto * image_feats = ggml_add(ctx0, state.neck_trk[2], no_mem);
+    ggml_set_name(image_feats, "sam_dec_image_feats");
+
     // ── SAM mask decoder graph ───────────────────────────────────────────
     auto dec_out = sam3_build_sam_dec_graph(ctx0, model,
-                                            state.neck_trk[2],  // [D, 72, 72, 1]
+                                            image_feats,        // [D, 72, 72, 1]
                                             pe_out.image_pe,
                                             pe_out.sparse,
                                             pe_out.dense,
@@ -5450,34 +5509,9 @@ sam3_result sam3_segment_pvs(sam3_state& state,
         const int N_pts = pe_out.n_tokens;
         const int num_pos_feats = D / 2;
 
-        // Re-build prompts
         std::vector<float> all_coords;
         std::vector<int> all_labels;
-        all_coords.reserve(N_pts * 2);
-        all_labels.reserve(N_pts);
-        for (const auto& pt : params.pos_points) {
-            all_coords.push_back(pt.x);
-            all_coords.push_back(pt.y);
-            all_labels.push_back(1);
-        }
-        for (const auto& pt : params.neg_points) {
-            all_coords.push_back(pt.x);
-            all_coords.push_back(pt.y);
-            all_labels.push_back(0);
-        }
-        if (!params.use_box) {
-            all_coords.push_back(0.0f);
-            all_coords.push_back(0.0f);
-            all_labels.push_back(-1);
-        }
-        if (params.use_box) {
-            all_coords.push_back(params.box.x0);
-            all_coords.push_back(params.box.y0);
-            all_labels.push_back(2);
-            all_coords.push_back(params.box.x1);
-            all_coords.push_back(params.box.y1);
-            all_labels.push_back(3);
-        }
+        sam3_collect_pvs_prompt_tokens(params, all_coords, all_labels);
 
         // Sparse embeddings — only this changes per call
         std::vector<float> sparse_data(N_pts * D, 0.0f);
@@ -6890,6 +6924,253 @@ bool sam3_test_dump_phase5_from_ref_inputs(const sam3_model & model,
     ggml_gallocr_free(galloc);
     ggml_free(ctx0);
     return ok;
+}
+
+static bool sam3_test_dump_phase6_impl(const sam3_model & model,
+                                       struct ggml_tensor * state_neck0,
+                                       struct ggml_tensor * state_neck1,
+                                       struct ggml_tensor * state_neck2,
+                                       const std::vector<float> * neck0_data,
+                                       const std::vector<float> * neck1_data,
+                                       const std::vector<float> * neck2_data,
+                                       const sam3_pvs_params & params,
+                                       const std::string & output_dir,
+                                       int n_threads) {
+    const auto & hp = model.hparams;
+    const int D = hp.sam_embed_dim;
+    const int H = hp.n_img_embd();
+    const int H1 = H * 2;
+    const int H0 = H * 4;
+
+    const size_t buf_size = ggml_tensor_overhead() * 32768 + ggml_graph_overhead() * 2;
+    struct ggml_init_params gparams = {
+        /*.mem_size   =*/buf_size,
+        /*.mem_buffer =*/nullptr,
+        /*.no_alloc   =*/true,
+    };
+    struct ggml_context * ctx0 = ggml_init(gparams);
+    if (!ctx0) {
+        fprintf(stderr, "%s: failed to init compute context\n", __func__);
+        return false;
+    }
+
+    struct ggml_tensor * neck0 = state_neck0;
+    struct ggml_tensor * neck1 = state_neck1;
+    struct ggml_tensor * neck2 = state_neck2;
+    if (neck0_data && neck1_data && neck2_data) {
+        neck0 = ggml_new_tensor_4d(ctx0, GGML_TYPE_F32, D, H0, H0, 1);
+        ggml_set_name(neck0, "sam_dec_feat_s0_input");
+        ggml_set_input(neck0);
+
+        neck1 = ggml_new_tensor_4d(ctx0, GGML_TYPE_F32, D, H1, H1, 1);
+        ggml_set_name(neck1, "sam_dec_feat_s1_input");
+        ggml_set_input(neck1);
+
+        neck2 = ggml_new_tensor_4d(ctx0, GGML_TYPE_F32, D, H, H, 1);
+        ggml_set_name(neck2, "sam_dec_feat_s2_input");
+        ggml_set_input(neck2);
+    }
+
+    if (!neck0 || !neck1 || !neck2) {
+        fprintf(stderr, "%s: missing tracker feature inputs\n", __func__);
+        ggml_free(ctx0);
+        return false;
+    }
+
+    auto pe_out = sam3_build_sam_pe(ctx0, params, D, H);
+
+    auto * no_mem = ggml_reshape_4d(ctx0, model.tensors.at("no_mem_embed"), D, 1, 1, 1);
+    auto * image_feats = ggml_add(ctx0, neck2, no_mem);
+    ggml_set_name(image_feats, "sam_dec_image_feats");
+
+    auto dec_out = sam3_build_sam_dec_graph(ctx0, model, image_feats,
+                                            pe_out.image_pe, pe_out.sparse, pe_out.dense,
+                                            neck0, neck1);
+
+    struct named_tensor {
+        const char * name;
+        struct ggml_tensor * tensor;
+    };
+
+    const std::vector<named_tensor> direct_tensors = {
+        {"sam_pe_sparse", pe_out.sparse},
+        {"sam_pe_dense", pe_out.dense},
+        {"sam_pe_image_pe", pe_out.image_pe},
+        {"sam_dec_image_feats", image_feats},
+        {"sam_dec_sam_token", dec_out.sam_token},
+    };
+
+    std::vector<std::string> named_outputs = {
+        "sam_dec_tokens_initial",
+        "sam_dec_block0_queries",
+        "sam_dec_block0_keys",
+        "sam_dec_block1_queries",
+        "sam_dec_block1_keys",
+        "sam_dec_final_queries",
+        "sam_dec_feat_s1_proj",
+        "sam_dec_feat_s0_proj",
+        "sam_dec_upscaled",
+        "sam_dec_mask_tokens",
+        "sam_dec_masks",
+        "sam_dec_iou",
+        "sam_dec_obj_score",
+    };
+
+    ggml_set_output(dec_out.masks);
+    ggml_set_output(dec_out.iou_pred);
+    ggml_set_output(dec_out.obj_score);
+    ggml_set_output(dec_out.sam_token);
+    ggml_set_output(dec_out.mask_tokens);
+    for (const auto & item : direct_tensors) {
+        ggml_set_output(item.tensor);
+    }
+    for (const auto & name : named_outputs) {
+        auto * t = ggml_get_tensor(ctx0, name.c_str());
+        if (!t) {
+            fprintf(stderr, "%s: tensor '%s' not found in graph\n", __func__, name.c_str());
+            ggml_free(ctx0);
+            return false;
+        }
+        ggml_set_output(t);
+    }
+
+    struct ggml_cgraph * graph = ggml_new_graph_custom(ctx0, 32768, false);
+    ggml_build_forward_expand(graph, dec_out.masks);
+    ggml_build_forward_expand(graph, dec_out.iou_pred);
+    ggml_build_forward_expand(graph, dec_out.obj_score);
+    ggml_build_forward_expand(graph, dec_out.sam_token);
+    ggml_build_forward_expand(graph, dec_out.mask_tokens);
+    for (const auto & item : direct_tensors) {
+        ggml_build_forward_expand(graph, item.tensor);
+    }
+    for (const auto & name : named_outputs) {
+        ggml_build_forward_expand(graph, ggml_get_tensor(ctx0, name.c_str()));
+    }
+
+    auto * galloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(model.backend));
+    if (!ggml_gallocr_reserve(galloc, graph) || !ggml_gallocr_alloc_graph(galloc, graph)) {
+        fprintf(stderr, "%s: failed to allocate phase 6 graph\n", __func__);
+        ggml_gallocr_free(galloc);
+        ggml_free(ctx0);
+        return false;
+    }
+
+    if (neck0_data && neck1_data && neck2_data) {
+        ggml_backend_tensor_set(neck0, neck0_data->data(), 0, neck0_data->size() * sizeof(float));
+        ggml_backend_tensor_set(neck1, neck1_data->data(), 0, neck1_data->size() * sizeof(float));
+        ggml_backend_tensor_set(neck2, neck2_data->data(), 0, neck2_data->size() * sizeof(float));
+    }
+
+    sam3_state pe_cache_state = {};
+    sam3_populate_pe_cache(pe_cache_state, model);
+
+    std::vector<float> all_coords;
+    std::vector<int> all_labels;
+    sam3_collect_pvs_prompt_tokens(params, all_coords, all_labels);
+    if ((int) all_labels.size() != pe_out.n_tokens) {
+        fprintf(stderr, "%s: prompt token count mismatch (%zu vs %d)\n",
+                __func__, all_labels.size(), pe_out.n_tokens);
+        ggml_gallocr_free(galloc);
+        ggml_free(ctx0);
+        return false;
+    }
+
+    {
+        const int num_pos_feats = D / 2;
+        std::vector<float> sparse_data((size_t) pe_out.n_tokens * D, 0.0f);
+        for (int p = 0; p < pe_out.n_tokens; ++p) {
+            float px = all_coords[p * 2 + 0] + 0.5f;
+            float py = all_coords[p * 2 + 1] + 0.5f;
+            float x_norm = px / (float) hp.img_size;
+            float y_norm = py / (float) hp.img_size;
+            float pe_vec[256];
+            sam3_pe_encode_coord(pe_vec, x_norm, y_norm,
+                                 pe_cache_state.pe_gauss_cache.data(), num_pos_feats);
+
+            const int label = all_labels[p];
+            if (label == -1) {
+                for (int d = 0; d < D; ++d) {
+                    sparse_data[(size_t) p * D + d] = pe_cache_state.not_a_point_cache[d];
+                }
+            } else {
+                for (int d = 0; d < D; ++d) {
+                    sparse_data[(size_t) p * D + d] = pe_vec[d] + pe_cache_state.point_emb_cache[label][d];
+                }
+            }
+        }
+
+        ggml_backend_tensor_set(pe_out.sparse, sparse_data.data(), 0,
+                                sparse_data.size() * sizeof(float));
+        ggml_backend_tensor_set(pe_out.image_pe, pe_cache_state.dense_pe_cache.data(), 0,
+                                pe_cache_state.dense_pe_cache.size() * sizeof(float));
+        ggml_backend_tensor_set(pe_out.dense, pe_cache_state.dense_nomask_cache.data(), 0,
+                                pe_cache_state.dense_nomask_cache.size() * sizeof(float));
+    }
+
+    sam3_graph_compute(model.backend, graph, n_threads);
+
+    bool ok = true;
+    for (const auto & item : direct_tensors) {
+        if (!sam3_dump_tensor_to_path(item.tensor, item.name, output_dir + "/" + item.name)) {
+            ok = false;
+        }
+    }
+    for (const auto & name : named_outputs) {
+        auto * t = ggml_get_tensor(ctx0, name.c_str());
+        if (!t) {
+            fprintf(stderr, "%s: tensor '%s' not found after compute\n", __func__, name.c_str());
+            ok = false;
+            continue;
+        }
+        if (!sam3_dump_tensor_to_path(t, name, output_dir + "/" + name)) {
+            ok = false;
+        }
+    }
+
+    ggml_gallocr_free(galloc);
+    ggml_free(ctx0);
+    return ok;
+}
+
+bool sam3_test_dump_phase6(const sam3_model & model,
+                           const sam3_state & state,
+                           const sam3_pvs_params & params,
+                           const std::string & output_dir,
+                           int n_threads) {
+    return sam3_test_dump_phase6_impl(model,
+                                      state.neck_trk[0], state.neck_trk[1], state.neck_trk[2],
+                                      nullptr, nullptr, nullptr,
+                                      params, output_dir, n_threads);
+}
+
+bool sam3_test_dump_phase6_from_ref_inputs(const sam3_model & model,
+                                           const std::string & prephase_ref_dir,
+                                           const sam3_pvs_params & params,
+                                           const std::string & output_dir,
+                                           int n_threads) {
+    const auto & hp = model.hparams;
+    const int D = hp.sam_embed_dim;
+    const int H = hp.n_img_embd();
+    const int H1 = H * 2;
+    const int H0 = H * 4;
+
+    std::vector<float> neck_trk_0;
+    std::vector<float> neck_trk_1;
+    std::vector<float> neck_trk_2;
+    if (!sam3_load_ref_f32_data(prephase_ref_dir + "/neck_trk_0", neck_trk_0, D * H0 * H0) ||
+        !sam3_load_ref_f32_data(prephase_ref_dir + "/neck_trk_1", neck_trk_1, D * H1 * H1) ||
+        !sam3_load_ref_f32_data(prephase_ref_dir + "/neck_trk_2", neck_trk_2, D * H * H)) {
+        return false;
+    }
+
+    neck_trk_0 = sam3_reorder_nchw_to_ggml_dwh(neck_trk_0, D, H0, H0);
+    neck_trk_1 = sam3_reorder_nchw_to_ggml_dwh(neck_trk_1, D, H1, H1);
+    neck_trk_2 = sam3_reorder_nchw_to_ggml_dwh(neck_trk_2, D, H, H);
+
+    return sam3_test_dump_phase6_impl(model,
+                                      nullptr, nullptr, nullptr,
+                                      &neck_trk_0, &neck_trk_1, &neck_trk_2,
+                                      params, output_dir, n_threads);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════

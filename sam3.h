@@ -189,6 +189,24 @@ bool sam3_test_dump_phase5_from_ref_inputs(const sam3_model & model,
                                            const std::string & output_dir,
                                            int n_threads = 4);
 
+// Test-only: run the phase 6 prompt encoder + SAM decoder on an already
+// encoded tracker image state and dump standard intermediate tensors to
+// <output_dir>/<tensor_name>.{bin,shape}.
+bool sam3_test_dump_phase6(const sam3_model & model,
+                           const sam3_state & state,
+                           const sam3_pvs_params & params,
+                           const std::string & output_dir,
+                           int n_threads = 4);
+
+// Test-only: run the phase 6 prompt encoder + SAM decoder from pre-dumped
+// phase 3 tracker features. This isolates phase 6 numerics from earlier phases
+// and is intended to be reused by later tracker-stage tests.
+bool sam3_test_dump_phase6_from_ref_inputs(const sam3_model & model,
+                                           const std::string & prephase_ref_dir,
+                                           const sam3_pvs_params & params,
+                                           const std::string & output_dir,
+                                           int n_threads = 4);
+
 // ─── Debug: dump state tensors to files for verification ───
 
 bool sam3_dump_state_tensor(const sam3_state & state,
