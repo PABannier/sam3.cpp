@@ -2737,6 +2737,7 @@ This section defines the exact order in which to implement, from zero to a worki
 
 **Step 8.3: Performance optimization**
 
+- Ensure outputs are absolutely identical and isomorphic
 - Profile with Instruments on macOS
 - Ensure Metal backend is used for all heavy operations
 - Optimize memory allocation (reuse graph allocators)
@@ -2859,6 +2860,7 @@ sam3_result sam3_propagate_frame(
 ```
 
 Implementation notes:
+
 - `sam3_create_visual_tracker()` creates a tracker that never runs PCS detection
 - `sam3_tracker_add_instance()` reuses the `sam3_segment_pvs()` code path internally, then writes the mask + object pointer to the memory bank
 - `sam3_propagate_frame()` is the propagation loop from Phase 7 (memory attention → SAM mask decode → memory update) without the detection + matching steps
@@ -2977,31 +2979,31 @@ Key technical challenges:
 
 Tensors **kept** in the visual-only model:
 
-| Prefix | Component |
-| ------ | --------- |
-| `vit.*` | ViT backbone (shared) |
-| `neck.trk.*` | Tracker SimpleFPN neck |
-| `sam_pe.*` | SAM prompt encoder |
-| `sam_dec.*` | SAM mask decoder |
-| `mem_enc.*` | Memory encoder |
-| `mem_attn.*` | Memory attention |
-| `obj_ptr_proj.*` | Object pointer MLP |
-| `obj_ptr_tpos_proj.*` | Temporal position projection |
-| `no_obj_ptr` | No-object pointer embedding |
-| `no_mem_embed` | No-memory embedding |
-| `no_mem_pos_enc` | No-memory positional encoding |
-| `no_obj_embed_spatial` | No-object spatial embedding |
-| `trk_mask_ds.*` | Tracker mask downsampling |
-| `mem_enc.tpos_enc` | Temporal position encodings |
+| Prefix                 | Component                     |
+| ---------------------- | ----------------------------- |
+| `vit.*`                | ViT backbone (shared)         |
+| `neck.trk.*`           | Tracker SimpleFPN neck        |
+| `sam_pe.*`             | SAM prompt encoder            |
+| `sam_dec.*`            | SAM mask decoder              |
+| `mem_enc.*`            | Memory encoder                |
+| `mem_attn.*`           | Memory attention              |
+| `obj_ptr_proj.*`       | Object pointer MLP            |
+| `obj_ptr_tpos_proj.*`  | Temporal position projection  |
+| `no_obj_ptr`           | No-object pointer embedding   |
+| `no_mem_embed`         | No-memory embedding           |
+| `no_mem_pos_enc`       | No-memory positional encoding |
+| `no_obj_embed_spatial` | No-object spatial embedding   |
+| `trk_mask_ds.*`        | Tracker mask downsampling     |
+| `mem_enc.tpos_enc`     | Temporal position encodings   |
 
 Tensors **stripped** (detector-only):
 
-| Prefix | Component | Approx. params |
-| ------ | --------- | -------------- |
-| `text.*` | Text encoder (24 layers, 49408-token embedding) | ~150M |
-| `fenc.*` | Fusion encoder (6 layers) | ~40M |
-| `ddec.*` | DETR decoder (6 layers, queries, bbox heads) | ~50M |
-| `seg.*` | Segmentation head (pixel decoder, mask predictor) | ~30M |
-| `geom.*` | Geometry/exemplar encoder (3 layers) | ~15M |
-| `scoring.*` | DotProductScoring MLP | ~5M |
-| `neck.det.*` | Detector SimpleFPN neck | ~20M |
+| Prefix       | Component                                         | Approx. params |
+| ------------ | ------------------------------------------------- | -------------- |
+| `text.*`     | Text encoder (24 layers, 49408-token embedding)   | ~150M          |
+| `fenc.*`     | Fusion encoder (6 layers)                         | ~40M           |
+| `ddec.*`     | DETR decoder (6 layers, queries, bbox heads)      | ~50M           |
+| `seg.*`      | Segmentation head (pixel decoder, mask predictor) | ~30M           |
+| `geom.*`     | Geometry/exemplar encoder (3 layers)              | ~15M           |
+| `scoring.*`  | DotProductScoring MLP                             | ~5M            |
+| `neck.det.*` | Detector SimpleFPN neck                           | ~20M           |
