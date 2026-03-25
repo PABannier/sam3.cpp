@@ -30,5 +30,7 @@ __pycache__
 /tmp/
 tests/output/
 tests/ref*/
-*.jpg
 raw_weights/
+
+# Test data
+data/

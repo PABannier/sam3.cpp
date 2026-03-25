@@ -3,10 +3,12 @@
 // Usage: sam3_video --model <path.ggml> --video <path> [--tokenizer <dir>]
 //
 // Controls:
-//   Type a text prompt → auto-detect instances on each frame.
+//   Mode selector chooses how to initialize tracking instances:
+//     Text:   Type a text prompt → auto-detect instances on each frame.
+//     Box:    Drag a bounding box on a paused frame → add instance.
+//     Points: Click positive/negative points → add instance.
+//   In all modes, clicking on an existing tracked mask refines it.
 //   [Play]/[Pause]/[Step] for playback control.
-//   Left-click: add positive refinement point for nearest instance.
-//   Right-click: add negative refinement point.
 //   [Export] saves mask PNGs per frame.
 
 #include "sam3.h"
@@ -17,7 +19,10 @@
 #include <imgui_impl_opengl3.h>
 
 #ifdef __APPLE__
-#include <OpenGL/gl.h>
+#ifndef GL_SILENCE_DEPRECATION
+#define GL_SILENCE_DEPRECATION
+#endif
+#include <OpenGL/gl3.h>
 #else
 #include <GL/gl.h>
 #endif
@@ -38,6 +43,8 @@ static const float INSTANCE_COLORS[][3] = {
 };
 static constexpr int N_COLORS = sizeof(INSTANCE_COLORS) / sizeof(INSTANCE_COLORS[0]);
 
+enum vtrack_mode { VMODE_TEXT, VMODE_BOX, VMODE_POINTS };
+
 struct vapp_state {
     // Model
     sam3_params             params;
@@ -53,12 +60,24 @@ struct vapp_state {
     sam3_image              frame;
     int                     frame_index = 0;
     GLuint                  tex_frame   = 0;
+    bool                    frame_encoded = false;
 
     // Tracking
     char                    text_prompt[256] = {};
     sam3_video_params       track_params;
     sam3_result             result;
     bool                    tracker_created = false;
+
+    // Interaction mode
+    vtrack_mode             init_mode = VMODE_TEXT;
+
+    // Manual instance creation (box/points on paused frame)
+    std::vector<sam3_point> init_pos_points;
+    std::vector<sam3_point> init_neg_points;
+    sam3_box                init_box = {0, 0, 0, 0};
+    bool                    has_init_box = false;
+    bool                    dragging = false;
+    float                   drag_x0 = 0, drag_y0 = 0;
 
     // Playback
     bool                    playing   = false;
@@ -132,11 +151,16 @@ static bool screen_to_image(const vapp_state& app, float sx, float sy,
 }
 
 static void create_tracker(vapp_state& app) {
-    app.track_params.text_prompt = app.text_prompt;
+    if (app.init_mode == VMODE_TEXT) {
+        app.track_params.text_prompt = app.text_prompt;
+    } else {
+        // Box/Points modes: create tracker with empty text (no auto-detection)
+        app.track_params.text_prompt = "";
+    }
     app.tracker = sam3_create_tracker(*app.model, app.track_params);
     app.tracker_created = (app.tracker != nullptr);
     if (app.tracker_created) {
-        snprintf(app.status, sizeof(app.status), "Tracker created. Press Play.");
+        snprintf(app.status, sizeof(app.status), "Tracker created. Press Play or add instances.");
     } else {
         snprintf(app.status, sizeof(app.status), "Failed to create tracker.");
     }
@@ -153,15 +177,80 @@ static void decode_and_track(vapp_state& app, int fi) {
 
     if (app.tracker_created) {
         app.result = sam3_track_frame(*app.tracker, *app.state, *app.model, app.frame);
+        app.frame_encoded = true;
         snprintf(app.status, sizeof(app.status), "Frame %d/%d — %d objects tracked",
                  fi, app.video_info.n_frames, (int)app.result.detections.size());
     } else {
         // Just encode and show the frame without tracking
         sam3_encode_image(*app.state, *app.model, app.frame);
+        app.frame_encoded = true;
         app.result = {};
         snprintf(app.status, sizeof(app.status), "Frame %d/%d — no tracker active",
                  fi, app.video_info.n_frames);
     }
+}
+
+// Check if a click position lands on any tracked instance mask.
+// Returns the instance_id or -1.
+static int find_instance_at(const vapp_state& app, float ix, float iy) {
+    int px = (int)ix, py = (int)iy;
+    for (const auto& det : app.result.detections) {
+        if (det.mask.data.empty()) continue;
+        if (px >= 0 && px < det.mask.width &&
+            py >= 0 && py < det.mask.height &&
+            det.mask.data[py * det.mask.width + px] > 127) {
+            return det.instance_id;
+        }
+    }
+    return -1;
+}
+
+static void add_instance_from_prompts(vapp_state& app) {
+    if (!app.tracker_created || !app.frame_encoded) return;
+    sam3_pvs_params pvs;
+    pvs.pos_points = app.init_pos_points;
+    pvs.neg_points = app.init_neg_points;
+    if (app.has_init_box) {
+        pvs.box = app.init_box;
+        pvs.use_box = true;
+    }
+    pvs.multimask = false;
+
+    // sam3_tracker_add_instance runs PVS internally and registers the instance
+    // in the tracker's memory bank.  We must NOT call decode_and_track afterwards
+    // because sam3_track_frame increments tracker.frame_index, which would
+    // desynchronize the tracker's internal counter from the actual frame.
+    //
+    // Instead, run PVS again (cheap — image is already encoded) to obtain a
+    // display mask and append it to the current result.
+    int new_id = sam3_tracker_add_instance(*app.tracker, *app.state, *app.model, pvs);
+    if (new_id >= 0) {
+        snprintf(app.status, sizeof(app.status), "Added instance #%d", new_id);
+
+        // Re-run PVS to get the mask for display (image features are still valid)
+        auto pvs_result = sam3_segment_pvs(*app.state, *app.model, pvs);
+        if (!pvs_result.detections.empty()) {
+            sam3_detection det = pvs_result.detections[0];
+            det.instance_id = new_id;
+            det.mask.instance_id = new_id;
+            app.result.detections.push_back(std::move(det));
+        }
+    } else {
+        snprintf(app.status, sizeof(app.status), "Failed to add instance");
+    }
+
+    // Clear pending prompts
+    app.init_pos_points.clear();
+    app.init_neg_points.clear();
+    app.init_box = {0, 0, 0, 0};
+    app.has_init_box = false;
+}
+
+static void clear_init_prompts(vapp_state& app) {
+    app.init_pos_points.clear();
+    app.init_neg_points.clear();
+    app.init_box = {0, 0, 0, 0};
+    app.has_init_box = false;
 }
 
 static void export_frame_masks(const vapp_state& app) {
@@ -272,7 +361,7 @@ int main(int argc, char** argv) {
         app.video_info = sam3_get_video_info(app.video_path);
         if (app.video_info.n_frames > 0) {
             snprintf(app.status, sizeof(app.status),
-                     "Video: %dx%d, %d frames, %.1f fps. Enter a text prompt and press Start.",
+                     "Video: %dx%d, %d frames, %.1f fps. Choose mode and press Start.",
                      app.video_info.width, app.video_info.height,
                      app.video_info.n_frames, app.video_info.fps);
             // Decode first frame for preview
@@ -300,56 +389,86 @@ int main(int argc, char** argv) {
             if (event.type == SDL_WINDOWEVENT &&
                 event.window.event == SDL_WINDOWEVENT_CLOSE) running = false;
 
-            // Mouse on canvas for refinement
-            if (!io.WantCaptureMouse && !app.frame.data.empty() && app.tracker_created) {
+            // Mouse on canvas
+            if (!io.WantCaptureMouse && !app.frame.data.empty()) {
                 float mx = io.MousePos.x, my = io.MousePos.y;
                 float ix, iy;
 
                 if (event.type == SDL_MOUSEBUTTONDOWN && event.button.button == SDL_BUTTON_LEFT) {
                     if (screen_to_image(app, mx, my, ix, iy)) {
-                        // Find nearest instance and refine
-                        int best_id = -1;
-                        for (const auto& det : app.result.detections) {
-                            if (det.mask.data.empty()) continue;
-                            int px = (int)ix, py = (int)iy;
-                            if (px >= 0 && px < det.mask.width &&
-                                py >= 0 && py < det.mask.height &&
-                                det.mask.data[py * det.mask.width + px] > 127) {
-                                best_id = det.instance_id;
-                                break;
-                            }
-                        }
-                        if (best_id >= 0) {
+                        // Check if clicking on an existing tracked instance (refine)
+                        int hit_id = find_instance_at(app, ix, iy);
+                        if (hit_id >= 0 && app.tracker_created && app.frame_encoded) {
                             std::vector<sam3_point> pos = {{ix, iy}};
                             std::vector<sam3_point> neg;
-                            sam3_refine_instance(*app.tracker, *app.state, *app.model,
-                                                 best_id, pos, neg);
+                            bool ok = sam3_refine_instance(*app.tracker, *app.state, *app.model,
+                                                           hit_id, pos, neg);
                             snprintf(app.status, sizeof(app.status),
-                                     "Refined instance #%d with positive point", best_id);
+                                     ok ? "Refined instance #%d with positive point"
+                                        : "Failed to refine instance #%d", hit_id);
+                        } else if (app.init_mode == VMODE_BOX) {
+                            // Start box drag
+                            app.dragging = true;
+                            app.drag_x0 = ix;
+                            app.drag_y0 = iy;
+                        } else if (app.init_mode == VMODE_POINTS) {
+                            // Add positive init point
+                            app.init_pos_points.push_back({ix, iy});
                         }
                     }
                 }
-                if (event.type == SDL_MOUSEBUTTONDOWN && event.button.button == SDL_BUTTON_RIGHT) {
-                    if (screen_to_image(app, mx, my, ix, iy)) {
-                        // Find nearest instance and add negative point
-                        int best_id = -1;
-                        for (const auto& det : app.result.detections) {
-                            if (det.mask.data.empty()) continue;
-                            int px = (int)ix, py = (int)iy;
-                            if (px >= 0 && px < det.mask.width &&
-                                py >= 0 && py < det.mask.height &&
-                                det.mask.data[py * det.mask.width + px] > 127) {
-                                best_id = det.instance_id;
-                                break;
+                if (event.type == SDL_MOUSEBUTTONUP && event.button.button == SDL_BUTTON_LEFT) {
+                    if (app.dragging && screen_to_image(app, mx, my, ix, iy)) {
+                        float dx = ix - app.drag_x0;
+                        float dy = iy - app.drag_y0;
+                        if (dx*dx + dy*dy > 25.0f) {
+                            // Completed box drag
+                            app.init_box.x0 = std::min(app.drag_x0, ix);
+                            app.init_box.y0 = std::min(app.drag_y0, iy);
+                            app.init_box.x1 = std::max(app.drag_x0, ix);
+                            app.init_box.y1 = std::max(app.drag_y0, iy);
+                            app.has_init_box = true;
+
+                            // Auto-add instance if tracker exists and frame is encoded
+                            if (app.tracker_created && app.frame_encoded) {
+                                add_instance_from_prompts(app);
                             }
                         }
-                        if (best_id >= 0) {
+                    }
+                    app.dragging = false;
+                }
+                if (event.type == SDL_MOUSEBUTTONDOWN && event.button.button == SDL_BUTTON_RIGHT) {
+                    if (screen_to_image(app, mx, my, ix, iy)) {
+                        // Check if clicking on tracked instance (refine with neg point)
+                        int hit_id = find_instance_at(app, ix, iy);
+                        if (hit_id >= 0 && app.tracker_created && app.frame_encoded) {
+                            // sam3_segment_pvs requires at least one positive
+                            // point.  Use the mask centroid as the implicit
+                            // positive seed so negative-only refinement works.
                             std::vector<sam3_point> pos;
+                            for (const auto& det : app.result.detections) {
+                                if (det.instance_id != hit_id || det.mask.data.empty()) continue;
+                                float cx = 0, cy = 0; int n = 0;
+                                int mw = det.mask.width;
+                                for (int p = 0; p < (int)det.mask.data.size(); ++p) {
+                                    if (det.mask.data[p] > 127) {
+                                        cx += static_cast<float>(p % mw);
+                                        cy += static_cast<float>(p / mw);  // NOLINT: integer row index is intentional
+                                        ++n;
+                                    }
+                                }
+                                if (n > 0) pos.push_back({cx / n, cy / n});
+                                break;
+                            }
                             std::vector<sam3_point> neg = {{ix, iy}};
-                            sam3_refine_instance(*app.tracker, *app.state, *app.model,
-                                                 best_id, pos, neg);
+                            bool ok = sam3_refine_instance(*app.tracker, *app.state, *app.model,
+                                                           hit_id, pos, neg);
                             snprintf(app.status, sizeof(app.status),
-                                     "Refined instance #%d with negative point", best_id);
+                                     ok ? "Refined instance #%d with negative point"
+                                        : "Failed to refine instance #%d", hit_id);
+                        } else if (app.init_mode == VMODE_POINTS) {
+                            // Add negative init point
+                            app.init_neg_points.push_back({ix, iy});
                         }
                     }
                 }
@@ -359,16 +478,22 @@ int main(int argc, char** argv) {
             if (event.type == SDL_KEYDOWN && !io.WantCaptureKeyboard) {
                 if (event.key.keysym.sym == SDLK_SPACE) {
                     app.playing = !app.playing;
+                    if (app.playing) app.last_frame_time = SDL_GetTicks();
                 } else if (event.key.keysym.sym == SDLK_RIGHT) {
-                    // Step forward
                     if (app.frame_index + 1 < app.video_info.n_frames) {
                         decode_and_track(app, app.frame_index + 1);
                     }
                 } else if (event.key.keysym.sym == SDLK_LEFT) {
-                    // Step backward (re-decode only, tracking is forward-only)
                     if (app.frame_index > 0) {
                         app.frame = sam3_decode_video_frame(app.video_path, app.frame_index - 1);
                         app.frame_index--;
+                        // The state's encoded features are now stale (they belong
+                        // to the old frame).  Clear frame_encoded so that
+                        // interactions like box-draw or refine won't operate on
+                        // the wrong features.  Also clear displayed results since
+                        // they correspond to the old frame.
+                        app.frame_encoded = false;
+                        app.result = {};
                     }
                 }
             }
@@ -408,12 +533,35 @@ int main(int argc, char** argv) {
 
         // ── Top bar ──────────────────────────────────────────────────────────
 
-        ImGui::Text("Text:");
+        // Mode selector
+        ImGui::Text("Mode:");
         ImGui::SameLine();
-        ImGui::SetNextItemWidth(250);
-        ImGui::InputText("##prompt", app.text_prompt, sizeof(app.text_prompt));
+        if (ImGui::RadioButton("Text", app.init_mode == VMODE_TEXT)) {
+            app.init_mode = VMODE_TEXT;
+            clear_init_prompts(app);
+        }
         ImGui::SameLine();
+        if (ImGui::RadioButton("Box", app.init_mode == VMODE_BOX)) {
+            app.init_mode = VMODE_BOX;
+            clear_init_prompts(app);
+        }
+        ImGui::SameLine();
+        if (ImGui::RadioButton("Points", app.init_mode == VMODE_POINTS)) {
+            app.init_mode = VMODE_POINTS;
+            clear_init_prompts(app);
+        }
 
+        // Text prompt (shown in all modes, but only used for VMODE_TEXT tracking)
+        if (app.init_mode == VMODE_TEXT) {
+            ImGui::SameLine();
+            ImGui::Text("  Text:");
+            ImGui::SameLine();
+            ImGui::SetNextItemWidth(200);
+            ImGui::InputText("##prompt", app.text_prompt, sizeof(app.text_prompt));
+        }
+
+        // Action buttons
+        ImGui::SameLine();
         if (!app.tracker_created) {
             if (ImGui::Button("Start tracking")) {
                 create_tracker(app);
@@ -441,13 +589,28 @@ int main(int argc, char** argv) {
         if (ImGui::Button("Reset")) {
             app.playing = false;
             app.tracker_created = false;
+            app.frame_encoded = false;
             app.tracker.reset();
             app.result = {};
             app.frame_index = 0;
+            clear_init_prompts(app);
             if (!app.video_path.empty()) {
                 app.frame = sam3_decode_video_frame(app.video_path, 0);
             }
             snprintf(app.status, sizeof(app.status), "Tracker reset.");
+        }
+
+        // Add Instance button (for Box/Points modes)
+        if (app.init_mode == VMODE_POINTS && app.tracker_created &&
+            !app.init_pos_points.empty()) {
+            ImGui::SameLine();
+            if (ImGui::Button("Add Instance")) {
+                add_instance_from_prompts(app);
+            }
+            ImGui::SameLine();
+            if (ImGui::Button("Clear points")) {
+                clear_init_prompts(app);
+            }
         }
 
         ImGui::Text("Frame: %d/%d   FPS: %.1f   Objects: %d   Speed: %.1fx",
@@ -486,7 +649,7 @@ int main(int argc, char** argv) {
             ImGui::SetCursorScreenPos(pos);
             ImGui::Image((ImTextureID)(intptr_t)app.tex_frame, ImVec2(dw, dh));
 
-            // Draw instance labels on canvas
+            // Draw instance labels + boxes on canvas
             ImDrawList* dl = ImGui::GetWindowDrawList();
             for (size_t d = 0; d < app.result.detections.size(); ++d) {
                 const auto& det = app.result.detections[d];
@@ -504,6 +667,43 @@ int main(int argc, char** argv) {
                 char label[64];
                 snprintf(label, sizeof(label), "#%d %.2f", det.instance_id, det.score);
                 dl->AddText(ImVec2(sx0 + 2, sy0 - 14), col, label);
+            }
+
+            // Draw pending init points (green = positive, red = negative)
+            for (const auto& p : app.init_pos_points) {
+                float sx = app.canvas_x + p.x / iw * dw;
+                float sy = app.canvas_y + p.y / ih * dh;
+                dl->AddCircleFilled(ImVec2(sx, sy), 6, IM_COL32(0, 255, 0, 220));
+                dl->AddCircle(ImVec2(sx, sy), 6, IM_COL32(255, 255, 255, 255), 0, 2);
+            }
+            for (const auto& p : app.init_neg_points) {
+                float sx = app.canvas_x + p.x / iw * dw;
+                float sy = app.canvas_y + p.y / ih * dh;
+                dl->AddCircleFilled(ImVec2(sx, sy), 6, IM_COL32(255, 0, 0, 220));
+                dl->AddCircle(ImVec2(sx, sy), 6, IM_COL32(255, 255, 255, 255), 0, 2);
+            }
+
+            // Draw pending init box (cyan)
+            if (app.has_init_box) {
+                float sx0 = app.canvas_x + app.init_box.x0 / iw * dw;
+                float sy0 = app.canvas_y + app.init_box.y0 / ih * dh;
+                float sx1 = app.canvas_x + app.init_box.x1 / iw * dw;
+                float sy1 = app.canvas_y + app.init_box.y1 / ih * dh;
+                dl->AddRect(ImVec2(sx0, sy0), ImVec2(sx1, sy1),
+                            IM_COL32(0, 255, 255, 220), 0, 0, 3);
+            }
+
+            // Draw drag-in-progress box (yellow)
+            if (app.dragging) {
+                float dix, diy;
+                if (screen_to_image(app, io.MousePos.x, io.MousePos.y, dix, diy)) {
+                    float sx0 = app.canvas_x + app.drag_x0 / iw * dw;
+                    float sy0 = app.canvas_y + app.drag_y0 / ih * dh;
+                    float sx1 = app.canvas_x + dix / iw * dw;
+                    float sy1 = app.canvas_y + diy / ih * dh;
+                    dl->AddRect(ImVec2(sx0, sy0), ImVec2(sx1, sy1),
+                                IM_COL32(255, 255, 0, 180), 0, 0, 2);
+                }
             }
         } else {
             ImGui::SetCursorPosY(ImGui::GetCursorPosY() + canvas_max_h * 0.4f);
@@ -542,6 +742,17 @@ int main(int argc, char** argv) {
                                    "#%d:%.2f", det.instance_id, det.score);
             }
         }
+
+        // Context-sensitive help
+        if (app.init_mode == VMODE_TEXT)
+            ImGui::TextColored(ImVec4(0.5f, 0.5f, 0.5f, 1.0f),
+                "Text mode: auto-detect via text prompt | Click on mask to refine");
+        else if (app.init_mode == VMODE_BOX)
+            ImGui::TextColored(ImVec4(0.5f, 0.5f, 0.5f, 1.0f),
+                "Box mode: drag box to add instance | Click on mask to refine");
+        else
+            ImGui::TextColored(ImVec4(0.5f, 0.5f, 0.5f, 1.0f),
+                "Points mode: left-click +point, right-click -point | Add Instance to confirm");
 
         ImGui::TextColored(ImVec4(0.6f, 0.8f, 1.0f, 1.0f), "%s", app.status);
 

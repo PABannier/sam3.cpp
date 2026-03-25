@@ -148,6 +148,14 @@ bool sam3_refine_instance(sam3_tracker                   & tracker,
                           const std::vector<sam3_point>  & pos_points,
                           const std::vector<sam3_point>  & neg_points);
 
+// Add a new instance to the tracker from PVS prompts (points/box) on the
+// current frame.  The image must already be encoded (via sam3_track_frame or
+// sam3_encode_image).  Returns assigned instance_id, or -1 on failure.
+int sam3_tracker_add_instance(sam3_tracker         & tracker,
+                              sam3_state            & state,
+                              const sam3_model      & model,
+                              const sam3_pvs_params & pvs_params);
+
 int  sam3_tracker_frame_index(const sam3_tracker & tracker);
 void sam3_tracker_reset(sam3_tracker & tracker);
 

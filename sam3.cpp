@@ -6312,11 +6312,82 @@ bool sam3_refine_instance(sam3_tracker& tracker, sam3_state& state,
     sam3_pvs_params pvs; pvs.pos_points = pos_points; pvs.neg_points = neg_points; pvs.multimask = false;
     auto r = sam3_segment_pvs(state, model, pvs);
     if (r.detections.empty()) return false;
-    tgt->last_score = r.detections[0].score; tgt->last_seen = tracker.frame_index;
+    // tracker.frame_index points to the *next* frame; the refinement applies
+    // to the frame that was last tracked / encoded.
+    int fi = std::max(0, tracker.frame_index - 1);
+    tgt->last_score = r.detections[0].score; tgt->last_seen = fi;
     std::vector<float> op(D, 0.0f);
-    sam3_store_obj_ptr(tracker, model, instance_id, op.data(), tracker.frame_index);
+    sam3_store_obj_ptr(tracker, model, instance_id, op.data(), fi);
     fprintf(stderr, "%s: refined instance %d\n", __func__, instance_id);
     return true;
+}
+
+int sam3_tracker_add_instance(sam3_tracker& tracker, sam3_state& state,
+                              const sam3_model& model,
+                              const sam3_pvs_params& pvs_params) {
+    const int D = model.hparams.neck_dim;
+    const int mask_hw = 288;
+
+    // Run PVS to get the segmentation mask
+    auto r = sam3_segment_pvs(state, model, pvs_params);
+    if (r.detections.empty()) {
+        fprintf(stderr, "%s: PVS returned no masks\n", __func__);
+        return -1;
+    }
+
+    const auto& det = r.detections[0];
+    if (det.mask.data.empty()) {
+        fprintf(stderr, "%s: PVS mask is empty\n", __func__);
+        return -1;
+    }
+
+    int inst_id = tracker.next_inst_id++;
+    // tracker.frame_index points to the *next* frame to process;
+    // the instance is being added on the frame that was just tracked.
+    int fi = tracker.frame_index - 1;
+    if (fi < 0) fi = 0;
+
+    // Create synthetic 288x288 logits from the binary mask.
+    // sam3_encode_memory applies sigmoid then scale/bias, so +6/-6 gives
+    // sigmoid values ~0.9975/~0.0025 — practically identical to real logits.
+    std::vector<float> synth_logits(mask_hw * mask_hw);
+    {
+        int mw = det.mask.width, mh = det.mask.height;
+        for (int y = 0; y < mask_hw; ++y) {
+            int sy = y * mh / mask_hw;
+            for (int x = 0; x < mask_hw; ++x) {
+                int sx = x * mw / mask_hw;
+                synth_logits[y * mask_hw + x] =
+                    (det.mask.data[sy * mw + sx] > 127) ? 6.0f : -6.0f;
+            }
+        }
+    }
+
+    // Encode into memory bank
+    float obj_score = det.mask.obj_score;
+    if (!sam3_encode_memory(tracker, state, model, inst_id,
+                            synth_logits.data(), mask_hw, mask_hw,
+                            fi, true, obj_score)) {
+        fprintf(stderr, "%s: failed to encode memory for instance %d\n", __func__, inst_id);
+        return -1;
+    }
+
+    // Store a zero object pointer (no raw SAM token available from PVS public API)
+    std::vector<float> op(D, 0.0f);
+    sam3_store_obj_ptr(tracker, model, inst_id, op.data(), fi);
+
+    // Create confirmed masklet
+    sam3_masklet ml;
+    ml.instance_id = inst_id;
+    ml.first_frame = fi;
+    ml.last_seen = fi;
+    ml.last_score = det.score;
+    ml.confirmed = true;
+    ml.mds_sum = 1;
+    tracker.masklets.push_back(std::move(ml));
+
+    fprintf(stderr, "%s: added instance #%d (score=%.3f)\n", __func__, inst_id, det.score);
+    return inst_id;
 }
 
 int sam3_tracker_frame_index(const sam3_tracker& tracker) { return tracker.frame_index; }
@@ -6360,12 +6431,13 @@ bool sam3_save_mask(const sam3_mask& mask, const std::string& path) {
 sam3_image sam3_decode_video_frame(const std::string& video_path, int frame_index) {
     sam3_image img;
 
-    // Use ffmpeg to extract a single frame as raw RGB
+    // Use ffmpeg to extract a single frame as raw RGB (frame-accurate)
     char cmd[1024];
     snprintf(cmd, sizeof(cmd),
-             "ffmpeg -nostdin -loglevel error -ss %.4f -i \"%s\" "
-             "-frames:v 1 -f rawvideo -pix_fmt rgb24 pipe:1 2>/dev/null",
-             frame_index / 30.0, video_path.c_str());
+             "ffmpeg -nostdin -loglevel error -i \"%s\" "
+             "-vf \"select=eq(n\\,%d)\" -vsync vfr -frames:v 1 "
+             "-f rawvideo -pix_fmt rgb24 pipe:1 2>/dev/null",
+             video_path.c_str(), frame_index);
 
     // First, get dimensions
     char info_cmd[1024];

@@ -1,12 +1,14 @@
 // sam3_image — Interactive image segmentation example
 //
 // Usage: sam3_image --model <path.ggml> [--tokenizer <dir>] [--image <path>]
+//                   [--threads N] [--no-gpu]
 //
 // Controls:
-//   Type a text prompt and press [Segment] for PCS (detect all matching instances).
-//   Left-click: add positive PVS point (green).
-//   Right-click: add negative PVS point (red).
-//   Drag left button: draw exemplar box.
+//   Mode selector: Points / Box (PVS) / Exemplar (PCS)
+//   Left-click on canvas: add positive point (or start box drag).
+//   Right-click on canvas: add negative point.
+//   Drag on canvas: draw bounding box.
+//   Type a text prompt and press [Segment] for PCS.
 //   [Clear] resets prompts and masks.
 //   [Export] saves masks as PNG files.
 
@@ -18,12 +20,16 @@
 #include <imgui_impl_opengl3.h>
 
 #ifdef __APPLE__
-#include <OpenGL/gl.h>
+#ifndef GL_SILENCE_DEPRECATION
+#define GL_SILENCE_DEPRECATION
+#endif
+#include <OpenGL/gl3.h>
 #else
 #include <GL/gl.h>
 #endif
 
 #include <algorithm>
+#include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <string>
@@ -39,6 +45,12 @@ static const float INSTANCE_COLORS[][3] = {
 };
 static constexpr int N_COLORS = sizeof(INSTANCE_COLORS) / sizeof(INSTANCE_COLORS[0]);
 
+enum interaction_mode { MODE_POINTS, MODE_BOX_PVS, MODE_EXEMPLAR_PCS };
+
+// Deferred action — we set this to trigger segmentation on the *next* frame,
+// so the busy overlay has a chance to render first.
+enum pending_action { ACTION_NONE, ACTION_PCS, ACTION_PVS, ACTION_PVS_BOX };
+
 struct app_state {
     // Model
     sam3_params         params;
@@ -51,6 +63,9 @@ struct app_state {
     GLuint              tex_overlay = 0;
     bool                image_encoded = false;
 
+    // Interaction mode
+    interaction_mode    mode = MODE_POINTS;
+
     // PCS
     char                text_prompt[256] = {};
     float               score_threshold  = 0.5f;
@@ -62,6 +77,8 @@ struct app_state {
     std::vector<sam3_point> pos_points;
     std::vector<sam3_point> neg_points;
     bool                multimask = false;
+    sam3_box            pvs_box = {0, 0, 0, 0};
+    bool                has_pvs_box = false;
 
     // Results
     sam3_result         result;
@@ -77,11 +94,11 @@ struct app_state {
     float               canvas_y    = 0;
     float               canvas_w    = 0;
     float               canvas_h    = 0;
-    float               zoom        = 1.0f;
 
-    // Status
+    // Status / busy overlay
     char                status[256] = "Ready.";
     bool                busy        = false;
+    pending_action      pending     = ACTION_NONE;
 };
 
 static GLuint upload_texture(const uint8_t* data, int w, int h, int ch, GLuint existing = 0) {
@@ -100,7 +117,6 @@ static void build_overlay(app_state& app) {
     int w = app.image.width;
     int h = app.image.height;
 
-    // Start from the original image
     std::vector<uint8_t> overlay(w * h * 4);
     for (int i = 0; i < w * h; ++i) {
         overlay[4*i+0] = app.image.data[3*i+0];
@@ -109,7 +125,6 @@ static void build_overlay(app_state& app) {
         overlay[4*i+3] = 255;
     }
 
-    // Blend masks
     if (app.show_masks) {
         for (size_t d = 0; d < app.result.detections.size(); ++d) {
             const auto& det = app.result.detections[d];
@@ -150,8 +165,9 @@ static void load_image(app_state& app, const char* path) {
     app.neg_points.clear();
     app.pos_exemplars.clear();
     app.neg_exemplars.clear();
+    app.pvs_box = {0, 0, 0, 0};
+    app.has_pvs_box = false;
 
-    // Encode
     snprintf(app.status, sizeof(app.status), "Encoding image (%dx%d)...",
              app.image.width, app.image.height);
     app.busy = true;
@@ -202,6 +218,26 @@ static void run_pvs(app_state& app) {
     build_overlay(app);
 }
 
+static void run_pvs_box(app_state& app) {
+    if (!app.image_encoded) return;
+    if (!app.has_pvs_box) return;
+    snprintf(app.status, sizeof(app.status), "Running PVS (box)...");
+    app.busy = true;
+
+    sam3_pvs_params pvs;
+    pvs.pos_points = app.pos_points;
+    pvs.neg_points = app.neg_points;
+    pvs.box        = app.pvs_box;
+    pvs.use_box    = true;
+    pvs.multimask  = app.multimask;
+
+    app.result = sam3_segment_pvs(*app.state, *app.model, pvs);
+    snprintf(app.status, sizeof(app.status), "PVS (box): %d masks.",
+             (int)app.result.detections.size());
+    app.busy = false;
+    build_overlay(app);
+}
+
 static void export_masks(const app_state& app) {
     for (size_t i = 0; i < app.result.detections.size(); ++i) {
         char path[256];
@@ -219,6 +255,36 @@ static bool screen_to_image(const app_state& app, float sx, float sy,
     ix = (sx - app.canvas_x) / app.canvas_w * app.image.width;
     iy = (sy - app.canvas_y) / app.canvas_h * app.image.height;
     return ix >= 0 && iy >= 0 && ix < app.image.width && iy < app.image.height;
+}
+
+// Draw a spinning indicator + message as a centered overlay
+static void draw_busy_overlay(const char* message) {
+    ImGuiIO& io = ImGui::GetIO();
+    ImVec2 center(io.DisplaySize.x * 0.5f, io.DisplaySize.y * 0.5f);
+
+    // Dim background
+    ImGui::GetForegroundDrawList()->AddRectFilled(
+        ImVec2(0, 0), io.DisplaySize, IM_COL32(0, 0, 0, 140));
+
+    // Spinner
+    float t = (float)ImGui::GetTime();
+    float radius = 20.0f;
+    int num_segments = 12;
+    for (int i = 0; i < num_segments; ++i) {
+        float angle = t * 5.0f + i * (2.0f * 3.14159f / num_segments);
+        float alpha = (float)(i + 1) / num_segments;
+        float x = center.x + cosf(angle) * radius;
+        float y = center.y - 30.0f + sinf(angle) * radius;
+        ImGui::GetForegroundDrawList()->AddCircleFilled(
+            ImVec2(x, y), 3.0f,
+            IM_COL32(255, 255, 255, (int)(alpha * 255)));
+    }
+
+    // Text below spinner
+    ImVec2 text_size = ImGui::CalcTextSize(message);
+    ImGui::GetForegroundDrawList()->AddText(
+        ImVec2(center.x - text_size.x * 0.5f, center.y + 10.0f),
+        IM_COL32(255, 255, 255, 255), message);
 }
 
 // ── Main ─────────────────────────────────────────────────────────────────────
@@ -254,6 +320,8 @@ int main(int argc, char** argv) {
         fprintf(stderr, "Error: --model is required.\n");
         return 1;
     }
+
+    fprintf(stderr, "Using %d threads\n", app.params.n_threads);
 
     // ── Init SDL2 + OpenGL ───────────────────────────────────────────────────
 
@@ -337,46 +405,18 @@ int main(int argc, char** argv) {
                 load_image(app, event.drop.file);
                 SDL_free(event.drop.file);
             }
+        }
 
-            // Mouse interactions on the canvas (only when ImGui doesn't want input)
-            if (!io.WantCaptureMouse && !app.image.data.empty() && app.image_encoded) {
-                float mx = io.MousePos.x;
-                float my = io.MousePos.y;
-                float ix, iy;
+        // ── Execute deferred segmentation (runs after the busy overlay frame) ─
 
-                if (event.type == SDL_MOUSEBUTTONDOWN && event.button.button == SDL_BUTTON_LEFT) {
-                    if (screen_to_image(app, mx, my, ix, iy)) {
-                        app.dragging = true;
-                        app.drag_x0  = ix;
-                        app.drag_y0  = iy;
-                    }
-                }
-                if (event.type == SDL_MOUSEBUTTONUP && event.button.button == SDL_BUTTON_LEFT) {
-                    if (app.dragging && screen_to_image(app, mx, my, ix, iy)) {
-                        float dx = ix - app.drag_x0;
-                        float dy = iy - app.drag_y0;
-                        if (dx*dx + dy*dy > 25.0f) {
-                            // It was a drag → exemplar box
-                            sam3_box box;
-                            box.x0 = std::min(app.drag_x0, ix);
-                            box.y0 = std::min(app.drag_y0, iy);
-                            box.x1 = std::max(app.drag_x0, ix);
-                            box.y1 = std::max(app.drag_y0, iy);
-                            app.pos_exemplars.push_back(box);
-                        } else {
-                            // It was a click → positive point
-                            app.pos_points.push_back({app.drag_x0, app.drag_y0});
-                            run_pvs(app);
-                        }
-                    }
-                    app.dragging = false;
-                }
-                if (event.type == SDL_MOUSEBUTTONDOWN && event.button.button == SDL_BUTTON_RIGHT) {
-                    if (screen_to_image(app, mx, my, ix, iy)) {
-                        app.neg_points.push_back({ix, iy});
-                        run_pvs(app);
-                    }
-                }
+        if (app.pending != ACTION_NONE) {
+            pending_action act = app.pending;
+            app.pending = ACTION_NONE;
+            switch (act) {
+                case ACTION_PCS:     run_pcs(app); break;
+                case ACTION_PVS:     run_pvs(app); break;
+                case ACTION_PVS_BOX: run_pvs_box(app); break;
+                default: break;
             }
         }
 
@@ -406,7 +446,9 @@ int main(int argc, char** argv) {
                                                ImGuiInputTextFlags_EnterReturnsTrue);
         ImGui::SameLine();
         if ((ImGui::Button("Segment") || enter_pressed) && app.image_encoded) {
-            run_pcs(app);
+            app.busy = true;
+            app.pending = ACTION_PCS;
+            snprintf(app.status, sizeof(app.status), "Segmenting...");
         }
         ImGui::SameLine();
         if (ImGui::Button("Clear")) {
@@ -415,6 +457,8 @@ int main(int argc, char** argv) {
             app.neg_points.clear();
             app.pos_exemplars.clear();
             app.neg_exemplars.clear();
+            app.pvs_box = {0, 0, 0, 0};
+            app.has_pvs_box = false;
             app.text_prompt[0] = '\0';
             build_overlay(app);
         }
@@ -423,10 +467,19 @@ int main(int argc, char** argv) {
             export_masks(app);
         }
 
+        // Mode selector
+        ImGui::Text("Mode:");
+        ImGui::SameLine();
+        if (ImGui::RadioButton("Points", app.mode == MODE_POINTS)) app.mode = MODE_POINTS;
+        ImGui::SameLine();
+        if (ImGui::RadioButton("Box (PVS)", app.mode == MODE_BOX_PVS)) app.mode = MODE_BOX_PVS;
+        ImGui::SameLine();
+        if (ImGui::RadioButton("Exemplar (PCS)", app.mode == MODE_EXEMPLAR_PCS)) app.mode = MODE_EXEMPLAR_PCS;
+
         // ── Image canvas ─────────────────────────────────────────────────────
 
         ImVec2 avail = ImGui::GetContentRegionAvail();
-        float panel_h = 100.0f;  // space for bottom controls
+        float panel_h = 100.0f;
         float canvas_max_h = avail.y - panel_h;
         float canvas_max_w = avail.x;
 
@@ -438,7 +491,6 @@ int main(int argc, char** argv) {
             float dh = ih * scale;
 
             ImVec2 pos = ImGui::GetCursorScreenPos();
-            // Center horizontally
             float offset_x = (canvas_max_w - dw) * 0.5f;
             pos.x += offset_x;
 
@@ -447,12 +499,83 @@ int main(int argc, char** argv) {
             app.canvas_w = dw;
             app.canvas_h = dh;
 
+            // Draw the image via an InvisibleButton so we get proper hover/click
             ImGui::SetCursorScreenPos(pos);
-            ImGui::Image((ImTextureID)(intptr_t)app.tex_overlay,
-                         ImVec2(dw, dh));
+            ImGui::InvisibleButton("canvas", ImVec2(dw, dh));
+            bool canvas_hovered = ImGui::IsItemHovered();
+            bool canvas_active  = ImGui::IsItemActive();
 
-            // Draw points on canvas
+            // Draw the texture manually on the draw list
             ImDrawList* dl = ImGui::GetWindowDrawList();
+            dl->AddImage((ImTextureID)(intptr_t)app.tex_overlay,
+                         pos, ImVec2(pos.x + dw, pos.y + dh));
+
+            // ── Canvas mouse interaction ─────────────────────────────────────
+
+            if (canvas_hovered && !app.busy && app.image_encoded) {
+                float mx = io.MousePos.x;
+                float my = io.MousePos.y;
+                float ix, iy;
+
+                // Left button down → start drag
+                if (ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
+                    if (screen_to_image(app, mx, my, ix, iy)) {
+                        app.dragging = true;
+                        app.drag_x0  = ix;
+                        app.drag_y0  = iy;
+                    }
+                }
+
+                // Right click → negative point
+                if (ImGui::IsMouseClicked(ImGuiMouseButton_Right)) {
+                    if (screen_to_image(app, mx, my, ix, iy)) {
+                        app.neg_points.push_back({ix, iy});
+                        app.busy = true;
+                        app.pending = app.has_pvs_box ? ACTION_PVS_BOX : ACTION_PVS;
+                        snprintf(app.status, sizeof(app.status), "Segmenting...");
+                    }
+                }
+            }
+
+            // Left button release → finish drag or click
+            if (app.dragging && ImGui::IsMouseReleased(ImGuiMouseButton_Left)) {
+                float mx = io.MousePos.x;
+                float my = io.MousePos.y;
+                float ix, iy;
+                if (screen_to_image(app, mx, my, ix, iy)) {
+                    float dx = ix - app.drag_x0;
+                    float dy = iy - app.drag_y0;
+                    if (dx*dx + dy*dy > 25.0f) {
+                        // Drag → box
+                        sam3_box box;
+                        box.x0 = std::min(app.drag_x0, ix);
+                        box.y0 = std::min(app.drag_y0, iy);
+                        box.x1 = std::max(app.drag_x0, ix);
+                        box.y1 = std::max(app.drag_y0, iy);
+                        if (app.mode == MODE_EXEMPLAR_PCS) {
+                            app.pos_exemplars.push_back(box);
+                        } else {
+                            // Points or Box mode → PVS box
+                            app.pvs_box = box;
+                            app.has_pvs_box = true;
+                            app.busy = true;
+                            app.pending = ACTION_PVS_BOX;
+                            snprintf(app.status, sizeof(app.status), "Segmenting...");
+                        }
+                    } else {
+                        // Click → positive point
+                        app.pos_points.push_back({app.drag_x0, app.drag_y0});
+                        app.busy = true;
+                        app.pending = app.has_pvs_box ? ACTION_PVS_BOX : ACTION_PVS;
+                        snprintf(app.status, sizeof(app.status), "Segmenting...");
+                    }
+                }
+                app.dragging = false;
+            }
+
+            // ── Draw annotations on canvas ───────────────────────────────────
+
+            // Points
             for (const auto& p : app.pos_points) {
                 float sx = app.canvas_x + p.x / iw * dw;
                 float sy = app.canvas_y + p.y / ih * dh;
@@ -466,7 +589,7 @@ int main(int argc, char** argv) {
                 dl->AddCircle(ImVec2(sx, sy), 6, IM_COL32(255, 255, 255, 255), 0, 2);
             }
 
-            // Draw exemplar boxes
+            // Exemplar boxes (green)
             for (const auto& b : app.pos_exemplars) {
                 float sx0 = app.canvas_x + b.x0 / iw * dw;
                 float sy0 = app.canvas_y + b.y0 / ih * dh;
@@ -476,20 +599,30 @@ int main(int argc, char** argv) {
                             IM_COL32(0, 255, 0, 200), 0, 0, 2);
             }
 
-            // Draw drag-in-progress box
+            // PVS bounding box (cyan)
+            if (app.has_pvs_box) {
+                float sx0 = app.canvas_x + app.pvs_box.x0 / iw * dw;
+                float sy0 = app.canvas_y + app.pvs_box.y0 / ih * dh;
+                float sx1 = app.canvas_x + app.pvs_box.x1 / iw * dw;
+                float sy1 = app.canvas_y + app.pvs_box.y1 / ih * dh;
+                dl->AddRect(ImVec2(sx0, sy0), ImVec2(sx1, sy1),
+                            IM_COL32(0, 255, 255, 220), 0, 0, 3);
+            }
+
+            // Drag-in-progress box (yellow)
             if (app.dragging) {
-                float ix, iy;
-                if (screen_to_image(app, io.MousePos.x, io.MousePos.y, ix, iy)) {
+                float dix, diy;
+                if (screen_to_image(app, io.MousePos.x, io.MousePos.y, dix, diy)) {
                     float sx0 = app.canvas_x + app.drag_x0 / iw * dw;
                     float sy0 = app.canvas_y + app.drag_y0 / ih * dh;
-                    float sx1 = app.canvas_x + ix / iw * dw;
-                    float sy1 = app.canvas_y + iy / ih * dh;
+                    float sx1 = app.canvas_x + dix / iw * dw;
+                    float sy1 = app.canvas_y + diy / ih * dh;
                     dl->AddRect(ImVec2(sx0, sy0), ImVec2(sx1, sy1),
                                 IM_COL32(255, 255, 0, 180), 0, 0, 2);
                 }
             }
 
-            // Draw detection boxes + labels
+            // Detection boxes + labels
             for (size_t d = 0; d < app.result.detections.size(); ++d) {
                 const auto& det = app.result.detections[d];
                 const float* c = INSTANCE_COLORS[d % N_COLORS];
@@ -527,6 +660,17 @@ int main(int argc, char** argv) {
         ImGui::SameLine();
         ImGui::Checkbox("Multi-mask (PVS)", &app.multimask);
 
+        // Context-sensitive help
+        if (app.mode == MODE_POINTS)
+            ImGui::TextColored(ImVec4(0.5f, 0.5f, 0.5f, 1.0f),
+                "Left-click: +point | Right-click: -point | Drag: bounding box");
+        else if (app.mode == MODE_BOX_PVS)
+            ImGui::TextColored(ImVec4(0.5f, 0.5f, 0.5f, 1.0f),
+                "Drag: bounding box (PVS) | Left-click: +point | Right-click: -point");
+        else
+            ImGui::TextColored(ImVec4(0.5f, 0.5f, 0.5f, 1.0f),
+                "Drag: exemplar box | Type text and press Segment");
+
         ImGui::TextColored(ImVec4(0.6f, 0.8f, 1.0f, 1.0f), "%s", app.status);
 
         // Detection list
@@ -543,6 +687,12 @@ int main(int argc, char** argv) {
         }
 
         ImGui::End();
+
+        // ── Busy overlay (drawn on foreground, over everything) ──────────────
+
+        if (app.busy) {
+            draw_busy_overlay("Segmenting...");
+        }
 
         // ── Render ───────────────────────────────────────────────────────────
 
