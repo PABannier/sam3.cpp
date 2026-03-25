@@ -277,6 +277,19 @@ def main():
             data = v.numpy()
         else:
             data = v
+        # vit.pos_embed: checkpoint stores [1, 577, 1024] (576 spatial + 1 cls token).
+        # The C++ loader expects [24, 24, 1024] (spatial grid only, no cls token).
+        # Strip the cls token and reshape to the pretrained spatial grid.
+        if new_name == "vit.pos_embed" and isinstance(data, np.ndarray):
+            if data.ndim == 3 and data.shape[1] == 577:
+                grid = int(np.sqrt(data.shape[1] - 1))
+                assert grid * grid == data.shape[1] - 1, (
+                    f"pos_embed spatial tokens ({data.shape[1]-1}) is not a perfect square"
+                )
+                data = data[:, 1:, :]             # [1, 576, 1024]
+                data = data.reshape(grid, grid, -1)  # [24, 24, 1024]
+                print(f"  vit.pos_embed: stripped cls token, reshaped to {list(data.shape)}")
+
         renamed[new_name] = data
 
     print(f"Kept:    {len(renamed)} tensors")
