@@ -1,0 +1,31 @@
+# PDF paper
+*.pdf
+
+# Build
+build/
+cmake-build-*/
+.cache/
+
+# Models/weights
+models/
+*.ggml
+*.bin
+*.pt
+*.pth
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Test artifacts
+/tmp/
+tests/output/
+
+raw_weights/
