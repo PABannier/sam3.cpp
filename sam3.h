@@ -207,6 +207,14 @@ bool sam3_test_dump_phase6_from_ref_inputs(const sam3_model & model,
                                            const std::string & output_dir,
                                            int n_threads = 4);
 
+// Test-only: run the phase 7 tracker subgraph from pre-dumped case inputs and
+// dump standard intermediate tensors to <output_dir>/<tensor_name>.{bin,shape}.
+// The case directory is produced by tests/dump_phase7_reference.py.
+bool sam3_test_dump_phase7_from_ref_inputs(const sam3_model & model,
+                                           const std::string & case_ref_dir,
+                                           const std::string & output_dir,
+                                           int n_threads = 4);
+
 // ─── Debug: dump state tensors to files for verification ───
 
 bool sam3_dump_state_tensor(const sam3_state & state,

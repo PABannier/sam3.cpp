@@ -1,0 +1,3 @@
+single_mem_no_ptr	Single memory, no pointer	point_single	0	-
+cond_prev_with_ptr	Conditioning and previous memory with pointers	point_single|box_only	0|1	1|2
+two_prev_with_ptr	Two previous memories with pointers	point_single|box_only	1|2	1|2
