@@ -3063,9 +3063,10 @@ static struct ggml_tensor * sam3_build_fenc_graph(
 // ═══════════════════════════════════════════════════════════════════════════════
 
 // inverse_sigmoid: log(x / (1 - x)), clamped to avoid inf
+// Python reference uses eps=1e-3: x1 = x.clamp(min=eps), x2 = (1-x).clamp(min=eps)
 static struct ggml_tensor * sam3_inverse_sigmoid(struct ggml_context * ctx, struct ggml_tensor * x) {
-    // clamp x to [1e-5, 1-1e-5]
-    x = ggml_clamp(ctx, x, 1e-5f, 1.0f - 1e-5f);
+    // clamp x to [1e-3, 1-1e-3] to match Python eps=1e-3
+    x = ggml_clamp(ctx, x, 1e-3f, 1.0f - 1e-3f);
     // log(x / (1 - x)) = log(x) - log(1 - x)
     auto * log_x = ggml_log(ctx, x);
     // Compute (1 - x) as (-1)*x + 1.  We use ggml_scale_bias which takes float
@@ -3149,14 +3150,23 @@ static struct ggml_tensor * sam3_ddec_layer_forward(
 {
     const int64_t D = queries->ne[0];
 
-    // 1. Self-attention among queries (pre-norm, Q and K get positional encoding)
-    {
-        auto * shortcut = queries;
-        auto * q_norm = sam3_layer_norm(ctx, queries, ly.norm1_w, ly.norm1_b);
-        auto * q_in = ggml_add(ctx, q_norm, query_pos);
-        auto * k_in = ggml_add(ctx, q_norm, query_pos);
+    // Python decoder layer order (all post-norm):
+    //   1. Self-attention → norm2 (post-norm)
+    //   2. Text cross-attention (ca_text) → catext_norm (post-norm)
+    //   3. Image cross-attention (cross_attn) → norm1 (post-norm)
+    //   4. FFN → norm3 (post-norm)
+    //
+    // Norm weight mapping:
+    //   ly.norm2_w  = ".norm2.weight"        = Python norm2 (post-SA)
+    //   ly.norm3_w  = ".norm_ca_text.weight"  = Python catext_norm (post-text-CA)
+    //   ly.norm1_w  = ".norm1.weight"         = Python norm1 (post-image-CA)
+    //   ly.norm4_w  = ".norm3.weight"         = Python norm3 (post-FFN)
 
-        // Split in_proj and do custom Q/K/V
+    // 1. Self-attention among queries (post-norm)
+    {
+        // Q = K = queries + query_pos, V = queries (no pos)
+        auto * q_in = ggml_add(ctx, queries, query_pos);
+
         auto * q_w = ggml_view_2d(ctx, ly.sa_in_proj_w, D, D, ly.sa_in_proj_w->nb[1], 0);
         auto * k_w = ggml_view_2d(ctx, ly.sa_in_proj_w, D, D, ly.sa_in_proj_w->nb[1], D * ly.sa_in_proj_w->nb[1]);
         auto * v_w = ggml_view_2d(ctx, ly.sa_in_proj_w, D, D, ly.sa_in_proj_w->nb[1], 2 * D * ly.sa_in_proj_w->nb[1]);
@@ -3169,8 +3179,8 @@ static struct ggml_tensor * sam3_ddec_layer_forward(
         const int64_t HD = D / n_heads;
 
         auto * Q = ggml_add(ctx, ggml_mul_mat(ctx, q_w, q_in), q_b);
-        auto * K = ggml_add(ctx, ggml_mul_mat(ctx, k_w, k_in), k_b);
-        auto * V = ggml_add(ctx, ggml_mul_mat(ctx, v_w, q_norm), v_b);
+        auto * K = ggml_add(ctx, ggml_mul_mat(ctx, k_w, q_in), k_b);
+        auto * V = ggml_add(ctx, ggml_mul_mat(ctx, v_w, queries), v_b);
 
         Q = ggml_reshape_4d(ctx, Q, HD, n_heads, N, B);
         Q = ggml_cont(ctx, ggml_permute(ctx, Q, 0, 2, 1, 3));
@@ -3185,15 +3195,55 @@ static struct ggml_tensor * sam3_ddec_layer_forward(
         sa_out = ggml_mul_mat(ctx, ly.sa_out_proj_w, sa_out);
         sa_out = ggml_add(ctx, sa_out, ly.sa_out_proj_b);
 
-        queries = ggml_add(ctx, shortcut, sa_out);
+        queries = ggml_add(ctx, queries, sa_out);
+        // Post-norm: norm2 (Python's post-SA norm)
+        queries = sam3_layer_norm(ctx, queries, ly.norm2_w, ly.norm2_b);
     }
 
-    // 2. Cross-attention to conditioned image features (pre-norm)
+    // 2. Cross-attention to text tokens (post-norm)
     {
-        auto * shortcut = queries;
-        auto * q_norm = sam3_layer_norm(ctx, queries, ly.norm2_w, ly.norm2_b);
-        auto * q_in = ggml_add(ctx, q_norm, query_pos);
-        auto * k_in = ggml_add(ctx, enc_feats, enc_pos);  // image feats + pos
+        // Q = queries + query_pos, K = V = text_feats
+        auto * q_in = ggml_add(ctx, queries, query_pos);
+
+        auto * q_w = ggml_view_2d(ctx, ly.ca_text_q_w, D, D, ly.ca_text_q_w->nb[1], 0);
+        auto * k_w = ggml_view_2d(ctx, ly.ca_text_q_w, D, D, ly.ca_text_q_w->nb[1], D * ly.ca_text_q_w->nb[1]);
+        auto * v_w = ggml_view_2d(ctx, ly.ca_text_q_w, D, D, ly.ca_text_q_w->nb[1], 2 * D * ly.ca_text_q_w->nb[1]);
+        auto * q_b = ggml_view_1d(ctx, ly.ca_text_q_b, D, 0);
+        auto * k_b = ggml_view_1d(ctx, ly.ca_text_q_b, D, D * sizeof(float));
+        auto * v_b = ggml_view_1d(ctx, ly.ca_text_q_b, D, 2 * D * sizeof(float));
+
+        const int64_t N_q  = queries->ne[1];
+        const int64_t N_kv = text_feats->ne[1];
+        const int64_t B    = queries->ne[2];
+        const int64_t HD   = D / n_heads;
+
+        auto * Q = ggml_add(ctx, ggml_mul_mat(ctx, q_w, q_in), q_b);
+        auto * K = ggml_add(ctx, ggml_mul_mat(ctx, k_w, text_feats), k_b);
+        auto * V = ggml_add(ctx, ggml_mul_mat(ctx, v_w, text_feats), v_b);
+
+        Q = ggml_reshape_4d(ctx, Q, HD, n_heads, N_q, B);
+        Q = ggml_cont(ctx, ggml_permute(ctx, Q, 0, 2, 1, 3));
+        K = ggml_reshape_4d(ctx, K, HD, n_heads, N_kv, B);
+        K = ggml_cont(ctx, ggml_permute(ctx, K, 0, 2, 1, 3));
+        V = ggml_reshape_4d(ctx, V, HD, n_heads, N_kv, B);
+        V = ggml_cont(ctx, ggml_permute(ctx, V, 0, 2, 1, 3));
+
+        float scale = 1.0f / sqrtf((float)HD);
+        auto * ca_out = ggml_flash_attn_ext(ctx, Q, K, V, nullptr, scale, 0.0f, 0.0f);
+        ca_out = ggml_reshape_3d(ctx, ca_out, D, N_q, B);
+        ca_out = ggml_mul_mat(ctx, ly.ca_text_out_w, ca_out);
+        ca_out = ggml_add(ctx, ca_out, ly.ca_text_out_b);
+
+        queries = ggml_add(ctx, queries, ca_out);
+        // Post-norm: catext_norm (Python's post-text-CA norm)
+        queries = sam3_layer_norm(ctx, queries, ly.norm3_w, ly.norm3_b);
+    }
+
+    // 3. Cross-attention to conditioned image features (post-norm)
+    {
+        // Q = queries + query_pos, K = enc_feats + enc_pos, V = enc_feats
+        auto * q_in = ggml_add(ctx, queries, query_pos);
+        auto * k_in = ggml_add(ctx, enc_feats, enc_pos);
 
         auto * q_w = ggml_view_2d(ctx, ly.ca_q_w, D, D, ly.ca_q_w->nb[1], 0);
         auto * k_w = ggml_view_2d(ctx, ly.ca_q_w, D, D, ly.ca_q_w->nb[1], D * ly.ca_q_w->nb[1]);
@@ -3224,67 +3274,40 @@ static struct ggml_tensor * sam3_ddec_layer_forward(
         ca_out = ggml_mul_mat(ctx, ly.ca_out_w, ca_out);
         ca_out = ggml_add(ctx, ca_out, ly.ca_out_b);
 
-        queries = ggml_add(ctx, shortcut, ca_out);
+        queries = ggml_add(ctx, queries, ca_out);
+        // Post-norm: norm1 (Python's post-image-CA norm)
+        queries = sam3_layer_norm(ctx, queries, ly.norm1_w, ly.norm1_b);
     }
 
-    // 3. Cross-attention to text tokens (pre-norm)
+    // 4. FFN (post-norm, ReLU)
     {
-        auto * shortcut = queries;
-        auto * q_norm = sam3_layer_norm(ctx, queries, ly.norm3_w, ly.norm3_b);
-
-        // ca_text uses fused in_proj: Q from queries, K/V from text
-        auto * q_w = ggml_view_2d(ctx, ly.ca_text_q_w, D, D, ly.ca_text_q_w->nb[1], 0);
-        auto * k_w = ggml_view_2d(ctx, ly.ca_text_q_w, D, D, ly.ca_text_q_w->nb[1], D * ly.ca_text_q_w->nb[1]);
-        auto * v_w = ggml_view_2d(ctx, ly.ca_text_q_w, D, D, ly.ca_text_q_w->nb[1], 2 * D * ly.ca_text_q_w->nb[1]);
-        auto * q_b = ggml_view_1d(ctx, ly.ca_text_q_b, D, 0);
-        auto * k_b = ggml_view_1d(ctx, ly.ca_text_q_b, D, D * sizeof(float));
-        auto * v_b = ggml_view_1d(ctx, ly.ca_text_q_b, D, 2 * D * sizeof(float));
-
-        const int64_t N_q  = queries->ne[1];
-        const int64_t N_kv = text_feats->ne[1];
-        const int64_t B    = queries->ne[2];
-        const int64_t HD   = D / n_heads;
-
-        auto * Q = ggml_add(ctx, ggml_mul_mat(ctx, q_w, q_norm), q_b);
-        auto * K = ggml_add(ctx, ggml_mul_mat(ctx, k_w, text_feats), k_b);
-        auto * V = ggml_add(ctx, ggml_mul_mat(ctx, v_w, text_feats), v_b);
-
-        Q = ggml_reshape_4d(ctx, Q, HD, n_heads, N_q, B);
-        Q = ggml_cont(ctx, ggml_permute(ctx, Q, 0, 2, 1, 3));
-        K = ggml_reshape_4d(ctx, K, HD, n_heads, N_kv, B);
-        K = ggml_cont(ctx, ggml_permute(ctx, K, 0, 2, 1, 3));
-        V = ggml_reshape_4d(ctx, V, HD, n_heads, N_kv, B);
-        V = ggml_cont(ctx, ggml_permute(ctx, V, 0, 2, 1, 3));
-
-        float scale = 1.0f / sqrtf((float)HD);
-        auto * ca_out = ggml_flash_attn_ext(ctx, Q, K, V, nullptr, scale, 0.0f, 0.0f);
-        ca_out = ggml_reshape_3d(ctx, ca_out, D, N_q, B);
-        ca_out = ggml_mul_mat(ctx, ly.ca_text_out_w, ca_out);
-        ca_out = ggml_add(ctx, ca_out, ly.ca_text_out_b);
-
-        queries = ggml_add(ctx, shortcut, ca_out);
-    }
-
-    // 4. FFN (pre-norm, ReLU)
-    {
-        auto * shortcut = queries;
-        auto * q_norm = sam3_layer_norm(ctx, queries, ly.norm4_w, ly.norm4_b);
-
-        auto * ffn = ggml_mul_mat(ctx, ly.ffn_fc1_w, q_norm);
+        auto * ffn = ggml_mul_mat(ctx, ly.ffn_fc1_w, queries);
         ffn = ggml_add(ctx, ffn, ly.ffn_fc1_b);
         ffn = ggml_relu(ctx, ffn);
         ffn = ggml_mul_mat(ctx, ly.ffn_fc2_w, ffn);
         ffn = ggml_add(ctx, ffn, ly.ffn_fc2_b);
 
-        queries = ggml_add(ctx, shortcut, ffn);
+        queries = ggml_add(ctx, queries, ffn);
+        // Post-norm: norm3 (Python's post-FFN norm)
+        queries = sam3_layer_norm(ctx, queries, ly.norm4_w, ly.norm4_b);
     }
 
     return queries;
 }
 
 // DotProductScoring: classify queries against text features via dot product.
+//
+// Python reference (DotProductScoring.forward):
+//   1. prompt_mlp(prompt) → residual MLP + LN on text features
+//   2. mean_pool_text(result, prompt_mask) → pooled [BS, D]
+//   3. prompt_proj(pooled) → [BS, D]
+//   4. hs_proj(hs) → [num_layer, BS, N_q, D]
+//   5. matmul(proj_hs, proj_pooled.unsqueeze(-1)) → dot product → [num_layer, BS, N_q, 1]
+//   6. scale by 1/sqrt(D)
+//   7. clamp to [-12, 12]
+//
 // query_outputs: [D, N_q, B] — the 200 object query outputs
-// text_features: [D, T, B] — text encoder output
+// text_features: [D, T, B] — text encoder output (already through resizer)
 // Returns: class_scores [N_q, B] (one score per query per batch)
 static struct ggml_tensor * sam3_dot_product_scoring(
         struct ggml_context * ctx,
@@ -3293,58 +3316,69 @@ static struct ggml_tensor * sam3_dot_product_scoring(
         struct ggml_tensor * text_features)  // [D, T, B]
 {
     const auto & tensors = model.tensors;
-    const int64_t D = query_outputs->ne[0];  // 256
+    const int64_t D   = query_outputs->ne[0];   // 256
+    const int64_t T   = text_features->ne[1];
+    const int64_t B   = text_features->ne[2];
 
-    // Project text features through scoring MLP: residual MLP with ReLU + LayerNorm
-    // prompt_proj: linear D→D
-    auto * text_proj = ggml_mul_mat(ctx, tensors.at("scoring.prompt_proj.weight"), text_features);
-    text_proj = ggml_add(ctx, text_proj, tensors.at("scoring.prompt_proj.bias"));
+    // Step 1: Apply prompt_mlp on text features (residual MLP + LayerNorm)
+    // prompt_mlp is MLP(256, 2048, 256, 2, residual=True, out_norm=LayerNorm)
+    // MLP forward: x = relu(fc0(x)); x = fc1(x); if residual: x += orig; x = LN(x)
+    auto * text_mlp = text_features;  // [D, T, B]
+    auto * orig_text = text_features;
+    text_mlp = ggml_mul_mat(ctx, tensors.at("scoring.prompt_mlp.layers.0.weight"), text_mlp);
+    text_mlp = ggml_add(ctx, text_mlp, tensors.at("scoring.prompt_mlp.layers.0.bias"));
+    text_mlp = ggml_relu(ctx, text_mlp);
+    text_mlp = ggml_mul_mat(ctx, tensors.at("scoring.prompt_mlp.layers.1.weight"), text_mlp);
+    text_mlp = ggml_add(ctx, text_mlp, tensors.at("scoring.prompt_mlp.layers.1.bias"));
+    // Residual connection
+    text_mlp = ggml_add(ctx, text_mlp, orig_text);
+    // LayerNorm (out_norm)
+    text_mlp = sam3_layer_norm(ctx, text_mlp,
+                                tensors.at("scoring.prompt_mlp.out_norm.weight"),
+                                tensors.at("scoring.prompt_mlp.out_norm.bias"));
+    // text_mlp: [D, T, B]
 
-    // prompt_mlp: D→FFN→D with ReLU, residual, + LayerNorm
-    auto * mlp_out = ggml_mul_mat(ctx, tensors.at("scoring.prompt_mlp.layers.0.weight"), text_proj);
-    mlp_out = ggml_add(ctx, mlp_out, tensors.at("scoring.prompt_mlp.layers.0.bias"));
-    mlp_out = ggml_relu(ctx, mlp_out);
-    mlp_out = ggml_mul_mat(ctx, tensors.at("scoring.prompt_mlp.layers.1.weight"), mlp_out);
-    mlp_out = ggml_add(ctx, mlp_out, tensors.at("scoring.prompt_mlp.layers.1.bias"));
-    // Residual
-    text_proj = ggml_add(ctx, text_proj, mlp_out);
-    // LayerNorm
-    text_proj = sam3_layer_norm(ctx, text_proj,
-                                 tensors.at("scoring.prompt_mlp.out_norm.weight"),
-                                 tensors.at("scoring.prompt_mlp.out_norm.bias"));
-    // text_proj: [D, T, B]
+    // Step 2: Mean-pool over text tokens → [D, 1, B]
+    // In Python: pooled = (prompt * is_valid).sum(dim=0) / num_valid
+    // For inference without padding mask, all tokens are valid, so it's just mean over T.
+    // ggml_mean operates on dim0, but we need mean over dim1 (T dimension).
+    // Approach: transpose so T is dim0, then pool.
+    // Actually, ggml_pool_1d with AVG on the T dimension works if T is in dim0:
+    // text_mlp is [D, T, B]. We need to permute to [T, D, B] first.
+    auto * text_perm = ggml_cont(ctx, ggml_permute(ctx, text_mlp, 1, 0, 2, 3));  // [T, D, B]
+    auto * text_pooled = ggml_pool_1d(ctx, text_perm, GGML_OP_POOL_AVG, (int)T, (int)T, 0);
+    // text_pooled: [1, D, B]
+    text_pooled = ggml_cont(ctx, ggml_permute(ctx, text_pooled, 1, 0, 2, 3));  // [D, 1, B]
 
-    // Project queries through hs_proj: D→D
-    auto * q_proj = ggml_mul_mat(ctx, tensors.at("scoring.hs_proj.weight"), query_outputs);
-    q_proj = ggml_add(ctx, q_proj, tensors.at("scoring.hs_proj.bias"));
-    // q_proj: [D, N_q, B]
+    // Step 3: Project pooled prompt through prompt_proj: D→D
+    auto * proj_pooled = ggml_mul_mat(ctx, tensors.at("scoring.prompt_proj.weight"), text_pooled);
+    proj_pooled = ggml_add(ctx, proj_pooled, tensors.at("scoring.prompt_proj.bias"));
+    // proj_pooled: [D, 1, B]
 
-    // Dot product: for each query, dot with each text token, then max/mean over text tokens
-    // scores = q_proj^T @ text_proj → [N_q, T, B]
-    // Then take max over T dimension to get [N_q, B]
-    // Actually: ggml_mul_mat(text_proj, q_proj) with text_proj^T @ q_proj → shapes need careful handling
-    // text_proj: [D, T, B], q_proj: [D, N_q, B]
-    // We want: for each batch, (N_q × D) @ (D × T) = (N_q × T)
-    // ggml_mul_mat(A, B) = A^T @ B where A=[D, T], B=[D, N_q] → result [T, N_q]
-    auto * scores = ggml_mul_mat(ctx, text_proj, q_proj);  // [T, N_q, B]
+    // Step 4: Project queries through hs_proj: D→D
+    auto * proj_hs = ggml_mul_mat(ctx, tensors.at("scoring.hs_proj.weight"), query_outputs);
+    proj_hs = ggml_add(ctx, proj_hs, tensors.at("scoring.hs_proj.bias"));
+    // proj_hs: [D, N_q, B]
 
-    // Max-pool over text tokens (dim 0) to get per-query score
-    // Use ggml_pool_1d on the T dimension — but scores is [T, N_q, B]
-    // We want max over T for each (N_q, B).
-    // Reshape to use a reduction: [T, N_q*B] then pool
-    const int64_t T   = scores->ne[0];
-    const int64_t N_q = scores->ne[1];
-    const int64_t B   = scores->ne[2];
+    // Step 5: Dot product — for each query, dot with pooled prompt
+    // matmul(proj_hs, proj_pooled.unsqueeze(-1)) in Python = batched vector-matrix multiply
+    // ggml_mul_mat(A, B) = A^T @ B
+    // With A = proj_pooled [D, 1, B], B = proj_hs [D, N_q, B]:
+    // result = [1, N_q, B] — each element is dot product of query with pooled prompt
+    auto * scores = ggml_mul_mat(ctx, proj_pooled, proj_hs);  // [1, N_q, B]
 
-    // For max-pooling over dim0, we can use ggml_pool_1d with k=T, s=T
-    // But ggml_pool_1d works on [W, C, N] → pools over W.
-    // scores: [T, N_q, B] — pool over T.
-    auto * pooled = ggml_pool_1d(ctx, scores, GGML_OP_POOL_MAX, T, T, 0);
-    // pooled: [1, N_q, B]
-    pooled = ggml_reshape_2d(ctx, pooled, N_q, B);
-    // pooled: [N_q, B]
+    // Step 6: Scale by 1/sqrt(D)
+    float scale = 1.0f / sqrtf((float)D);
+    scores = ggml_scale(ctx, scores, scale);
 
-    return pooled;
+    // Step 7: Clamp to [-12, 12]
+    scores = ggml_clamp(ctx, scores, -12.0f, 12.0f);
+
+    // Reshape to [N_q, B]
+    const int64_t N_q = query_outputs->ne[1];
+    scores = ggml_reshape_2d(ctx, scores, N_q, B);
+
+    return scores;
 }
 
 // Build full DETR decoder graph.
@@ -3420,6 +3454,13 @@ static sam3_ddec_output sam3_build_ddec_graph(
     auto * query_pos = ggml_concat(ctx, query_pos_pres, query_pos_obj, 1);  // [D, NQ+1, 1]
 
     // ── Run decoder layers ───────────────────────────────────────────────
+    // Note: in the Python reference, query_pos is recomputed each iteration from the
+    // updated reference_boxes via gen_sineembed_for_position + ref_point_head MLP.
+    // Since the sine embedding and ref_point_head MLP are currently computed CPU-side
+    // (not in graph), we use a static query_pos here. This is an approximation; for full
+    // accuracy, the sine pos embed + MLP should be done in the graph and updated per layer.
+    // TODO: move sine_pos_embed + ref_point_head into ggml graph for per-layer update.
+
     for (int i = 0; i < hp.ddec_layers; ++i) {
         queries = sam3_ddec_layer_forward(ctx, model.ddec.layers[i],
                                            queries, query_pos,
@@ -3427,13 +3468,19 @@ static sam3_ddec_output sam3_build_ddec_graph(
                                            text_feats, hp.ddec_heads);
 
         // Box refinement after each layer (on object queries only, not presence token)
-        // Extract object queries: queries[D, 1:, B]
+        // Python: delta_unsig = bbox_embed(out_norm(output))
+        // out_norm is the final decoder norm (ddec.norm), applied at each iteration
         auto * obj_q = ggml_view_3d(ctx, queries, D, NQ, 1,
                                      queries->nb[1], queries->nb[2], 1 * queries->nb[1]);
         obj_q = ggml_cont(ctx, obj_q);
 
+        // Apply the final decoder norm before box refinement (use_normed_output_consistently)
+        auto * obj_q_normed = sam3_layer_norm(ctx, obj_q,
+                                               tensors.at("ddec.norm.weight"),
+                                               tensors.at("ddec.norm.bias"));
+
         // Shared bbox_embed MLP (registered globally, not per-layer)
-        auto * bd = obj_q;
+        auto * bd = obj_q_normed;
         for (int j = 0; j < 3; ++j) {
             auto wn = "ddec.bbox_embed.layers." + std::to_string(j) + ".weight";
             auto bn = "ddec.bbox_embed.layers." + std::to_string(j) + ".bias";
@@ -3481,9 +3528,9 @@ static sam3_ddec_output sam3_build_ddec_graph(
         pres_out = ggml_add(ctx, pres_out, tensors.at(bn));
         if (j < 2) pres_out = ggml_relu(ctx, pres_out);
     }
-    auto * presence_score = ggml_sigmoid(ctx, pres_out);
-    // presence_score: [1, 1, 1] → reshape to [1, B]
-    presence_score = ggml_reshape_2d(ctx, presence_score, 1, 1);
+    // Keep presence as raw logit (no sigmoid yet — applied during post-processing)
+    auto * presence_score = ggml_reshape_2d(ctx, pres_out, 1, 1);
+    // presence_score: [1, B] — raw logit
 
     sam3_ddec_output out;
     out.queries         = queries;          // [D, NQ+1, B]
@@ -3503,6 +3550,18 @@ static sam3_ddec_output sam3_build_ddec_graph(
 // fpn_feats[1]: [D, 144, 144, B]
 // fpn_feats[2]: [D,  72,  72, B] (lowest res)
 // Returns: [D, 288, 288, B] pixel features
+//
+// Python PixelDecoder.forward:
+//   prev_fpn = backbone_feats[-1]  (lowest res)
+//   for bb_feat in backbone_feats[:-1][::-1]:  (iterate from second-lowest to highest)
+//       prev_fpn = bb_feat + F.interpolate(prev_fpn, size=bb_feat.shape[-2:], mode="nearest")
+//       prev_fpn = conv_layers[i](prev_fpn)    # conv on the MERGED result
+//       prev_fpn = F.relu(norms[i](prev_fpn))  # GroupNorm then ReLU
+//
+// Note: Python uses GroupNorm(8, 256) but we use ggml's norm (LayerNorm-style) as an
+// approximation.  The weights were saved from GroupNorm — this is a known precision
+// difference that should be revisited (TODO: implement group_norm in ggml or add a helper).
+// For now we use layer_norm_2d which normalizes over channel dim similarly.
 static struct ggml_tensor * sam3_pixel_decoder(
         struct ggml_context * ctx,
         const sam3_model & model,
@@ -3510,90 +3569,122 @@ static struct ggml_tensor * sam3_pixel_decoder(
 {
     const auto & seg = model.seg_head;
 
-    // Start from lowest resolution and progressively upsample
+    // Start from lowest resolution
     auto * feat = fpn_feats[2];  // [D, 72, 72, B]
 
-    // Upsample 2x + merge with FPN[1] (144x144)
+    // Iteration 0: merge with FPN[1] (144x144)
+    // prev_fpn = FPN[1] + upsample(prev_fpn)
     // Permute to [W, H, D, B] for conv operations
-    feat = ggml_cont(ctx, ggml_permute(ctx, feat, 2, 0, 1, 3));  // [72, 72, D, B]
-    feat = ggml_upscale(ctx, feat, 2, GGML_SCALE_MODE_NEAREST);  // [144, 144, D, B]
-    // Conv 3x3 on FPN[1]
-    auto * fpn1_conv = ggml_cont(ctx, ggml_permute(ctx, fpn_feats[1], 2, 0, 1, 3));
-    fpn1_conv = ggml_conv_2d_s1_ph(ctx, seg.up_conv_w[0], fpn1_conv);
+    auto * prev = ggml_cont(ctx, ggml_permute(ctx, feat, 2, 0, 1, 3));  // [72, 72, D, B]
+    prev = ggml_upscale(ctx, prev, 2, GGML_SCALE_MODE_NEAREST);  // [144, 144, D, B]
+    auto * fpn1 = ggml_cont(ctx, ggml_permute(ctx, fpn_feats[1], 2, 0, 1, 3));  // [144, 144, D, B]
+    prev = ggml_add(ctx, fpn1, prev);  // merged
+    // Conv 3x3 on the MERGED result (not individual FPN feat)
+    prev = ggml_conv_2d_s1_ph(ctx, seg.up_conv_w[0], prev);
     {
         auto * b3d = ggml_reshape_3d(ctx, seg.up_conv_b[0], 1, 1, seg.up_conv_b[0]->ne[0]);
-        fpn1_conv = ggml_add(ctx, fpn1_conv, ggml_repeat(ctx, b3d, fpn1_conv));
+        prev = ggml_add(ctx, prev, ggml_repeat(ctx, b3d, prev));
     }
-    feat = ggml_add(ctx, feat, fpn1_conv);
-    // LayerNorm2d
-    auto * feat_perm = ggml_cont(ctx, ggml_permute(ctx, feat, 1, 2, 0, 3));  // [D, 144, 144, B]
-    feat_perm = sam3_layer_norm_2d(ctx, feat_perm, seg.up_norm_w[0], seg.up_norm_b[0]);
-    feat = ggml_cont(ctx, ggml_permute(ctx, feat_perm, 2, 0, 1, 3));  // [144, 144, D, B]
+    // GroupNorm (approximated as LayerNorm2d) then ReLU
+    auto * prev_perm = ggml_cont(ctx, ggml_permute(ctx, prev, 1, 2, 0, 3));  // [D, 144, 144, B]
+    prev_perm = sam3_layer_norm_2d(ctx, prev_perm, seg.up_norm_w[0], seg.up_norm_b[0]);
+    prev = ggml_cont(ctx, ggml_permute(ctx, prev_perm, 2, 0, 1, 3));  // [144, 144, D, B]
+    prev = ggml_relu(ctx, prev);
 
-    // Upsample 2x + merge with FPN[0] (288x288)
-    feat = ggml_upscale(ctx, feat, 2, GGML_SCALE_MODE_NEAREST);  // [288, 288, D, B]
-    auto * fpn0_conv = ggml_cont(ctx, ggml_permute(ctx, fpn_feats[0], 2, 0, 1, 3));
-    fpn0_conv = ggml_conv_2d_s1_ph(ctx, seg.up_conv_w[1], fpn0_conv);
+    // Iteration 1: merge with FPN[0] (288x288)
+    prev = ggml_upscale(ctx, prev, 2, GGML_SCALE_MODE_NEAREST);  // [288, 288, D, B]
+    auto * fpn0 = ggml_cont(ctx, ggml_permute(ctx, fpn_feats[0], 2, 0, 1, 3));  // [288, 288, D, B]
+    prev = ggml_add(ctx, fpn0, prev);  // merged
+    // Conv 3x3 on the MERGED result
+    prev = ggml_conv_2d_s1_ph(ctx, seg.up_conv_w[1], prev);
     {
         auto * b3d = ggml_reshape_3d(ctx, seg.up_conv_b[1], 1, 1, seg.up_conv_b[1]->ne[0]);
-        fpn0_conv = ggml_add(ctx, fpn0_conv, ggml_repeat(ctx, b3d, fpn0_conv));
+        prev = ggml_add(ctx, prev, ggml_repeat(ctx, b3d, prev));
     }
-    feat = ggml_add(ctx, feat, fpn0_conv);
-    feat_perm = ggml_cont(ctx, ggml_permute(ctx, feat, 1, 2, 0, 3));  // [D, 288, 288, B]
-    feat_perm = sam3_layer_norm_2d(ctx, feat_perm, seg.up_norm_w[1], seg.up_norm_b[1]);
-    feat = ggml_cont(ctx, ggml_permute(ctx, feat_perm, 2, 0, 1, 3));  // [288, 288, D, B]
+    // GroupNorm (approximated as LayerNorm2d) then ReLU
+    prev_perm = ggml_cont(ctx, ggml_permute(ctx, prev, 1, 2, 0, 3));  // [D, 288, 288, B]
+    prev_perm = sam3_layer_norm_2d(ctx, prev_perm, seg.up_norm_w[1], seg.up_norm_b[1]);
+    prev = ggml_cont(ctx, ggml_permute(ctx, prev_perm, 2, 0, 1, 3));  // [288, 288, D, B]
+    prev = ggml_relu(ctx, prev);
 
-    // Final conv
-    feat = ggml_conv_2d_s1_ph(ctx, seg.up_conv_w[2], feat);
-    {
-        auto * b3d = ggml_reshape_3d(ctx, seg.up_conv_b[2], 1, 1, seg.up_conv_b[2]->ne[0]);
-        feat = ggml_add(ctx, feat, ggml_repeat(ctx, b3d, feat));
-    }
-    feat_perm = ggml_cont(ctx, ggml_permute(ctx, feat, 1, 2, 0, 3));  // [D, 288, 288, B]
-    feat_perm = sam3_layer_norm_2d(ctx, feat_perm, seg.up_norm_w[2], seg.up_norm_b[2]);
+    // Iteration 2 (final): the Python loop has num_upsampling_stages=3, so there are 3 conv layers
+    // but only 2 upsample steps (feats[:-1] has 2 elements for 3 total feats).
+    // Actually, wait: backbone_feats has 3 entries. backbone_feats[:-1] = first 2.
+    // fpn_feats[::-1] iterates [fpn_feats[1], fpn_feats[0]] = 2 iterations, not 3.
+    // The 3rd conv layer is NOT used in the PixelDecoder loop — it would need a 4th FPN level.
+    // The PixelDecoder creates num_upsampling_stages=3 convs, but only uses 2 in the loop
+    // (since there are only 2 upsampling steps for 3 FPN levels).
+    // The 3rd conv is unused by the pixel decoder itself.
 
-    return feat_perm;  // [D, 288, 288, B]
+    // Convert back to [D, W, H, B] layout
+    prev_perm = ggml_cont(ctx, ggml_permute(ctx, prev, 1, 2, 0, 3));  // [D, 288, 288, B]
+
+    return prev_perm;  // [D, 288, 288, B]
 }
 
 // Build the full segmentation head graph.
-// pixel_feats: [D, 288, 288, B] from pixel decoder
+//
+// Python UniversalSegmentationHead.forward:
+//   1. Cross-attend encoder_hidden_states to prompt → updated encoder
+//   2. _embed_pixels: replace lowest-res FPN feat with spatial portion of encoder output
+//   3. Run pixel decoder on modified FPN feats
+//   4. instance_seg_head (Conv1x1)
+//   5. mask_predictor: einsum(mask_embed(queries), instance_embeds)
+//
+// enc_hidden: [D, N_spatial, B] — fusion encoder output (cross-attended in step 1)
+// fpn_feats[3]: the 3 FPN features at different resolutions
 // query_outputs: [D, N, B] selected object query outputs
-// text_features: [D, T, B] for cross-attention
-// Returns: mask_logits [N, 288*288, B] (raw logits, not sigmoid)
+// text_features: [D, T, B] for cross-attention (prompt)
+// Returns: mask_logits [W*H, N, B] (raw logits, not sigmoid)
 static struct ggml_tensor * sam3_build_seg_head_graph(
         struct ggml_context * ctx,
         const sam3_model & model,
-        struct ggml_tensor * pixel_feats,    // [D, 288, 288, B]
+        struct ggml_tensor * enc_hidden,     // [D, N_spatial, B] fusion encoder output
+        struct ggml_tensor * fpn_feats[3],   // FPN features at 3 scales
         struct ggml_tensor * query_outputs,  // [D, N, B]
         struct ggml_tensor * text_features)  // [D, T, B] (for cross-attn, can be nullptr)
 {
     const auto & seg     = model.seg_head;
     const auto & tensors = model.tensors;
-    const int64_t D = pixel_feats->ne[0];  // 256
-    const int64_t W = pixel_feats->ne[1];  // 288
-    const int64_t H = pixel_feats->ne[2];  // 288
-    const int64_t B = pixel_feats->ne[3];  // 1
+    const int64_t D = enc_hidden->ne[0];  // 256
+    const int64_t B = enc_hidden->ne[2];  // 1
     const int64_t N = query_outputs->ne[1]; // number of selected queries
 
-    // Optional: cross-attention of pixel features to text/prompt features
+    // Step 1: Cross-attend encoder hidden states to text/prompt features
+    auto * enc = enc_hidden;
     if (text_features) {
-        // Flatten pixel features: [D, W*H, B]
-        auto * pf_flat = ggml_reshape_3d(ctx, pixel_feats, D, W * H, B);
-
-        // Cross-attention: pixel features query text
-        auto * ca_norm = sam3_layer_norm(ctx, pf_flat,
+        auto * ca_norm = sam3_layer_norm(ctx, enc,
                                           tensors.at("seg.cross_attn_norm.weight"),
                                           tensors.at("seg.cross_attn_norm.bias"));
 
-        ca_norm = sam3_multihead_attn_fused(ctx, ca_norm, text_features,
+        auto * ca_out = sam3_multihead_attn_fused(ctx, ca_norm, text_features,
                                              seg.ca_prompt_q_w, seg.ca_prompt_q_b,
                                              seg.ca_prompt_out_w, seg.ca_prompt_out_b,
                                              8, nullptr);
-        pf_flat = ggml_add(ctx, pf_flat, ca_norm);
-        pixel_feats = ggml_reshape_4d(ctx, pf_flat, D, W, H, B);
+        enc = ggml_add(ctx, enc, ca_out);
     }
+    // enc: [D, N_spatial, B]
 
-    // Instance segmentation head: Conv1x1 on pixel features
+    // Step 2: Replace lowest-res FPN feat with spatial portion of encoder output
+    // enc is [D, 5184, B] where 5184 = 72*72. Reshape to [D, 72, 72, B].
+    const int64_t feat_hw = model.hparams.n_img_embd();  // 72
+    auto * enc_spatial = ggml_reshape_4d(ctx, enc, D, feat_hw, feat_hw, B);
+
+    // Create modified FPN feats: replace the lowest resolution (index 2) with encoder output
+    struct ggml_tensor * modified_fpn[3] = {
+        fpn_feats[0],    // [D, 288, 288, B] — unchanged
+        fpn_feats[1],    // [D, 144, 144, B] — unchanged
+        enc_spatial,     // [D,  72,  72, B] — replaced with encoder output
+    };
+
+    // Step 3: Run pixel decoder on modified FPN feats
+    auto * pixel_feats = sam3_pixel_decoder(ctx, model, modified_fpn);
+    // pixel_feats: [D, 288, 288, B]
+
+    const int64_t W = pixel_feats->ne[1];  // 288
+    const int64_t H = pixel_feats->ne[2];  // 288
+
+    // Step 4: Instance segmentation head: Conv1x1 on pixel features
     auto * pf_conv = ggml_cont(ctx, ggml_permute(ctx, pixel_feats, 2, 0, 1, 3));  // [W, H, D, B] for conv
     pf_conv = ggml_conv_2d_sk_p0(ctx, tensors.at("seg.instance_seg_head.weight"), pf_conv);
     {
@@ -3603,7 +3694,7 @@ static struct ggml_tensor * sam3_build_seg_head_graph(
     }
     auto * pixel_embed = ggml_cont(ctx, ggml_permute(ctx, pf_conv, 1, 2, 0, 3));  // [D, W, H, B]
 
-    // Mask embedding: project query outputs through mask_embed MLP
+    // Step 5: Mask embedding: project query outputs through mask_embed MLP
     // 3-layer MLP: D→D→D→D (each layer registered separately)
     auto * mask_embed = query_outputs;
     for (int j = 0; j < 3; ++j) {
@@ -3615,14 +3706,11 @@ static struct ggml_tensor * sam3_build_seg_head_graph(
     }
     // mask_embed: [D, N, B]
 
-    // Mask prediction: einsum('bnd,bdhw->bnhw') = mask_embed^T @ pixel_embed
+    // Mask prediction: einsum('bqc,bchw->bqhw') = mask_embed^T @ pixel_embed
     // Flatten pixel_embed: [D, W*H, B]
     auto * pe_flat = ggml_reshape_3d(ctx, pixel_embed, D, W * H, B);
-    // We need the output layout to have per-query masks contiguous in memory so
-    // the CPU-side post-processing can read mask q at offset q*W*H.
     // ggml_mul_mat(A, B) = A^T @ B.  With A=[D, W*H, B], B=[D, N, B]:
     //   A^T is [W*H, D], result = [W*H, N, B].
-    // Element (wh, n, b) = data[wh + n*W*H], so query n's mask is contiguous.
     auto * masks = ggml_mul_mat(ctx, pe_flat, mask_embed);
     // masks: [W*H, N, B]
 
@@ -3718,23 +3806,31 @@ static sam3_box sam3_cxcywh_to_xyxy(float cx, float cy, float w, float h,
 
 // Compute sinusoidal positional embedding for DETR reference points.
 // ref_boxes: [NQ, 4] (cx, cy, w, h) — returns [NQ, 512] embedding.
+//
+// Python gen_sineembed_for_position output order for 4D input:
+//   [pos_y, pos_x, pos_w, pos_h]  (y FIRST, then x, then w, h)
+// where pos_tensor[:, :, 0] = x = cx, pos_tensor[:, :, 1] = y = cy
+// So the 512-dim vector is: [cy_embed_128, cx_embed_128, w_embed_128, h_embed_128]
 static void sam3_sine_pos_embed_boxes(float * out, const float * boxes, int NQ, int num_feats) {
     const float temperature = 10000.0f;
-    // For each query: 4 coordinates → each gets num_feats/4 = 128/4 = 32 features (sin/cos)
-    // Total: 4 * 128 = 512
-    const int feats_per_coord = num_feats;  // 128 features per coordinate pair
+    const int feats_per_coord = num_feats;  // 128 features per coordinate
+
+    // Map coordinate indices to match Python output order: [y, x, w, h] = [cy, cx, w, h]
+    // boxes layout: [cx(0), cy(1), w(2), h(3)]
+    // Python output: slot 0 = cy (idx 1), slot 1 = cx (idx 0), slot 2 = w (idx 2), slot 3 = h (idx 3)
+    const int coord_order[4] = {1, 0, 2, 3};  // map output slot → boxes index
 
     for (int q = 0; q < NQ; ++q) {
-        for (int c = 0; c < 4; ++c) {
-            float val = boxes[q * 4 + c];
+        for (int slot = 0; slot < 4; ++slot) {
+            float val = boxes[q * 4 + coord_order[slot]];
             for (int i = 0; i < feats_per_coord; ++i) {
                 int paired = i & ~1;
                 float dim_t = powf(temperature, (float)paired / (float)feats_per_coord);
                 float angle = val * 2.0f * (float)M_PI / dim_t;
                 if (i % 2 == 0) {
-                    out[q * feats_per_coord * 4 + c * feats_per_coord + i] = sinf(angle);
+                    out[q * feats_per_coord * 4 + slot * feats_per_coord + i] = sinf(angle);
                 } else {
-                    out[q * feats_per_coord * 4 + c * feats_per_coord + i] = cosf(angle);
+                    out[q * feats_per_coord * 4 + slot * feats_per_coord + i] = cosf(angle);
                 }
             }
         }
@@ -3827,17 +3923,17 @@ sam3_result sam3_segment_pcs(sam3_state             & state,
         state.neck_det[2],  // [D,  72,  72, B]
     };
 
-    auto * pixel_feats = sam3_pixel_decoder(ctx0, model, fpn_feats);
-    ggml_set_name(pixel_feats, "pixel_feats");
-    // pixel_feats: [D, 288, 288, B]
-
     // Extract object queries from DETR output (skip presence token)
     auto * obj_queries = ggml_view_3d(ctx0, ddec_out.queries, D, NQ, 1,
                                        ddec_out.queries->nb[1], ddec_out.queries->nb[2],
                                        1 * ddec_out.queries->nb[1]);
     obj_queries = ggml_cont(ctx0, obj_queries);
 
-    auto * mask_logits = sam3_build_seg_head_graph(ctx0, model, pixel_feats, obj_queries, text_features);
+    // Pass fusion encoder output (conditioned) for pixel decoder integration
+    // The seg head will cross-attend enc output to text, then replace lowest-res FPN feat,
+    // then run the pixel decoder, then produce masks.
+    auto * mask_logits = sam3_build_seg_head_graph(ctx0, model, conditioned, fpn_feats,
+                                                    obj_queries, text_features);
     ggml_set_name(mask_logits, "mask_logits");
     ggml_set_output(mask_logits);
     // mask_logits: [288*288, NQ, 1]  (per-query masks are contiguous)
@@ -3987,7 +4083,9 @@ sam3_result sam3_segment_pcs(sam3_state             & state,
     std::vector<float> pres_data(1);
     ggml_backend_tensor_get(ddec_out.presence_score, pres_data.data(), 0, sizeof(float));
 
-    float presence = pres_data[0];
+    // presence_score is a raw logit — apply sigmoid to get probability
+    float presence_logit = pres_data[0];
+    float presence_prob  = 1.0f / (1.0f + expf(-presence_logit));
 
     // Read mask logits: [288*288, NQ, 1] — per-query masks are contiguous
     const int mask_hw = 288;
@@ -3995,9 +4093,13 @@ sam3_result sam3_segment_pcs(sam3_state             & state,
     ggml_backend_tensor_get(mask_logits, all_masks.data(), 0, all_masks.size() * sizeof(float));
 
     // ── Post-process: score thresholding ─────────────────────────────────
+    // Python joint scoring: outputs_class = inverse_sigmoid(class_scores.sigmoid() * presence.sigmoid())
+    // Then final score = outputs_class.sigmoid() = class_scores.sigmoid() * presence.sigmoid()
+    // So effectively: score = sigmoid(class_logit) * sigmoid(presence_logit)
     std::vector<sam3_detection> dets;
     for (int q = 0; q < NQ; ++q) {
-        float score = scores_data[q] * presence;
+        float class_prob = 1.0f / (1.0f + expf(-scores_data[q]));
+        float score = class_prob * presence_prob;
         if (score < params.score_threshold) continue;
 
         sam3_detection det;
@@ -4031,8 +4133,8 @@ sam3_result sam3_segment_pcs(sam3_state             & state,
         dets.push_back(std::move(det));
     }
 
-    fprintf(stderr, "%s: %zu detections above threshold %.2f (presence=%.3f)\n",
-            __func__, dets.size(), params.score_threshold, presence);
+    fprintf(stderr, "%s: %zu detections above threshold %.2f (presence=%.3f, logit=%.3f)\n",
+            __func__, dets.size(), params.score_threshold, presence_prob, presence_logit);
 
     // ── NMS ──────────────────────────────────────────────────────────────
     auto keep = sam3_nms(dets, params.nms_threshold);
