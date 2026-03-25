@@ -469,6 +469,8 @@ struct sam3_bpe_tokenizer {
     std::unordered_map<std::string, int>              encoder;
     std::unordered_map<int, std::string>              decoder;
     std::vector<std::pair<std::string, std::string>>  merges;
+    std::unordered_map<std::string, int>              merge_ranks;  // "a\x1fb" → rank
+    std::unordered_map<uint8_t, std::string>          byte_encoder; // byte → unicode UTF-8
     std::unordered_map<std::string, std::string>      cache;
     int sot_token = 49406;
     int eot_token = 49407;
@@ -622,6 +624,487 @@ static struct ggml_tensor * sam3_layer_norm_2d(struct ggml_context * ctx,
         x = ggml_add(ctx, x, b);
     }
     return x;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  BPE Tokenizer — CLIP-style byte-level BPE
+// ═══════════════════════════════════════════════════════════════════════════════
+
+// ── UTF-8 helpers ────────────────────────────────────────────────────────────
+
+static int sam3_utf8_len(uint8_t c) {
+    if (c < 0x80) return 1;
+    if (c < 0xC0) return 1;  // continuation (shouldn't start here)
+    if (c < 0xE0) return 2;
+    if (c < 0xF0) return 3;
+    return 4;
+}
+
+static std::string sam3_codepoint_to_utf8(int cp) {
+    std::string s;
+    if (cp < 0x80) {
+        s += (char)cp;
+    } else if (cp < 0x800) {
+        s += (char)(0xC0 | (cp >> 6));
+        s += (char)(0x80 | (cp & 0x3F));
+    } else if (cp < 0x10000) {
+        s += (char)(0xE0 | (cp >> 12));
+        s += (char)(0x80 | ((cp >> 6) & 0x3F));
+        s += (char)(0x80 | (cp & 0x3F));
+    } else {
+        s += (char)(0xF0 | (cp >> 18));
+        s += (char)(0x80 | ((cp >> 12) & 0x3F));
+        s += (char)(0x80 | ((cp >> 6) & 0x3F));
+        s += (char)(0x80 | (cp & 0x3F));
+    }
+    return s;
+}
+
+// Check if position i in s starts a Unicode letter.
+// Handles ASCII letters + treats any multibyte UTF-8 start byte as a letter.
+// This is a reasonable approximation without ICU.
+static bool sam3_is_letter(const std::string & s, size_t i) {
+    uint8_t c = (uint8_t)s[i];
+    if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')) return true;
+    if (c >= 0xC0) return true;  // multibyte UTF-8 → treat as letter
+    return false;
+}
+
+// ── Byte-to-unicode mapping (CLIP / GPT-2 style) ────────────────────────────
+
+// Maps each byte 0-255 to a unique unicode character (as UTF-8 string).
+// Printable bytes map to themselves; non-printable bytes map to U+0100..U+0143.
+static void sam3_init_byte_encoder(std::unordered_map<uint8_t, std::string> & enc) {
+    // Collect printable byte values
+    std::vector<int> bs;
+    for (int i =  33; i <= 126; ++i) bs.push_back(i);
+    for (int i = 161; i <= 172; ++i) bs.push_back(i);
+    for (int i = 174; i <= 255; ++i) bs.push_back(i);
+
+    // Corresponding codepoints (printable → identity)
+    std::vector<int> cs(bs.begin(), bs.end());
+
+    // Non-printable bytes get codepoints starting at 256
+    int n = 0;
+    for (int b = 0; b < 256; ++b) {
+        if (std::find(bs.begin(), bs.end(), b) == bs.end()) {
+            bs.push_back(b);
+            cs.push_back(256 + n);
+            n++;
+        }
+    }
+
+    enc.clear();
+    for (size_t i = 0; i < bs.size(); ++i) {
+        enc[(uint8_t)bs[i]] = sam3_codepoint_to_utf8(cs[i]);
+    }
+}
+
+// ── Merge key helper ─────────────────────────────────────────────────────────
+
+// Unit separator (0x1F) cannot appear in byte-encoded BPE tokens.
+static inline std::string sam3_merge_key(const std::string & a, const std::string & b) {
+    std::string k;
+    k.reserve(a.size() + 1 + b.size());
+    k += a;
+    k += '\x1f';
+    k += b;
+    return k;
+}
+
+// ── Minimal JSON parser for vocab.json ───────────────────────────────────────
+
+// Parses a flat { "string": int, ... } JSON object.
+static bool sam3_parse_vocab_json(const std::string & path,
+                                   std::unordered_map<std::string, int> & encoder) {
+    std::ifstream f(path);
+    if (!f.is_open()) return false;
+
+    std::string content((std::istreambuf_iterator<char>(f)),
+                         std::istreambuf_iterator<char>());
+
+    size_t pos = 0;
+    // Skip to '{'
+    while (pos < content.size() && content[pos] != '{') pos++;
+    if (pos >= content.size()) return false;
+    pos++;
+
+    while (pos < content.size()) {
+        // Skip whitespace and commas
+        while (pos < content.size() &&
+               (content[pos] == ' '  || content[pos] == '\n' ||
+                content[pos] == '\r' || content[pos] == '\t' || content[pos] == ','))
+            pos++;
+
+        if (pos >= content.size() || content[pos] == '}') break;
+
+        // Expect '"'
+        if (content[pos] != '"') return false;
+        pos++;
+
+        // Read key (handle escape sequences)
+        std::string key;
+        while (pos < content.size() && content[pos] != '"') {
+            if (content[pos] == '\\') {
+                pos++;
+                if (pos >= content.size()) return false;
+                switch (content[pos]) {
+                    case '"':  key += '"';  break;
+                    case '\\': key += '\\'; break;
+                    case '/':  key += '/';  break;
+                    case 'n':  key += '\n'; break;
+                    case 'r':  key += '\r'; break;
+                    case 't':  key += '\t'; break;
+                    case 'u': {
+                        // Parse 4-hex-digit unicode escape
+                        if (pos + 4 >= content.size()) return false;
+                        std::string hex = content.substr(pos + 1, 4);
+                        int cp = (int)strtol(hex.c_str(), nullptr, 16);
+                        key += sam3_codepoint_to_utf8(cp);
+                        pos += 4;
+                        break;
+                    }
+                    default: key += content[pos]; break;
+                }
+            } else {
+                key += content[pos];
+            }
+            pos++;
+        }
+        if (pos >= content.size()) return false;
+        pos++; // skip closing '"'
+
+        // Skip to ':'
+        while (pos < content.size() && content[pos] != ':') pos++;
+        if (pos >= content.size()) return false;
+        pos++;
+
+        // Skip whitespace
+        while (pos < content.size() &&
+               (content[pos] == ' '  || content[pos] == '\n' ||
+                content[pos] == '\r' || content[pos] == '\t'))
+            pos++;
+
+        // Read integer
+        bool negative = false;
+        if (pos < content.size() && content[pos] == '-') {
+            negative = true;
+            pos++;
+        }
+        int64_t val = 0;
+        while (pos < content.size() && content[pos] >= '0' && content[pos] <= '9') {
+            val = val * 10 + (content[pos] - '0');
+            pos++;
+        }
+        if (negative) val = -val;
+
+        encoder[key] = (int)val;
+    }
+
+    return !encoder.empty();
+}
+
+// ── Load merges.txt ──────────────────────────────────────────────────────────
+
+static bool sam3_load_merges(const std::string & path,
+                              std::vector<std::pair<std::string, std::string>> & merges,
+                              std::unordered_map<std::string, int> & merge_ranks) {
+    std::ifstream f(path);
+    if (!f.is_open()) return false;
+
+    std::string line;
+    // Skip header line (#version: ...)
+    if (!std::getline(f, line)) return false;
+    if (!line.empty() && line[0] != '#') {
+        // No header — this line IS a merge
+        size_t sp = line.find(' ');
+        if (sp != std::string::npos) {
+            std::string a = line.substr(0, sp);
+            std::string b = line.substr(sp + 1);
+            merge_ranks[sam3_merge_key(a, b)] = (int)merges.size();
+            merges.push_back({std::move(a), std::move(b)});
+        }
+    }
+
+    while (std::getline(f, line)) {
+        if (line.empty()) continue;
+        size_t sp = line.find(' ');
+        if (sp == std::string::npos) continue;
+        std::string a = line.substr(0, sp);
+        std::string b = line.substr(sp + 1);
+        merge_ranks[sam3_merge_key(a, b)] = (int)merges.size();
+        merges.push_back({std::move(a), std::move(b)});
+    }
+
+    return !merges.empty();
+}
+
+// ── sam3_load_bpe_vocab ──────────────────────────────────────────────────────
+
+static bool sam3_load_bpe_vocab(sam3_bpe_tokenizer & tok, const std::string & dir) {
+    std::string sep(1, '/');
+    std::string vocab_path  = dir + sep + "vocab.json";
+    std::string merges_path = dir + sep + "merges.txt";
+
+    // Load vocabulary
+    if (!sam3_parse_vocab_json(vocab_path, tok.encoder)) {
+        fprintf(stderr, "%s: failed to load vocab from '%s'\n", __func__, vocab_path.c_str());
+        return false;
+    }
+
+    // Build decoder (reverse map)
+    tok.decoder.clear();
+    for (const auto & kv : tok.encoder) {
+        tok.decoder[kv.second] = kv.first;
+    }
+
+    // Load merges
+    if (!sam3_load_merges(merges_path, tok.merges, tok.merge_ranks)) {
+        fprintf(stderr, "%s: failed to load merges from '%s'\n", __func__, merges_path.c_str());
+        return false;
+    }
+
+    // Init byte encoder
+    sam3_init_byte_encoder(tok.byte_encoder);
+
+    // Set special tokens
+    tok.sot_token = 49406;
+    tok.eot_token = 49407;
+
+    fprintf(stderr, "%s: loaded %zu vocab entries, %zu merges\n",
+            __func__, tok.encoder.size(), tok.merges.size());
+    return true;
+}
+
+// ── BPE encode a single word ─────────────────────────────────────────────────
+
+// Split a UTF-8 string into individual unicode characters.
+static std::vector<std::string> sam3_utf8_chars(const std::string & s) {
+    std::vector<std::string> chars;
+    size_t i = 0;
+    while (i < s.size()) {
+        int len = sam3_utf8_len((uint8_t)s[i]);
+        chars.push_back(s.substr(i, len));
+        i += len;
+    }
+    return chars;
+}
+
+// Apply BPE merges to a byte-encoded word string.
+// Returns space-separated BPE tokens (e.g. "he llo</w>").
+static std::string sam3_bpe_encode(sam3_bpe_tokenizer & tok, const std::string & token) {
+    auto cit = tok.cache.find(token);
+    if (cit != tok.cache.end()) return cit->second;
+
+    // Split into unicode chars, append </w> to last
+    std::vector<std::string> word = sam3_utf8_chars(token);
+    if (word.empty()) return "";
+    word.back() += "</w>";
+
+    if (word.size() == 1) {
+        tok.cache[token] = word[0];
+        return word[0];
+    }
+
+    while (true) {
+        // Find pair with lowest merge rank
+        int best_rank = INT_MAX;
+        std::string best_first, best_second;
+
+        for (size_t i = 0; i + 1 < word.size(); ++i) {
+            auto it = tok.merge_ranks.find(sam3_merge_key(word[i], word[i + 1]));
+            if (it != tok.merge_ranks.end() && it->second < best_rank) {
+                best_rank  = it->second;
+                best_first  = word[i];
+                best_second = word[i + 1];
+            }
+        }
+
+        if (best_rank == INT_MAX) break;
+
+        // Merge all occurrences of this pair
+        std::string merged = best_first + best_second;
+        std::vector<std::string> new_word;
+        for (size_t i = 0; i < word.size(); ) {
+            if (i + 1 < word.size() &&
+                word[i] == best_first && word[i + 1] == best_second) {
+                new_word.push_back(merged);
+                i += 2;
+            } else {
+                new_word.push_back(word[i]);
+                i++;
+            }
+        }
+        word = std::move(new_word);
+        if (word.size() == 1) break;
+    }
+
+    // Join with spaces
+    std::string result;
+    for (size_t i = 0; i < word.size(); ++i) {
+        if (i > 0) result += ' ';
+        result += word[i];
+    }
+    tok.cache[token] = result;
+    return result;
+}
+
+// ── Pre-tokenizer (CLIP regex approximation) ─────────────────────────────────
+
+// Splits text into word tokens following the CLIP pattern:
+//   <|startoftext|> | <|endoftext|> | 's|'t|'re|'ve|'m|'ll|'d
+//   | [\p{L}]+ | [\p{N}] | [^\s\p{L}\p{N}]+
+static std::vector<std::string> sam3_pretokenize(const std::string & text) {
+    std::vector<std::string> tokens;
+    size_t i = 0;
+    const size_t n = text.size();
+
+    while (i < n) {
+        uint8_t c = (uint8_t)text[i];
+
+        // Skip whitespace
+        if (c == ' ' || c == '\t' || c == '\n' || c == '\r') { i++; continue; }
+
+        // Special tokens
+        if (i + 15 <= n && text.compare(i, 15, "<|startoftext|>") == 0) {
+            tokens.push_back("<|startoftext|>");
+            i += 15; continue;
+        }
+        if (i + 13 <= n && text.compare(i, 13, "<|endoftext|>") == 0) {
+            tokens.push_back("<|endoftext|>");
+            i += 13; continue;
+        }
+
+        // Contractions (must check before letters since ' isn't a letter)
+        if (c == '\'') {
+            if (i + 2 <= n) {
+                char c2 = text[i + 1];
+                if (c2 == 's' || c2 == 't' || c2 == 'm' || c2 == 'd') {
+                    tokens.push_back(text.substr(i, 2));
+                    i += 2; continue;
+                }
+            }
+            if (i + 3 <= n) {
+                std::string c3 = text.substr(i + 1, 2);
+                if (c3 == "re" || c3 == "ve" || c3 == "ll") {
+                    tokens.push_back(text.substr(i, 3));
+                    i += 3; continue;
+                }
+            }
+            // Fall through — not a contraction
+        }
+
+        // Letter sequence
+        if (sam3_is_letter(text, i)) {
+            size_t start = i;
+            while (i < n && sam3_is_letter(text, i)) {
+                i += sam3_utf8_len((uint8_t)text[i]);
+            }
+            tokens.push_back(text.substr(start, i - start));
+            continue;
+        }
+
+        // Single digit
+        if (c >= '0' && c <= '9') {
+            tokens.push_back(text.substr(i, 1));
+            i++; continue;
+        }
+
+        // Non-space, non-letter, non-digit sequence
+        {
+            size_t start = i;
+            while (i < n) {
+                uint8_t ch = (uint8_t)text[i];
+                if (ch == ' ' || ch == '\t' || ch == '\n' || ch == '\r') break;
+                if (sam3_is_letter(text, i)) break;
+                if (ch >= '0' && ch <= '9') break;
+                i++;
+            }
+            if (i > start) tokens.push_back(text.substr(start, i - start));
+        }
+    }
+
+    return tokens;
+}
+
+// ── sam3_tokenize — full pipeline ────────────────────────────────────────────
+
+// Tokenize text into a fixed-length token ID vector [ctx_len].
+// Format: [SOT, bpe_tokens..., EOT, 0, 0, ..., 0]
+static std::vector<int32_t> sam3_tokenize(sam3_bpe_tokenizer & tok,
+                                           const std::string & text,
+                                           int ctx_len) {
+    // 1. Lowercase
+    std::string lower;
+    lower.reserve(text.size());
+    for (char c : text) {
+        lower += (c >= 'A' && c <= 'Z') ? (char)(c + 32) : c;
+    }
+
+    // 2. Collapse whitespace, trim
+    std::string clean;
+    clean.reserve(lower.size());
+    bool last_ws = true;
+    for (char c : lower) {
+        if (c == ' ' || c == '\t' || c == '\n' || c == '\r') {
+            if (!last_ws) { clean += ' '; last_ws = true; }
+        } else {
+            clean += c;
+            last_ws = false;
+        }
+    }
+    if (!clean.empty() && clean.back() == ' ') clean.pop_back();
+
+    // 3. Pre-tokenize into word tokens
+    auto words = sam3_pretokenize(clean);
+
+    // 4. BPE encode each word
+    std::vector<int32_t> ids;
+    ids.push_back(tok.sot_token);
+
+    for (const auto & word : words) {
+        // Byte-encode: convert each UTF-8 byte through byte_encoder
+        std::string encoded;
+        for (uint8_t b : word) {
+            auto it = tok.byte_encoder.find(b);
+            if (it != tok.byte_encoder.end()) {
+                encoded += it->second;
+            }
+        }
+
+        // BPE
+        std::string bpe_result = sam3_bpe_encode(tok, encoded);
+
+        // Split on spaces → look up each token
+        size_t start = 0;
+        while (start < bpe_result.size()) {
+            size_t end = bpe_result.find(' ', start);
+            if (end == std::string::npos) end = bpe_result.size();
+            std::string bpe_tok = bpe_result.substr(start, end - start);
+
+            auto eit = tok.encoder.find(bpe_tok);
+            if (eit != tok.encoder.end()) {
+                ids.push_back(eit->second);
+            }
+            // Unknown tokens are silently dropped (matches CLIP behavior
+            // where all byte sequences are in the vocab)
+
+            start = end + 1;
+        }
+    }
+
+    ids.push_back(tok.eot_token);
+
+    // 5. Truncate (keep SOT at front, force EOT at end)
+    if ((int)ids.size() > ctx_len) {
+        ids.resize(ctx_len);
+        ids.back() = tok.eot_token;
+    }
+
+    // 6. Pad with 0 to ctx_len
+    ids.resize(ctx_len, 0);
+
+    return ids;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -1490,6 +1973,22 @@ std::shared_ptr<sam3_model> sam3_load_model(const sam3_params & params) {
         return nullptr;
     }
 
+    // ── Load BPE tokenizer ───────────────────────────────────────────────
+    {
+        std::string tok_dir = params.tokenizer_dir;
+        if (tok_dir.empty()) {
+            // Default: same directory as the model file
+            auto slash = params.model_path.find_last_of("/\\");
+            tok_dir = (slash != std::string::npos)
+                          ? params.model_path.substr(0, slash)
+                          : ".";
+        }
+        if (!sam3_load_bpe_vocab(model->tokenizer, tok_dir)) {
+            fprintf(stderr, "%s: WARNING: tokenizer not loaded from '%s' "
+                    "(text prompts will not work)\n", __func__, tok_dir.c_str());
+        }
+    }
+
     fprintf(stderr, "%s: model loaded successfully\n", __func__);
     return model;
 }
@@ -1730,4 +2229,23 @@ sam3_video_info sam3_get_video_info(const std::string & video_path) {
     }
     pclose(fp);
     return info;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  Tokenizer — standalone test API (does not require model weights)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+// Global tokenizer instance for the test API.
+static sam3_bpe_tokenizer g_test_tokenizer;
+static bool               g_test_tokenizer_loaded = false;
+
+bool sam3_test_load_tokenizer(const std::string & dir) {
+    if (!sam3_load_bpe_vocab(g_test_tokenizer, dir)) return false;
+    g_test_tokenizer_loaded = true;
+    return true;
+}
+
+std::vector<int32_t> sam3_test_tokenize(const std::string & text) {
+    if (!g_test_tokenizer_loaded) return {};
+    return sam3_tokenize(g_test_tokenizer, text, 32);
 }
