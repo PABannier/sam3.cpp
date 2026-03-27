@@ -223,6 +223,24 @@ bool sam3_test_dump_phase7_from_ref_inputs(const sam3_model & model,
                                            const std::string & output_dir,
                                            int n_threads = 4);
 
+// Test-only: run the geometry encoder from pre-computed backbone features and
+// dump intermediate tensors to <output_dir>/<tensor_name>.{bin,shape}.
+// Tests exemplar box coordinate encoding against Python reference.
+bool sam3_test_dump_geom_enc(const sam3_model   & model,
+                              const std::string  & prephase_ref_dir,
+                              const sam3_pcs_params & params,
+                              const std::string  & output_dir,
+                              int                  n_threads = 4);
+
+// Test-only: run ONLY the fusion encoder (6 layers) from pre-dumped inputs
+// (image features, pos encoding, prompt tokens, attn bias).  Dumps per-layer
+// outputs for isolated fenc debugging.  Input tensors should come from the
+// actual Python package via tests/dump_fenc_from_package.py.
+bool sam3_test_fenc_only(const sam3_model  & model,
+                          const std::string & ref_dir,
+                          const std::string & output_dir,
+                          int                 n_threads = 4);
+
 // ─── Debug: dump state tensors to files for verification ───
 
 bool sam3_dump_state_tensor(const sam3_state & state,

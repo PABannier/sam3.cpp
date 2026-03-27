@@ -14,6 +14,8 @@
 #define STB_IMAGE_WRITE_IMPLEMENTATION
 #include "stb_image_write.h"
 
+#include <sys/stat.h>
+
 #include <algorithm>
 #include <cassert>
 #include <chrono>
@@ -290,14 +292,33 @@ struct sam3_geom_layer {
 };
 
 struct sam3_geom_encoder {
-    struct ggml_tensor* point_proj_w = nullptr;
+    // Direct projections
+    struct ggml_tensor* point_proj_w = nullptr;    // Linear(2, D)
     struct ggml_tensor* point_proj_b = nullptr;
-    struct ggml_tensor* box_proj_w = nullptr;
+    struct ggml_tensor* box_proj_w = nullptr;      // Linear(4, D)
     struct ggml_tensor* box_proj_b = nullptr;
-    struct ggml_tensor* type_embed = nullptr;
-    struct ggml_tensor* cls_token = nullptr;
-    struct ggml_tensor* post_proj_w = nullptr;
+    // Pooling projections
+    struct ggml_tensor* point_pool_proj_w = nullptr;  // Linear(D, D)
+    struct ggml_tensor* point_pool_proj_b = nullptr;
+    struct ggml_tensor* box_pool_proj_w = nullptr;    // Conv2d(D, D, 7)
+    struct ggml_tensor* box_pool_proj_b = nullptr;
+    // Positional encoding projections
+    struct ggml_tensor* point_pos_proj_w = nullptr;   // Linear(D, D)
+    struct ggml_tensor* point_pos_proj_b = nullptr;
+    struct ggml_tensor* box_pos_proj_w = nullptr;     // Linear(D+2, D) = Linear(258, 256)
+    struct ggml_tensor* box_pos_proj_b = nullptr;
+    // Label and CLS embeddings
+    struct ggml_tensor* type_embed = nullptr;      // Embedding(2, D)
+    struct ggml_tensor* cls_token = nullptr;       // Embedding(1, D)
+    // Final projection + norms
+    struct ggml_tensor* post_proj_w = nullptr;     // Linear(D, D)
     struct ggml_tensor* post_proj_b = nullptr;
+    struct ggml_tensor* norm_w = nullptr;          // LayerNorm for final_proj
+    struct ggml_tensor* norm_b = nullptr;
+    struct ggml_tensor* encode_norm_w = nullptr;   // LayerNorm after transformer
+    struct ggml_tensor* encode_norm_b = nullptr;
+    struct ggml_tensor* img_pre_norm_w = nullptr;  // LayerNorm before pooling
+    struct ggml_tensor* img_pre_norm_b = nullptr;
     std::vector<sam3_geom_layer> layers;
 };
 
@@ -1251,7 +1272,13 @@ static void sam3_register_tensors(sam3_model& model) {
         tensors[name] = t;
         return t;
     };
-    const ggml_type WTYPE = model.weight_type;
+    // Always register weight tensors as f32 for computation. When loading f16
+    // weights, they are dequantized to f32 at load time (sam3_load_tensors handles
+    // the f16→f32 conversion). This ensures ggml uses f32 dot products — if we
+    // registered as GGML_TYPE_F16, ggml would also quantize the activations to f16
+    // before the dot product (vec_dot_type=F16), causing unacceptable precision loss
+    // that compounds through 32 transformer blocks (30x worse than PyTorch f16).
+    const ggml_type WTYPE = GGML_TYPE_F32;
 
     auto T2 = [&](const std::string& name, int64_t d0, int64_t d1) -> ggml_tensor* {
         auto* t = ggml_new_tensor_2d(ctx, WTYPE, d0, d1);
@@ -1561,32 +1588,33 @@ static void sam3_register_tensors(sam3_model& model) {
     // ── Geometry encoder ───────────────────────────────────────────────────
     model.geom_enc.layers.resize(hp.geom_layers);
 
+    // Direct projections
     model.geom_enc.point_proj_w = T2("geom.points_direct_project.weight", 2, D);
     model.geom_enc.point_proj_b = T1f("geom.points_direct_project.bias", D);
     model.geom_enc.box_proj_w = T2("geom.boxes_direct_project.weight", 4, D);
     model.geom_enc.box_proj_b = T1f("geom.boxes_direct_project.bias", D);
+    // Pooling projections
+    model.geom_enc.point_pool_proj_w = T2("geom.points_pool_project.weight", D, D);
+    model.geom_enc.point_pool_proj_b = T1f("geom.points_pool_project.bias", D);
+    model.geom_enc.box_pool_proj_w = T4("geom.boxes_pool_project.weight", 7, 7, D, D);
+    model.geom_enc.box_pool_proj_b = T1f("geom.boxes_pool_project.bias", D);
+    // Positional encoding projections
+    model.geom_enc.point_pos_proj_w = T2("geom.points_pos_enc_project.weight", D, D);
+    model.geom_enc.point_pos_proj_b = T1f("geom.points_pos_enc_project.bias", D);
+    model.geom_enc.box_pos_proj_w = T2("geom.boxes_pos_enc_project.weight", 258, D);
+    model.geom_enc.box_pos_proj_b = T1f("geom.boxes_pos_enc_project.bias", D);
+    // Label and CLS
     model.geom_enc.type_embed = T2f("geom.label_embed.weight", D, 2);
     model.geom_enc.cls_token = T2f("geom.cls_embed.weight", D, 1);
+    // Final projection + norms
     model.geom_enc.post_proj_w = T2("geom.final_proj.weight", D, D);
     model.geom_enc.post_proj_b = T1f("geom.final_proj.bias", D);
-
-    // Points and boxes pool/pos projections
-    reg("geom.points_pool_project.weight", D, D);
-    reg1("geom.points_pool_project.bias", D);
-    reg("geom.points_pos_enc_project.weight", D, D);
-    reg1("geom.points_pos_enc_project.bias", D);
-    reg4("geom.boxes_pool_project.weight", 7, 7, D, D);
-    reg1("geom.boxes_pool_project.bias", D);
-    reg("geom.boxes_pos_enc_project.weight", 258, D);
-    reg1("geom.boxes_pos_enc_project.bias", D);
-
-    // Norms
-    reg1("geom.norm.weight", D);
-    reg1("geom.norm.bias", D);
-    reg1("geom.encode_norm.weight", D);
-    reg1("geom.encode_norm.bias", D);
-    reg1("geom.img_pre_norm.weight", D);
-    reg1("geom.img_pre_norm.bias", D);
+    model.geom_enc.norm_w = T1f("geom.norm.weight", D);
+    model.geom_enc.norm_b = T1f("geom.norm.bias", D);
+    model.geom_enc.encode_norm_w = T1f("geom.encode_norm.weight", D);
+    model.geom_enc.encode_norm_b = T1f("geom.encode_norm.bias", D);
+    model.geom_enc.img_pre_norm_w = T1f("geom.img_pre_norm.weight", D);
+    model.geom_enc.img_pre_norm_b = T1f("geom.img_pre_norm.bias", D);
 
     for (int i = 0; i < hp.geom_layers; ++i) {
         auto& ly = model.geom_enc.layers[i];
@@ -2135,24 +2163,41 @@ void sam3_free_state(sam3_state& state) {
 // Bilinear resize of a [H, W, 3] uint8 image to [dst_h, dst_w, 3].
 static void sam3_resize_bilinear(const uint8_t* src, int src_w, int src_h,
                                  uint8_t* dst, int dst_w, int dst_h) {
-    const float sx = (float)src_w / dst_w;
-    const float sy = (float)src_h / dst_h;
+    // Bilinear resize matching torch.nn.functional.interpolate(bilinear, align_corners=False).
+    // ALL arithmetic is in double to get an exact result for uint8 inputs (0-255),
+    // ensuring the bilinear result is independent of FMA/SIMD/compiler behavior.
+    // The exact double result is then rounded to uint8, matching torch's round().
+    const double sx = (double)src_w / dst_w;
+    const double sy = (double)src_h / dst_h;
     for (int y = 0; y < dst_h; ++y) {
-        const float fy = (y + 0.5f) * sy - 0.5f;
-        const int y0 = std::max(0, (int)fy);
-        const int y1 = std::min(src_h - 1, y0 + 1);
-        const float wy = fy - y0;
+        double fy = (y + 0.5) * sy - 0.5;
+        if (fy < 0.0) fy = 0.0;
+        const int y0 = (int)fy;
+        const int y1 = (y0 < src_h - 1) ? y0 + 1 : y0;
+        const double wy = fy - y0;
+        const double wy0 = 1.0 - wy;
         for (int x = 0; x < dst_w; ++x) {
-            const float fx = (x + 0.5f) * sx - 0.5f;
-            const int x0 = std::max(0, (int)fx);
-            const int x1 = std::min(src_w - 1, x0 + 1);
-            const float wx = fx - x0;
+            double fx = (x + 0.5) * sx - 0.5;
+            if (fx < 0.0) fx = 0.0;
+            const int x0 = (int)fx;
+            const int x1 = (x0 < src_w - 1) ? x0 + 1 : x0;
+            const double wx = fx - x0;
+            const double wx0 = 1.0 - wx;
             for (int c = 0; c < 3; ++c) {
-                float v = (1 - wy) * ((1 - wx) * src[(y0 * src_w + x0) * 3 + c] +
-                                      wx * src[(y0 * src_w + x1) * 3 + c]) +
-                          wy * ((1 - wx) * src[(y1 * src_w + x0) * 3 + c] +
-                                wx * src[(y1 * src_w + x1) * 3 + c]);
-                dst[(y * dst_w + x) * 3 + c] = (uint8_t)std::min(255.0f, std::max(0.0f, v + 0.5f));
+                const double p00 = src[(y0 * src_w + x0) * 3 + c];
+                const double p01 = src[(y0 * src_w + x1) * 3 + c];
+                const double p10 = src[(y1 * src_w + x0) * 3 + c];
+                const double p11 = src[(y1 * src_w + x1) * 3 + c];
+                double v = wy0 * (wx0 * p00 + wx * p01) +
+                           wy  * (wx0 * p10 + wx * p11);
+                // Round to nearest integer, matching torch's round().to(uint8).
+                // For exact half-values (v = N.5), torch uses banker's rounding
+                // (round-half-to-even), but bilinear with double precision on
+                // uint8 inputs virtually never hits exact halves.
+                int iv = (int)(v + 0.5);
+                if (iv < 0) iv = 0;
+                if (iv > 255) iv = 255;
+                dst[(y * dst_w + x) * 3 + c] = (uint8_t)iv;
             }
         }
     }
@@ -2165,7 +2210,7 @@ static std::vector<float> sam3_preprocess_image(const sam3_image& image, int img
     const int C = 3;
     std::vector<float> result(C * img_size * img_size);
 
-    // Resize to img_size × img_size
+    // Resize to img_size × img_size via uint8 bilinear (matching torch pipeline)
     std::vector<uint8_t> resized;
     const uint8_t* pixels = image.data.data();
     int w = image.width, h = image.height;
@@ -2178,7 +2223,7 @@ static std::vector<float> sam3_preprocess_image(const sam3_image& image, int img
         h = img_size;
     }
 
-    // Convert to float [C, H, W] with normalization: (pixel / 255.0 - 0.5) / 0.5 = pixel / 127.5 - 1.0
+    // Convert to float [C, H, W] with normalization: (pixel / 255.0 - 0.5) / 0.5
     for (int c = 0; c < C; ++c) {
         for (int y = 0; y < img_size; ++y) {
             for (int x = 0; x < img_size; ++x) {
@@ -2487,6 +2532,7 @@ static struct ggml_tensor* sam3_build_vit_graph(struct ggml_context* ctx,
 
     // Permute to [E, W, H, B] (sam.cpp convention: embed dim first)
     x = ggml_cont(ctx, ggml_permute(ctx, x, 1, 2, 0, 3));
+    ggml_set_name(x, "dbg_patch_embed");
 
     // ── Positional embedding (tiled) ──────────────────────────────────────
     // pos_embed: [E, 24, 24, 1] — Hiera pretrained resolution, no cls token.
@@ -2498,13 +2544,18 @@ static struct ggml_tensor* sam3_build_vit_graph(struct ggml_context* ctx,
     auto* pos_tiled = ggml_repeat(ctx, pos_2d, pos_target);
 
     x = ggml_add(ctx, x, pos_tiled);
+    ggml_set_name(x, "dbg_after_pos_embed");
 
     // ── LayerNorm pre ─────────────────────────────────────────────────────
     x = sam3_layer_norm(ctx, x, model.vit.ln_pre_w, model.vit.ln_pre_b);
+    ggml_set_name(x, "dbg_after_ln_pre");
 
     // ── 32 transformer blocks ─────────────────────────────────────────────
     for (int i = 0; i < hp.vit_depth; ++i) {
         x = sam3_vit_block_forward(ctx, x, model.vit.blocks[i], hp, i);
+        char dbg_name[64];
+        snprintf(dbg_name, sizeof(dbg_name), "dbg_block_%d_out", i);
+        ggml_set_name(x, dbg_name);
     }
 
     // Output: [E, W, H, 1] = [1024, 72, 72, 1]
@@ -2994,6 +3045,23 @@ bool sam3_encode_image_from_preprocessed(sam3_state& state,
     ggml_set_name(vit_out, "vit_output");
     ggml_set_output(vit_out);
 
+    // Mark debug intermediate tensors as outputs so graph allocator preserves them
+    {
+        const char* dbg_names[] = {
+            "dbg_patch_embed", "dbg_after_pos_embed", "dbg_after_ln_pre",
+        };
+        for (const char* dn : dbg_names) {
+            auto* dt = ggml_get_tensor(ctx0, dn);
+            if (dt) ggml_set_output(dt);
+        }
+        for (int i = 0; i < (int)model.hparams.vit_depth; ++i) {
+            char bn[64];
+            snprintf(bn, sizeof(bn), "dbg_block_%d_out", i);
+            auto* dt = ggml_get_tensor(ctx0, bn);
+            if (dt) ggml_set_output(dt);
+        }
+    }
+
     struct ggml_tensor* neck_det_out[4];
     struct ggml_tensor* neck_trk_out[4];
     sam3_build_neck_graph(ctx0, vit_out, model.neck_det, neck_det_out);
@@ -3206,6 +3274,472 @@ static struct ggml_tensor* sam3_expand_token_attn_bias(
 
     // ggml_flash_attn_ext expects mask storage in fp16.
     return ggml_cont(ctx, ggml_cast(ctx, full_bias, GGML_TYPE_F16));
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  Geometry / exemplar encoder — graph building
+// ═══════════════════════════════════════════════════════════════════════════════
+
+// Sinusoidal positional encoding for box coordinates.
+// Matches Python PositionEmbeddingSine.encode_boxes(cx, cy, w, h).
+// Output: [258] = [pos_y(128), pos_x(128), h, w]
+static void sam3_sine_encode_box(float* out, float cx, float cy, float w, float h,
+                                  int num_pos_feats, int temperature) {
+    const float scale = 2.0f * (float)M_PI;
+    float x_embed = cx * scale;
+    float y_embed = cy * scale;
+
+    // dim_t[i] = temperature^(2*(i//2)/num_pos_feats)
+    for (int i = 0; i < num_pos_feats; ++i) {
+        int div_idx = 2 * (i / 2);
+        float dim_t = powf((float)temperature, (float)div_idx / (float)num_pos_feats);
+        float px = x_embed / dim_t;
+        float py = y_embed / dim_t;
+        // Interleaved sin/cos: even indices get sin, odd get cos
+        if (i % 2 == 0) {
+            out[i] = sinf(py);                    // pos_y first
+            out[num_pos_feats + i] = sinf(px);    // pos_x second
+        } else {
+            out[i] = cosf(py);
+            out[num_pos_feats + i] = cosf(px);
+        }
+    }
+    out[2 * num_pos_feats] = h;       // h
+    out[2 * num_pos_feats + 1] = w;   // w
+}
+
+// CPU-side ROI Align matching torchvision.ops.roi_align behavior.
+// Features in ggml [C, W, H] layout. Box in XYXY format scaled to feature grid coords.
+// Uses sub-sampling matching torchvision's sampling_ratio=0 (auto).
+// Output: [C * roi_size * roi_size] in ggml layout.
+static void sam3_roi_align_single(
+    const float* feats,  // [C, W, H] ggml layout (C innermost, then W, then H)
+    int C, int W_feat, int H_feat,
+    float x0, float y0, float x1, float y1,
+    int roi_size,
+    float* out)  // [C, roi_size, roi_size]
+{
+    float roi_w = std::max(x1 - x0, 1e-6f);
+    float roi_h = std::max(y1 - y0, 1e-6f);
+    float bin_w = roi_w / (float)roi_size;
+    float bin_h = roi_h / (float)roi_size;
+
+    // Match torchvision sampling_ratio=0: use ceil(bin_size) sub-samples
+    int sample_y_count = std::max(1, (int)ceilf(bin_h));
+    int sample_x_count = std::max(1, (int)ceilf(bin_w));
+    float inv_count = 1.0f / (float)(sample_y_count * sample_x_count);
+
+    auto bilinear_sample = [&](float sx, float sy, int c) -> float {
+        // Clamp to [-0.5, W-0.5] then adjust — matching torchvision
+        if (sx < -1.0f || sx > (float)W_feat || sy < -1.0f || sy > (float)H_feat)
+            return 0.0f;
+
+        sy = std::max(0.0f, sy);
+        sx = std::max(0.0f, sx);
+
+        int y_lo = (int)sy;
+        int x_lo = (int)sx;
+        int y_hi = std::min(y_lo + 1, H_feat - 1);
+        int x_hi = std::min(x_lo + 1, W_feat - 1);
+        y_lo = std::min(y_lo, H_feat - 1);
+        x_lo = std::min(x_lo, W_feat - 1);
+
+        float ly = sy - (float)y_lo;
+        float lx = sx - (float)x_lo;
+
+        // ggml layout: feats[c + x * C + y * C * W_feat]
+        float v00 = feats[c + x_lo * C + y_lo * C * W_feat];
+        float v10 = feats[c + x_hi * C + y_lo * C * W_feat];
+        float v01 = feats[c + x_lo * C + y_hi * C * W_feat];
+        float v11 = feats[c + x_hi * C + y_hi * C * W_feat];
+
+        return v00 * (1 - ly) * (1 - lx)
+             + v10 * (1 - ly) * lx
+             + v01 * ly * (1 - lx)
+             + v11 * ly * lx;
+    };
+
+    for (int ph = 0; ph < roi_size; ++ph) {
+        for (int pw = 0; pw < roi_size; ++pw) {
+            for (int c = 0; c < C; ++c) {
+                float sum = 0.0f;
+                for (int iy = 0; iy < sample_y_count; ++iy) {
+                    float sy = y0 + bin_h * ((float)ph + ((float)iy + 0.5f) / (float)sample_y_count);
+                    for (int ix = 0; ix < sample_x_count; ++ix) {
+                        float sx = x0 + bin_w * ((float)pw + ((float)ix + 0.5f) / (float)sample_x_count);
+                        sum += bilinear_sample(sx, sy, c);
+                    }
+                }
+                out[c + pw * C + ph * C * roi_size] = sum * inv_count;
+            }
+        }
+    }
+}
+
+// Build geometry encoder graph and pre-compute box embeddings on CPU.
+// Returns the geometry features as a pre-computed input tensor [D, N_geo, 1]
+// where N_geo = n_exemplar_boxes + 1 (CLS).
+// For dummy prompts (no boxes), N_geo = 1 (just CLS token).
+struct sam3_geom_result {
+    struct ggml_tensor* geo_feats;  // [D, N_geo, 1]
+    int n_tokens;                    // N_geo
+};
+
+static sam3_geom_result sam3_build_geom_enc_graph(
+    struct ggml_context* ctx,
+    const sam3_model& model,
+    const sam3_pcs_params& params,
+    struct ggml_tensor* img_feats,   // [D, N_img, 1] where N_img = H*H
+    struct ggml_tensor* img_pe)      // [D, N_img, 1] sinusoidal PE
+{
+    const auto& ge = model.geom_enc;
+    const int D = model.hparams.neck_dim;  // 256
+    const int n_heads = 8;
+    const int n_boxes = (int)(params.pos_exemplars.size() + params.neg_exemplars.size());
+    const int N_geo = n_boxes + 1;  // +1 for CLS
+
+    // Input tensor: pre-computed geometry embeddings after final_proj + norm [D, N_geo, 1]
+    // The caller pre-computes: final_proj(box_embeds + CLS) → LayerNorm
+    auto* x = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, D, N_geo, 1);
+    ggml_set_name(x, "geom_post_final_proj");  // also used as upload target
+    ggml_set_input(x);
+
+    // Transformer layers (3 layers: self-attn + cross-attn + FFN, pre-norm)
+    for (int i = 0; i < (int)ge.layers.size(); ++i) {
+        const auto& ly = ge.layers[i];
+
+        // 1. Self-attention (pre-norm, pos_enc_at_attn=False)
+        {
+            auto* shortcut = x;
+            auto* xn = sam3_layer_norm(ctx, x, ly.norm1_w, ly.norm1_b);
+
+            // Q = K = V = norm(x) — no positional encoding at self-attention
+            auto* Q = ggml_add(ctx, ggml_mul_mat(ctx,
+                ggml_view_2d(ctx, ly.sa_in_proj_w, D, D, ly.sa_in_proj_w->nb[1], 0), xn),
+                ggml_view_1d(ctx, ly.sa_in_proj_b, D, 0));
+            auto* K = ggml_add(ctx, ggml_mul_mat(ctx,
+                ggml_view_2d(ctx, ly.sa_in_proj_w, D, D, ly.sa_in_proj_w->nb[1], D * ly.sa_in_proj_w->nb[1]), xn),
+                ggml_view_1d(ctx, ly.sa_in_proj_b, D, D * sizeof(float)));
+            auto* V = ggml_add(ctx, ggml_mul_mat(ctx,
+                ggml_view_2d(ctx, ly.sa_in_proj_w, D, D, ly.sa_in_proj_w->nb[1], 2 * D * ly.sa_in_proj_w->nb[1]), xn),
+                ggml_view_1d(ctx, ly.sa_in_proj_b, D, 2 * D * sizeof(float)));
+
+            const int64_t S = N_geo;
+            const int64_t HD = D / n_heads;
+
+            Q = ggml_reshape_4d(ctx, Q, HD, n_heads, S, 1);
+            Q = ggml_cont(ctx, ggml_permute(ctx, Q, 0, 2, 1, 3));
+            K = ggml_reshape_4d(ctx, K, HD, n_heads, S, 1);
+            K = ggml_cont(ctx, ggml_permute(ctx, K, 0, 2, 1, 3));
+            V = ggml_reshape_4d(ctx, V, HD, n_heads, S, 1);
+            V = ggml_cont(ctx, ggml_permute(ctx, V, 0, 2, 1, 3));
+
+            float scale = 1.0f / sqrtf((float)HD);
+            auto* sa_out = ggml_flash_attn_ext(ctx, Q, K, V, nullptr, scale, 0.0f, 0.0f);
+            sa_out = ggml_reshape_3d(ctx, sa_out, D, S, 1);
+
+            sa_out = ggml_mul_mat(ctx, ly.sa_out_proj_w, sa_out);
+            sa_out = ggml_add(ctx, sa_out, ly.sa_out_proj_b);
+
+            x = ggml_add(ctx, shortcut, sa_out);
+        }
+
+        // 2. Cross-attention (pre-norm, Q from x, K from img+PE, V from img)
+        {
+            auto* shortcut = x;
+            auto* xn = sam3_layer_norm(ctx, x, ly.norm2_w, ly.norm2_b);
+
+            // Q from normalized geometry tokens (no pos)
+            // K from image features + PE
+            // V from image features
+            auto* q_w = ggml_view_2d(ctx, ly.ca_q_w, D, D, ly.ca_q_w->nb[1], 0);
+            auto* k_w = ggml_view_2d(ctx, ly.ca_q_w, D, D, ly.ca_q_w->nb[1], D * ly.ca_q_w->nb[1]);
+            auto* v_w = ggml_view_2d(ctx, ly.ca_q_w, D, D, ly.ca_q_w->nb[1], 2 * D * ly.ca_q_w->nb[1]);
+            auto* q_b = ggml_view_1d(ctx, ly.ca_q_b, D, 0);
+            auto* k_b = ggml_view_1d(ctx, ly.ca_q_b, D, D * sizeof(float));
+            auto* v_b = ggml_view_1d(ctx, ly.ca_q_b, D, 2 * D * sizeof(float));
+
+            auto* k_input = ggml_add(ctx, img_feats, img_pe);  // pos_enc_at_cross_attn_keys
+
+            auto* Q = ggml_add(ctx, ggml_mul_mat(ctx, q_w, xn), q_b);
+            auto* K = ggml_add(ctx, ggml_mul_mat(ctx, k_w, k_input), k_b);
+            auto* V = ggml_add(ctx, ggml_mul_mat(ctx, v_w, img_feats), v_b);
+
+            const int64_t S_q = N_geo;
+            const int64_t S_kv = img_feats->ne[1];
+            const int64_t HD = D / n_heads;
+
+            Q = ggml_reshape_4d(ctx, Q, HD, n_heads, S_q, 1);
+            Q = ggml_cont(ctx, ggml_permute(ctx, Q, 0, 2, 1, 3));
+            K = ggml_reshape_4d(ctx, K, HD, n_heads, S_kv, 1);
+            K = ggml_cont(ctx, ggml_permute(ctx, K, 0, 2, 1, 3));
+            V = ggml_reshape_4d(ctx, V, HD, n_heads, S_kv, 1);
+            V = ggml_cont(ctx, ggml_permute(ctx, V, 0, 2, 1, 3));
+
+            float scale = 1.0f / sqrtf((float)HD);
+            auto* ca_out = ggml_flash_attn_ext(ctx, Q, K, V, nullptr, scale, 0.0f, 0.0f);
+            ca_out = ggml_reshape_3d(ctx, ca_out, D, S_q, 1);
+
+            ca_out = ggml_mul_mat(ctx, ly.ca_out_w, ca_out);
+            ca_out = ggml_add(ctx, ca_out, ly.ca_out_b);
+
+            x = ggml_add(ctx, shortcut, ca_out);
+        }
+
+        // 3. FFN (pre-norm, ReLU)
+        {
+            auto* shortcut = x;
+            auto* xn = sam3_layer_norm(ctx, x, ly.norm3_w, ly.norm3_b);
+            auto* ffn = ggml_mul_mat(ctx, ly.ffn_fc1_w, xn);
+            ffn = ggml_add(ctx, ffn, ly.ffn_fc1_b);
+            ffn = ggml_relu(ctx, ffn);
+            ffn = ggml_mul_mat(ctx, ly.ffn_fc2_w, ffn);
+            ffn = ggml_add(ctx, ffn, ly.ffn_fc2_b);
+            x = ggml_add(ctx, shortcut, ffn);
+        }
+        sam3_name_tensorf(x, "geom_layer%d_out", i);
+    }
+
+    // Final encode norm
+    x = sam3_layer_norm(ctx, x, ge.encode_norm_w, ge.encode_norm_b);
+    ggml_set_name(x, "geom_output");
+    ggml_set_output(x);
+
+    sam3_geom_result result;
+    result.geo_feats = x;
+    result.n_tokens = N_geo;
+    return result;
+}
+
+// Pre-compute geometry encoder input on CPU: box embeddings + CLS token.
+// Reads model weights from GPU, computes embeddings, returns float vector.
+// Layout: [D, N_geo] row-major where N_geo = n_boxes + 1 (CLS last).
+static std::vector<float> sam3_precompute_geom_input(
+    const sam3_model& model,
+    const sam3_pcs_params& params,
+    const float* img_feats_data,  // [D, W, H] ggml-layout backbone features (nullable if no boxes)
+    int W_feat, int H_feat)
+{
+    const auto& ge = model.geom_enc;
+    const int D = model.hparams.neck_dim;  // 256
+    const int roi_size = 7;
+    const int num_pos_feats = D / 2;  // 128
+
+    // Collect all exemplar boxes
+    struct box_info { float cx, cy, w, h; int label; };
+    std::vector<box_info> boxes;
+    for (const auto& b : params.pos_exemplars) {
+        // API provides XYXY in original image space — convert to normalized CxCyWH [0,1]
+        float cx = (b.x0 + b.x1) * 0.5f;
+        float cy = (b.y0 + b.y1) * 0.5f;
+        float bw = b.x1 - b.x0;
+        float bh = b.y1 - b.y0;
+        boxes.push_back({cx, cy, bw, bh, 0});  // label 0 = positive
+    }
+    for (const auto& b : params.neg_exemplars) {
+        float cx = (b.x0 + b.x1) * 0.5f;
+        float cy = (b.y0 + b.y1) * 0.5f;
+        float bw = b.x1 - b.x0;
+        float bh = b.y1 - b.y0;
+        boxes.push_back({cx, cy, bw, bh, 1});  // label 1 = negative
+    }
+
+    const int n_boxes = (int)boxes.size();
+    const int N_geo = n_boxes + 1;
+
+    // Read needed weights from GPU
+    std::vector<float> box_proj_w_data(4 * D), box_proj_b_data(D);
+    std::vector<float> type_embed_data(D * 2);
+    std::vector<float> cls_data(D);
+    std::vector<float> box_pos_proj_w_data(258 * D), box_pos_proj_b_data(D);
+    std::vector<float> box_pool_proj_w_data(7 * 7 * D * D), box_pool_proj_b_data(D);
+    std::vector<float> img_pre_norm_w_data(D), img_pre_norm_b_data(D);
+
+    auto read_f32 = [](struct ggml_tensor* t, float* dst, size_t n) {
+        if (t->type == GGML_TYPE_F16) {
+            std::vector<ggml_fp16_t> tmp(n);
+            ggml_backend_tensor_get(t, tmp.data(), 0, n * sizeof(ggml_fp16_t));
+            ggml_fp16_to_fp32_row(tmp.data(), dst, (int)n);
+        } else {
+            ggml_backend_tensor_get(t, dst, 0, n * sizeof(float));
+        }
+    };
+
+    read_f32(ge.box_proj_w, box_proj_w_data.data(), 4 * D);
+    read_f32(ge.box_proj_b, box_proj_b_data.data(), D);
+    read_f32(ge.type_embed, type_embed_data.data(), D * 2);
+    read_f32(ge.cls_token, cls_data.data(), D);
+    read_f32(ge.box_pos_proj_w, box_pos_proj_w_data.data(), 258 * D);
+    read_f32(ge.box_pos_proj_b, box_pos_proj_b_data.data(), D);
+
+    if (n_boxes > 0) {
+        read_f32(ge.box_pool_proj_w, box_pool_proj_w_data.data(), 7 * 7 * D * D);
+        read_f32(ge.box_pool_proj_b, box_pool_proj_b_data.data(), D);
+        read_f32(ge.img_pre_norm_w, img_pre_norm_w_data.data(), D);
+        read_f32(ge.img_pre_norm_b, img_pre_norm_b_data.data(), D);
+    }
+
+    // Output: [D * N_geo] in row-major [D, N_geo] ggml order
+    std::vector<float> out(D * N_geo, 0.0f);
+
+    // Encode each box
+    for (int bi = 0; bi < n_boxes; ++bi) {
+        const auto& box = boxes[bi];
+        float embed[256] = {};
+
+        // 1. Direct projection: Linear(4, D)
+        // box_proj_w: ggml [4, D] = PyTorch [D, 4]
+        // out = x @ W^T + b where x=[cx,cy,w,h]
+        {
+            float coords[4] = {box.cx, box.cy, box.w, box.h};
+            for (int d = 0; d < D; ++d) {
+                float sum = box_proj_b_data[d];
+                for (int j = 0; j < 4; ++j)
+                    sum += coords[j] * box_proj_w_data[j + d * 4];  // ggml: [4, D] stride
+                embed[d] = sum;
+            }
+        }
+
+        // 2. ROI Align + Conv2d(D, D, 7) pool projection
+        if (img_feats_data) {
+            // Apply img_pre_norm (LayerNorm) to image features before pooling
+            // For simplicity, we compute LayerNorm per spatial position
+            // Actually, LayerNorm is applied to the [D] dimension at each spatial location
+            // But we need the full feature map, so let's normalize in-place copy
+            const int N_spatial = W_feat * H_feat;
+            std::vector<float> normed_feats(D * N_spatial);
+
+            for (int s = 0; s < N_spatial; ++s) {
+                // Compute mean and variance over D dimension
+                float mean = 0.0f;
+                for (int d = 0; d < D; ++d)
+                    mean += img_feats_data[d + s * D];
+                mean /= D;
+
+                float var = 0.0f;
+                for (int d = 0; d < D; ++d) {
+                    float diff = img_feats_data[d + s * D] - mean;
+                    var += diff * diff;
+                }
+                var /= D;
+
+                float inv_std = 1.0f / sqrtf(var + 1e-5f);
+                for (int d = 0; d < D; ++d) {
+                    normed_feats[d + s * D] =
+                        (img_feats_data[d + s * D] - mean) * inv_std * img_pre_norm_w_data[d]
+                        + img_pre_norm_b_data[d];
+                }
+            }
+
+            // Convert CxCyWH [0,1] → XYXY in feature grid coordinates
+            float fx0 = (box.cx - box.w * 0.5f) * (float)W_feat;
+            float fy0 = (box.cy - box.h * 0.5f) * (float)H_feat;
+            float fx1 = (box.cx + box.w * 0.5f) * (float)W_feat;
+            float fy1 = (box.cy + box.h * 0.5f) * (float)H_feat;
+
+            // ROI Align
+            std::vector<float> roi_data(D * roi_size * roi_size);
+            sam3_roi_align_single(normed_feats.data(), D, W_feat, H_feat,
+                                  fx0, fy0, fx1, fy1, roi_size, roi_data.data());
+
+            // Conv2d(D, D, 7): kernel [7, 7, D, D] in ggml = [D_out, D_in, kH, kW] in PyTorch
+            // Since roi_size = 7 = kernel_size, output is [D, 1, 1]
+            // This is effectively a matrix multiply: out[d_out] = sum over (d_in, kh, kw)
+            for (int d_out = 0; d_out < D; ++d_out) {
+                float sum = box_pool_proj_b_data[d_out];
+                for (int kh = 0; kh < roi_size; ++kh) {
+                    for (int kw = 0; kw < roi_size; ++kw) {
+                        for (int d_in = 0; d_in < D; ++d_in) {
+                            // ggml weight layout: [kW=7, kH=7, D_in=256, D_out=256]
+                            int w_idx = kw + kh * 7 + d_in * 7 * 7 + d_out * 7 * 7 * D;
+                            // roi_data layout: [C, W, H] = [D_in, kW, kH]
+                            int r_idx = d_in + kw * D + kh * D * roi_size;
+                            sum += box_pool_proj_w_data[w_idx] * roi_data[r_idx];
+                        }
+                    }
+                }
+                embed[d_out] += sum;
+            }
+        }
+
+        // 3. Sinusoidal positional encoding + Linear(258, D)
+        {
+            float pos_enc[258];
+            sam3_sine_encode_box(pos_enc, box.cx, box.cy, box.w, box.h,
+                                num_pos_feats, 10000);
+
+            for (int d = 0; d < D; ++d) {
+                float sum = box_pos_proj_b_data[d];
+                for (int j = 0; j < 258; ++j)
+                    sum += pos_enc[j] * box_pos_proj_w_data[j + d * 258];
+                embed[d] += sum;
+            }
+        }
+
+        // 4. Label embedding
+        {
+            int label = box.label;
+            for (int d = 0; d < D; ++d)
+                embed[d] += type_embed_data[d + label * D];
+        }
+
+        // Store in output: ggml layout [D, N_geo] — embed goes at column bi
+        for (int d = 0; d < D; ++d)
+            out[d + bi * D] = embed[d];
+    }
+
+    // CLS token goes at position n_boxes (last)
+    for (int d = 0; d < D; ++d)
+        out[d + n_boxes * D] = cls_data[d];
+
+    // Apply final_proj (Linear(D,D)) + LayerNorm on CPU
+    std::vector<float> proj_w(D * D), proj_b(D);
+    std::vector<float> ln_w(D), ln_b(D);
+    read_f32(ge.post_proj_w, proj_w.data(), D * D);
+    read_f32(ge.post_proj_b, proj_b.data(), D);
+    read_f32(ge.norm_w, ln_w.data(), D);
+    read_f32(ge.norm_b, ln_b.data(), D);
+
+    std::vector<float> projected(D * N_geo);
+    for (int t = 0; t < N_geo; ++t) {
+        // Linear: y = W @ x + b
+        // W is stored in PyTorch row-major [D_out, D_in] → ggml [D_in, D_out]
+        // proj_w[d_in + d_out * D] = W_py[d_out, d_in]
+        for (int d_out = 0; d_out < D; ++d_out) {
+            float sum = proj_b[d_out];
+            for (int d_in = 0; d_in < D; ++d_in)
+                sum += out[d_in + t * D] * proj_w[d_in + d_out * D];
+            projected[d_out + t * D] = sum;
+        }
+    }
+    if (n_boxes > 0) {
+        fprintf(stderr, "%s: %d exemplar boxes encoded (%d pos, %d neg)\n",
+                __func__, n_boxes,
+                (int)params.pos_exemplars.size(),
+                (int)params.neg_exemplars.size());
+    }
+
+    // LayerNorm over D dimension for each token
+    for (int t = 0; t < N_geo; ++t) {
+        float mean = 0.0f;
+        for (int d = 0; d < D; ++d)
+            mean += projected[d + t * D];
+        mean /= D;
+
+        float var = 0.0f;
+        for (int d = 0; d < D; ++d) {
+            float diff = projected[d + t * D] - mean;
+            var += diff * diff;
+        }
+        var /= D;
+
+        float inv_std = 1.0f / sqrtf(var + 1e-5f);
+        for (int d = 0; d < D; ++d) {
+            float normalized = (projected[d + t * D] - mean) * inv_std;
+            out[d + t * D] = normalized * ln_w[d] + ln_b[d];
+        }
+    }
+    return out;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -4899,6 +5433,7 @@ sam3_result sam3_segment_pcs(sam3_state& state,
     const int H = hp.n_img_embd();       // 72
     const int L = hp.text_ctx_len;       // 32
     const int NQ = hp.ddec_num_queries;  // 200
+    const int N_spatial = H * H;         // 5184
     sam3_result result;
 
     // ── Check that image has been encoded ────────────────────────────────
@@ -4918,244 +5453,380 @@ sam3_result sam3_segment_pcs(sam3_state& state,
     fprintf(stderr, "%s: text='%s', %zu tokens\n", __func__,
             params.text_prompt.c_str(), token_ids.size());
 
-    // ── Build computation graph ──────────────────────────────────────────
-    const size_t buf_size = ggml_tensor_overhead() * 16384 + ggml_graph_overhead() * 2;
-    struct ggml_init_params gparams = {
-        /*.mem_size   =*/buf_size,
-        /*.mem_buffer =*/nullptr,
-        /*.no_alloc   =*/true,
-    };
-    struct ggml_context* ctx0 = ggml_init(gparams);
-    if (!ctx0) {
-        fprintf(stderr, "%s: failed to init compute context\n", __func__);
-        return result;
-    }
+    // ── Helper: run a sub-graph with its own context and allocator ──────
+    // Each stage below follows this exact pattern:
+    //   1. Create fresh ggml_context + graph + allocator
+    //   2. Create INPUT tensors (ggml_set_input)
+    //   3. Build the computation graph
+    //   4. Mark outputs (ggml_set_output)
+    //   5. Allocate → set input data → compute → read output data
+    //   6. Free allocator + context
+    // This ensures ZERO buffer sharing between stages.
 
-    // ── Text encoder input ───────────────────────────────────────────────
-    auto* inp_tokens = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, L);
-    ggml_set_name(inp_tokens, "text_token_ids");
-    ggml_set_input(inp_tokens);
+    // ── Pre-compute shared CPU data used by multiple stages ─────────────
+    const int n_boxes = (int)(params.pos_exemplars.size() + params.neg_exemplars.size());
+    const int N_geo = n_boxes + 1;  // +1 for CLS
+    const int T = L + N_geo;        // total prompt tokens (text + geometry)
 
-    // ── Text encoder graph (implemented in Phase 4) ─────────────────────
-    // sam3_build_text_encoder_graph creates causal mask internally (named "causal_mask").
-    // Returns: [256, L] = [D, 32] (2D tensor).
-    auto* text_features_2d = sam3_build_text_encoder_graph(ctx0, inp_tokens, model);
-    // Reshape to [D, L, 1] for consistent 3D processing in fusion/DETR
-    auto* text_features = ggml_reshape_3d(ctx0, text_features_2d, D, L, 1);
-    ggml_set_name(text_features, "text_features");
+    // Read image features and PE from state into CPU buffers (used by multiple stages)
+    std::vector<float> img_feats_cpu(D * N_spatial);
+    std::vector<float> img_pe_cpu(D * N_spatial);
+    ggml_backend_tensor_get(state.neck_det[2], img_feats_cpu.data(), 0,
+                            D * N_spatial * sizeof(float));
+    ggml_backend_tensor_get(state.neck_det_pe[2], img_pe_cpu.data(), 0,
+                            D * N_spatial * sizeof(float));
 
-    // ── Prepare image features for fusion encoder ────────────────────────
-    // Use the 72×72 neck features (scale 2) for the fusion encoder
-    // neck_det[2]: [D, 72, 72, B] — flatten spatial dims → [D, 5184, 1]
-    auto* img_feats = ggml_reshape_3d(ctx0, state.neck_det[2], D, H * H, 1);
-    // PE for image features: flatten from [D, 72, 72, 1] → [D, 5184, 1]
-    auto* img_pe = ggml_reshape_3d(ctx0, state.neck_det_pe[2], D, H * H, 1);
+    // Pre-compute constant input vectors
+    std::vector<float> sine_dim_t_cpu(64);
+    for (int i = 0; i < 64; ++i)
+        sine_dim_t_cpu[i] = 2.0f * (float)M_PI / powf(10000.0f, 2.0f * (float)i / 128.0f);
 
-    // ── Fusion encoder graph ─────────────────────────────────────────────
-    // ── DETR decoder inputs: sine dim_t for positional encoding, RPB grid ─
-    // sine_dim_t: [1, 64] — pre-computed 2π / 10000^(2i/128) for i=0..63
-    auto* sine_dim_t = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, 1, 64);
-    ggml_set_name(sine_dim_t, "sine_dim_t");
-    ggml_set_input(sine_dim_t);
+    std::vector<float> rpb_coords_cpu(H);
+    for (int i = 0; i < H; ++i) rpb_coords_cpu[i] = (float)i / (float)H;
 
-    // RPB coordinate grid: [feat_hw] = [72] — normalized [0/72, 1/72, ..., 71/72]
-    auto* rpb_coords = ggml_new_tensor_1d(ctx0, GGML_TYPE_F32, H);
-    ggml_set_name(rpb_coords, "rpb_coords");
-    ggml_set_input(rpb_coords);
+    // Build combined attention bias for the prompt: [T] = [L + N_geo]
+    // 0.0 for valid tokens, -1e9 for padding text tokens, 0.0 for geo tokens
+    std::vector<float> combined_bias_cpu(T);
+    for (int i = 0; i < L; ++i)
+        combined_bias_cpu[i] = (token_ids[i] != 0) ? 0.0f : -1.0e9f;
+    for (int i = 0; i < N_geo; ++i)
+        combined_bias_cpu[L + i] = 0.0f;
 
-    // Text validity mask for DotProductScoring: [L, 1, 1]
-    // Values: T/n_valid for valid tokens, 0 for padding
-    auto* text_valid_mask = ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, L, 1, 1);
-    ggml_set_name(text_valid_mask, "text_valid_mask");
-    ggml_set_input(text_valid_mask);
+    // Build text validity mask for DotProductScoring: [T]
+    int n_valid_tokens = 0;
+    for (int i = 0; i < L; ++i)
+        if (token_ids[i] != 0) ++n_valid_tokens;
+    n_valid_tokens += N_geo;
+    if (n_valid_tokens == 0) n_valid_tokens = 1;
+    float tvm_scale = (float)T / (float)n_valid_tokens;
+    std::vector<float> text_valid_mask_cpu(T);
+    for (int i = 0; i < L; ++i)
+        text_valid_mask_cpu[i] = (token_ids[i] != 0) ? tvm_scale : 0.0f;
+    for (int i = 0; i < N_geo; ++i)
+        text_valid_mask_cpu[L + i] = tvm_scale;
 
-    // Text attention bias for prompt cross-attention: 0 for valid tokens, a
-    // large negative bias for padding tokens.
-    auto* text_attn_bias = ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, L, 1, 1);
-    ggml_set_name(text_attn_bias, "text_attn_bias");
-    ggml_set_input(text_attn_bias);
-
-    // ── Fusion encoder graph ─────────────────────────────────────────────
-    auto* conditioned = sam3_build_fenc_graph(ctx0, model, img_feats, text_features,
-                                              img_pe, text_attn_bias);
-    ggml_set_name(conditioned, "fenc_output");
-    // conditioned: [D, 5184, 1]
-
-    // ── DETR decoder graph ───────────────────────────────────────────────
-    auto ddec_out = sam3_build_ddec_graph(ctx0, model, conditioned, img_pe, text_features,
-                                          sine_dim_t, rpb_coords, text_attn_bias, text_valid_mask);
-    ggml_set_name(ddec_out.class_scores, "class_scores");
-    ggml_set_name(ddec_out.pred_boxes, "pred_boxes");
-    ggml_set_name(ddec_out.presence_score, "presence_score");
-    ggml_set_output(ddec_out.class_scores);
-    ggml_set_output(ddec_out.pred_boxes);
-    ggml_set_output(ddec_out.presence_score);
-
-    // ── Segmentation head graph ──────────────────────────────────────────
-    // Use FPN features from detector neck at 3 scales
-    struct ggml_tensor* fpn_feats[3] = {
-        state.neck_det[0],  // [D, 288, 288, B]
-        state.neck_det[1],  // [D, 144, 144, B]
-        state.neck_det[2],  // [D,  72,  72, B]
-    };
-
-    // Extract object queries from DETR output (skip presence token)
-    auto* obj_queries = ggml_view_3d(ctx0, ddec_out.queries, D, NQ, 1,
-                                     ddec_out.queries->nb[1], ddec_out.queries->nb[2],
-                                     1 * ddec_out.queries->nb[1]);
-    obj_queries = ggml_cont(ctx0, obj_queries);
-
-    // Pass fusion encoder output (conditioned) for pixel decoder integration
-    // The seg head will cross-attend enc output to text, then replace lowest-res FPN feat,
-    // then run the pixel decoder, then produce masks.
-    auto* mask_logits = sam3_build_seg_head_graph(ctx0, model, conditioned, fpn_feats,
-                                                  obj_queries, text_features, text_attn_bias);
-    ggml_set_name(mask_logits, "mask_logits");
-    ggml_set_output(mask_logits);
-    // mask_logits: [288*288, NQ, 1]  (per-query masks are contiguous)
-
-    // ── Build and allocate graph ─────────────────────────────────────────
-    struct ggml_cgraph* graph = ggml_new_graph_custom(ctx0, 65536, false);
-    ggml_build_forward_expand(graph, ddec_out.class_scores);
-    ggml_build_forward_expand(graph, ddec_out.pred_boxes);
-    ggml_build_forward_expand(graph, ddec_out.presence_score);
-    ggml_build_forward_expand(graph, mask_logits);
-
-    auto* galloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(model.backend));
-    if (!ggml_gallocr_reserve(galloc, graph)) {
-        fprintf(stderr, "%s: failed to reserve graph memory\n", __func__);
-        ggml_gallocr_free(galloc);
-        ggml_free(ctx0);
-        return result;
-    }
-    if (!ggml_gallocr_alloc_graph(galloc, graph)) {
-        fprintf(stderr, "%s: failed to allocate graph\n", __func__);
-        ggml_gallocr_free(galloc);
-        ggml_free(ctx0);
-        return result;
-    }
-
-    fprintf(stderr, "%s: graph allocated, %d nodes\n", __func__, ggml_graph_n_nodes(graph));
-
-    // ── Set input data ───────────────────────────────────────────────────
-    // Token IDs
-    ggml_backend_tensor_set(inp_tokens, token_ids.data(), 0, L * sizeof(int32_t));
-
-    // Causal mask (created internally by sam3_build_text_encoder_graph, F16 format)
+    // ═══════════════════════════════════════════════════════════════════
+    //  SUB-GRAPH 1: Text Encoder
+    // ═══════════════════════════════════════════════════════════════════
+    std::vector<float> text_feats_cpu(D * L);
     {
-        auto* causal_mask = ggml_get_tensor(ctx0, "causal_mask");
-        if (causal_mask) {
-            std::vector<ggml_fp16_t> mask_data(L * L);
-            sam3_fill_causal_mask(mask_data.data(), L);
-            ggml_backend_tensor_set(causal_mask, mask_data.data(), 0, L * L * sizeof(ggml_fp16_t));
+        const size_t sz = ggml_tensor_overhead() * 16384 + ggml_graph_overhead() * 2;
+        struct ggml_init_params gp = {sz, nullptr, true};
+        auto* ctx = ggml_init(gp);
+
+        auto* inp = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, L);
+        ggml_set_name(inp, "text_token_ids"); ggml_set_input(inp);
+
+        auto* out = sam3_build_text_encoder_graph(ctx, inp, model);
+        ggml_set_output(out);
+
+        auto* graph = ggml_new_graph_custom(ctx, 16384, false);
+        ggml_build_forward_expand(graph, out);
+
+        auto* causal = ggml_get_tensor(ctx, "causal_mask");
+        auto* alloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(model.backend));
+        if (!ggml_gallocr_reserve(alloc, graph) || !ggml_gallocr_alloc_graph(alloc, graph)) {
+            fprintf(stderr, "%s: text encoder alloc failed\n", __func__);
+            ggml_gallocr_free(alloc); ggml_free(ctx); return result;
         }
-    }
 
-    // Sine dim_t for DETR positional encoding: 2π / 10000^(2i/128) for i=0..63
-    {
-        auto* sdt = ggml_get_tensor(ctx0, "sine_dim_t");
-        if (sdt) {
-            std::vector<float> dim_t_data(64);
-            for (int i = 0; i < 64; ++i) {
-                dim_t_data[i] = 2.0f * (float)M_PI / powf(10000.0f, 2.0f * (float)i / 128.0f);
-            }
-            ggml_backend_tensor_set(sdt, dim_t_data.data(), 0, 64 * sizeof(float));
+        if (inp->buffer) {
+            ggml_backend_tensor_set(inp, token_ids.data(), 0, L * sizeof(int32_t));
+        } else {
+            fprintf(stderr, "%s: ERROR: text encoder input tensor has no buffer!\n", __func__);
+            ggml_gallocr_free(alloc); ggml_free(ctx); return result;
         }
-    }
-
-    // RPB coordinate grid: [0/72, 1/72, ..., 71/72]
-    {
-        auto* rc = ggml_get_tensor(ctx0, "rpb_coords");
-        if (rc) {
-            std::vector<float> coords(H);
-            for (int i = 0; i < H; ++i) coords[i] = (float)i / (float)H;
-            ggml_backend_tensor_set(rc, coords.data(), 0, H * sizeof(float));
+        if (causal && causal->buffer) {
+            std::vector<ggml_fp16_t> cm(L * L);
+            sam3_fill_causal_mask(cm.data(), L);
+            ggml_backend_tensor_set(causal, cm.data(), 0, L * L * sizeof(ggml_fp16_t));
         }
-    }
 
-    // Presence token positional encoding: zeros
-    {
-        auto* qpos_pres = ggml_get_tensor(ctx0, "ddec_query_pos_pres");
-        if (qpos_pres) {
-            std::vector<float> zeros(D, 0.0f);
-            ggml_backend_tensor_set(qpos_pres, zeros.data(), 0, D * sizeof(float));
-        }
-    }
-
-    // RPB presence token mask: zeros
-    {
-        auto* rpb_pz = ggml_get_tensor(ctx0, "rpb_pres_zeros");
-        if (rpb_pz) {
-            int n = (int)(rpb_pz->ne[0] * rpb_pz->ne[1] * rpb_pz->ne[2] * rpb_pz->ne[3]);
-            std::vector<float> zeros(n, 0.0f);
-            ggml_backend_tensor_set(rpb_pz, zeros.data(), 0, n * sizeof(float));
-        }
-    }
-
-    // Text validity mask for DotProductScoring
-    // Tokens: [SOT, bpe..., EOT, 0, 0, ...]. Valid = non-zero. Pad = 0.
-    {
-        auto* tvm = ggml_get_tensor(ctx0, "text_valid_mask");
-        if (tvm) {
-            int n_valid = 0;
-            for (int i = 0; i < L; ++i) {
-                if (token_ids[i] != 0) ++n_valid;
-            }
-            if (n_valid == 0) n_valid = 1;  // safety
-            float scale = (float)L / (float)n_valid;  // compensate AVG pooling
-            std::vector<float> mask_data(L);
-            for (int i = 0; i < L; ++i) {
-                mask_data[i] = (token_ids[i] != 0) ? scale : 0.0f;
-            }
-            ggml_backend_tensor_set(tvm, mask_data.data(), 0, L * sizeof(float));
-        }
-    }
-
-    // Text attention bias for prompt cross-attention.
-    {
-        auto * tab = ggml_get_tensor(ctx0, "text_attn_bias");
-        if (tab) {
-            std::vector<float> bias_data(L);
-            for (int i = 0; i < L; ++i) {
-                bias_data[i] = (token_ids[i] != 0) ? 0.0f : -1.0e9f;
-            }
-            ggml_backend_tensor_set(tab, bias_data.data(), 0, L * sizeof(float));
-        }
-    }
-
-    // ── Compute ──────────────────────────────────────────────────────────
-    {
-        auto t0 = std::chrono::high_resolution_clock::now();
         sam3_graph_compute(model.backend, graph, state.n_threads);
-        auto t1 = std::chrono::high_resolution_clock::now();
-        double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
-        fprintf(stderr, "%s: graph computed in %.1f ms (%d threads)\n",
-                __func__, ms, state.n_threads);
+        ggml_backend_tensor_get(out, text_feats_cpu.data(), 0, D * L * sizeof(float));
+
+        ggml_gallocr_free(alloc); ggml_free(ctx);
     }
 
-    // ── Read outputs ─────────────────────────────────────────────────────
+    fprintf(stderr, "%s: text encoder done\n", __func__);
+
+    // ═══════════════════════════════════════════════════════════════════
+    //  SUB-GRAPH 2: Geometry Encoder
+    // ═══════════════════════════════════════════════════════════════════
+    std::vector<float> geo_feats_cpu(D * N_geo);
+    {
+        const size_t sz = ggml_tensor_overhead() * 4096 + ggml_graph_overhead() * 2;
+        struct ggml_init_params gp = {sz, nullptr, true};
+        auto* ctx = ggml_init(gp);
+
+        auto* g_img = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, D, N_spatial, 1);
+        ggml_set_name(g_img, "geo_img"); ggml_set_input(g_img);
+        auto* g_pe = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, D, N_spatial, 1);
+        ggml_set_name(g_pe, "geo_pe"); ggml_set_input(g_pe);
+
+        auto gr = sam3_build_geom_enc_graph(ctx, model, params, g_img, g_pe);
+        ggml_set_output(gr.geo_feats);
+
+        auto* graph = ggml_new_graph_custom(ctx, 4096, false);
+        ggml_build_forward_expand(graph, gr.geo_feats);
+
+        auto* alloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(model.backend));
+        if (!ggml_gallocr_reserve(alloc, graph) || !ggml_gallocr_alloc_graph(alloc, graph)) {
+            fprintf(stderr, "%s: geometry encoder alloc failed\n", __func__);
+            ggml_gallocr_free(alloc); ggml_free(ctx); return result;
+        }
+
+        ggml_backend_tensor_set(g_img, img_feats_cpu.data(), 0, D * N_spatial * sizeof(float));
+        ggml_backend_tensor_set(g_pe, img_pe_cpu.data(), 0, D * N_spatial * sizeof(float));
+
+        // Pre-transformer input (CLS + optional box embeddings)
+        {
+            const float* feats_ptr = n_boxes > 0 ? img_feats_cpu.data() : nullptr;
+            auto geom_data = sam3_precompute_geom_input(model, params, feats_ptr, H, H);
+            auto* gi = ggml_get_tensor(ctx, "geom_post_final_proj");
+            if (gi) ggml_backend_tensor_set(gi, geom_data.data(), 0, geom_data.size() * sizeof(float));
+        }
+
+        sam3_graph_compute(model.backend, graph, state.n_threads);
+        ggml_backend_tensor_get(gr.geo_feats, geo_feats_cpu.data(), 0,
+                                D * N_geo * sizeof(float));
+
+        ggml_gallocr_free(alloc); ggml_free(ctx);
+    }
+
+    fprintf(stderr, "%s: geometry encoder done\n", __func__);
+
+    // Build combined prompt on CPU: [text_feats, geo_feats] → [D * T]
+    std::vector<float> combined_prompt_cpu(D * T);
+    memcpy(combined_prompt_cpu.data(), text_feats_cpu.data(), D * L * sizeof(float));
+    memcpy(combined_prompt_cpu.data() + D * L, geo_feats_cpu.data(), D * N_geo * sizeof(float));
+
+    fprintf(stderr, "%s: starting fusion encoder\n", __func__);
+    // ═══════════════════════════════════════════════════════════════════
+    //  SUB-GRAPH 3: Fusion Encoder
+    // ═══════════════════════════════════════════════════════════════════
+    std::vector<float> fenc_output_cpu(D * N_spatial);
+    {
+        const size_t sz = ggml_tensor_overhead() * 16384 + ggml_graph_overhead() * 2;
+        struct ggml_init_params gp = {sz, nullptr, true};
+        auto* ctx = ggml_init(gp);
+
+        auto* img = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, D, N_spatial, 1);
+        ggml_set_name(img, "fenc_img"); ggml_set_input(img);
+        auto* pe = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, D, N_spatial, 1);
+        ggml_set_name(pe, "fenc_pe"); ggml_set_input(pe);
+        auto* prompt = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, D, T, 1);
+        ggml_set_name(prompt, "fenc_prompt"); ggml_set_input(prompt);
+        auto* bias = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, T, 1, 1);
+        ggml_set_name(bias, "fenc_bias"); ggml_set_input(bias);
+
+        auto* out = sam3_build_fenc_graph(ctx, model, img, prompt, pe, bias);
+        ggml_set_output(out);
+
+        auto* graph = ggml_new_graph_custom(ctx, 16384, false);
+        ggml_build_forward_expand(graph, out);
+
+        auto* alloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(model.backend));
+        if (!ggml_gallocr_reserve(alloc, graph) || !ggml_gallocr_alloc_graph(alloc, graph)) {
+            fprintf(stderr, "%s: fusion encoder alloc failed\n", __func__);
+            ggml_gallocr_free(alloc); ggml_free(ctx); return result;
+        }
+
+        ggml_backend_tensor_set(img, img_feats_cpu.data(), 0, D * N_spatial * sizeof(float));
+        ggml_backend_tensor_set(pe, img_pe_cpu.data(), 0, D * N_spatial * sizeof(float));
+        ggml_backend_tensor_set(prompt, combined_prompt_cpu.data(), 0, D * T * sizeof(float));
+        ggml_backend_tensor_set(bias, combined_bias_cpu.data(), 0, T * sizeof(float));
+
+        // Dump fenc inputs for comparison with isolated test
+        {
+            FILE* f;
+            f = fopen("/tmp/fenc_subgraph_img.bin", "wb");
+            if (f) { fwrite(img_feats_cpu.data(), sizeof(float), D * N_spatial, f); fclose(f); }
+            f = fopen("/tmp/fenc_subgraph_pe.bin", "wb");
+            if (f) { fwrite(img_pe_cpu.data(), sizeof(float), D * N_spatial, f); fclose(f); }
+            f = fopen("/tmp/fenc_subgraph_prompt.bin", "wb");
+            if (f) { fwrite(combined_prompt_cpu.data(), sizeof(float), D * T, f); fclose(f); }
+            f = fopen("/tmp/fenc_subgraph_bias.bin", "wb");
+            if (f) { fwrite(combined_bias_cpu.data(), sizeof(float), T, f); fclose(f); }
+        }
+
+        sam3_graph_compute(model.backend, graph, state.n_threads);
+        ggml_backend_tensor_get(out, fenc_output_cpu.data(), 0, D * N_spatial * sizeof(float));
+
+        fprintf(stderr, "%s: fenc_out[0..4] = [%.6f, %.6f, %.6f, %.6f, %.6f]\n",
+                __func__, fenc_output_cpu[0], fenc_output_cpu[1], fenc_output_cpu[2],
+                fenc_output_cpu[3], fenc_output_cpu[4]);
+
+        ggml_gallocr_free(alloc); ggml_free(ctx);
+    }
+
+    fprintf(stderr, "%s: fusion encoder done\n", __func__);
+    // ═══════════════════════════════════════════════════════════════════
+    //  SUB-GRAPH 4: DETR Decoder + Scoring
+    // ═══════════════════════════════════════════════════════════════════
     std::vector<float> scores_data(NQ);
-    ggml_backend_tensor_get(ddec_out.class_scores, scores_data.data(), 0, NQ * sizeof(float));
-
     std::vector<float> boxes_data(4 * NQ);
-    ggml_backend_tensor_get(ddec_out.pred_boxes, boxes_data.data(), 0, 4 * NQ * sizeof(float));
+    std::vector<float> queries_data(D * (NQ + 1));  // 201 = NQ + presence token
+    float presence_logit = 0.0f;
+    {
+        const size_t sz = ggml_tensor_overhead() * 32768 + ggml_graph_overhead() * 2;
+        struct ggml_init_params gp = {sz, nullptr, true};
+        auto* ctx = ggml_init(gp);
 
-    std::vector<float> pres_data(1);
-    ggml_backend_tensor_get(ddec_out.presence_score, pres_data.data(), 0, sizeof(float));
+        auto* enc = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, D, N_spatial, 1);
+        ggml_set_name(enc, "ddec_enc"); ggml_set_input(enc);
+        auto* pe = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, D, N_spatial, 1);
+        ggml_set_name(pe, "ddec_pe"); ggml_set_input(pe);
+        auto* txt = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, D, T, 1);
+        ggml_set_name(txt, "ddec_text"); ggml_set_input(txt);
+        auto* sdt = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 1, 64);
+        ggml_set_name(sdt, "sine_dim_t"); ggml_set_input(sdt);
+        auto* rpb = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, H);
+        ggml_set_name(rpb, "rpb_coords"); ggml_set_input(rpb);
+        auto* tab = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, T, 1, 1);
+        ggml_set_name(tab, "text_attn_bias"); ggml_set_input(tab);
+        auto* tvm = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, T, 1, 1);
+        ggml_set_name(tvm, "text_valid_mask"); ggml_set_input(tvm);
 
-    // presence_score is a raw logit — apply sigmoid to get probability
-    float presence_logit = pres_data[0];
+        auto dout = sam3_build_ddec_graph(ctx, model, enc, pe, txt, sdt, rpb, tab, tvm);
+        ggml_set_output(dout.class_scores);
+        ggml_set_output(dout.pred_boxes);
+        ggml_set_output(dout.presence_score);
+        ggml_set_output(dout.queries);
+
+        auto* graph = ggml_new_graph_custom(ctx, 65536, false);
+        ggml_build_forward_expand(graph, dout.class_scores);
+        ggml_build_forward_expand(graph, dout.pred_boxes);
+        ggml_build_forward_expand(graph, dout.presence_score);
+        ggml_build_forward_expand(graph, dout.queries);
+
+        auto* alloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(model.backend));
+        if (!ggml_gallocr_reserve(alloc, graph) || !ggml_gallocr_alloc_graph(alloc, graph)) {
+            fprintf(stderr, "%s: DETR decoder alloc failed\n", __func__);
+            ggml_gallocr_free(alloc); ggml_free(ctx); return result;
+        }
+
+        ggml_backend_tensor_set(enc, fenc_output_cpu.data(), 0, D * N_spatial * sizeof(float));
+        ggml_backend_tensor_set(pe, img_pe_cpu.data(), 0, D * N_spatial * sizeof(float));
+        ggml_backend_tensor_set(txt, combined_prompt_cpu.data(), 0, D * T * sizeof(float));
+        ggml_backend_tensor_set(sdt, sine_dim_t_cpu.data(), 0, 64 * sizeof(float));
+        ggml_backend_tensor_set(rpb, rpb_coords_cpu.data(), 0, H * sizeof(float));
+        ggml_backend_tensor_set(tab, combined_bias_cpu.data(), 0, T * sizeof(float));
+        ggml_backend_tensor_set(tvm, text_valid_mask_cpu.data(), 0, T * sizeof(float));
+
+        // Presence token position encoding: zeros
+        auto* qpos = ggml_get_tensor(ctx, "ddec_query_pos_pres");
+        if (qpos) {
+            std::vector<float> z(D, 0.0f);
+            ggml_backend_tensor_set(qpos, z.data(), 0, D * sizeof(float));
+        }
+        auto* rpbz = ggml_get_tensor(ctx, "rpb_pres_zeros");
+        if (rpbz) {
+            int n = (int)(rpbz->ne[0] * rpbz->ne[1] * rpbz->ne[2] * rpbz->ne[3]);
+            std::vector<float> z(n, 0.0f);
+            ggml_backend_tensor_set(rpbz, z.data(), 0, n * sizeof(float));
+        }
+
+        sam3_graph_compute(model.backend, graph, state.n_threads);
+
+        ggml_backend_tensor_get(dout.class_scores, scores_data.data(), 0, NQ * sizeof(float));
+        ggml_backend_tensor_get(dout.pred_boxes, boxes_data.data(), 0, 4 * NQ * sizeof(float));
+        ggml_backend_tensor_get(dout.presence_score, &presence_logit, 0, sizeof(float));
+        ggml_backend_tensor_get(dout.queries, queries_data.data(), 0,
+                                D * (NQ + 1) * sizeof(float));
+
+        ggml_gallocr_free(alloc); ggml_free(ctx);
+    }
+
     float presence_prob = 1.0f / (1.0f + expf(-presence_logit));
 
-    // Read mask logits: [288*288, NQ, 1] — per-query masks are contiguous
+    fprintf(stderr, "%s: DETR decoder done\n", __func__);
+    // ═══════════════════════════════════════════════════════════════════
+    //  SUB-GRAPH 5: Segmentation Head
+    // ═══════════════════════════════════════════════════════════════════
     const int mask_hw = 288;
     std::vector<float> all_masks(NQ * mask_hw * mask_hw);
-    ggml_backend_tensor_get(mask_logits, all_masks.data(), 0, all_masks.size() * sizeof(float));
+    {
+        const size_t sz = ggml_tensor_overhead() * 16384 + ggml_graph_overhead() * 2;
+        struct ggml_init_params gp = {sz, nullptr, true};
+        auto* ctx = ggml_init(gp);
 
-    // ── Post-process: score thresholding ─────────────────────────────────
-    // Python joint scoring: outputs_class = inverse_sigmoid(class_scores.sigmoid() * presence.sigmoid())
-    // Then final score = outputs_class.sigmoid() = class_scores.sigmoid() * presence.sigmoid()
-    // So effectively: score = sigmoid(class_logit) * sigmoid(presence_logit)
+        auto* enc_h = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, D, N_spatial, 1);
+        ggml_set_name(enc_h, "seg_enc"); ggml_set_input(enc_h);
+
+        // FPN features at 3 scales — create fresh inputs
+        const int H0 = H * 4, H1 = H * 2;
+        auto* fpn0 = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, D, H0, H0, 1);
+        ggml_set_name(fpn0, "seg_fpn0"); ggml_set_input(fpn0);
+        auto* fpn1 = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, D, H1, H1, 1);
+        ggml_set_name(fpn1, "seg_fpn1"); ggml_set_input(fpn1);
+        auto* fpn2 = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, D, H, H, 1);
+        ggml_set_name(fpn2, "seg_fpn2"); ggml_set_input(fpn2);
+        struct ggml_tensor* fpn_feats[3] = {fpn0, fpn1, fpn2};
+
+        // Object queries (skip presence token at index 0 → start at index 1)
+        auto* oq = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, D, NQ, 1);
+        ggml_set_name(oq, "seg_queries"); ggml_set_input(oq);
+
+        auto* txt = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, D, T, 1);
+        ggml_set_name(txt, "seg_text"); ggml_set_input(txt);
+        auto* tab = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, T, 1, 1);
+        ggml_set_name(tab, "seg_bias"); ggml_set_input(tab);
+
+        auto* out = sam3_build_seg_head_graph(ctx, model, enc_h, fpn_feats,
+                                               oq, txt, tab);
+        ggml_set_output(out);
+
+        auto* graph = ggml_new_graph_custom(ctx, 32768, false);
+        ggml_build_forward_expand(graph, out);
+
+        fprintf(stderr, "%s: seg head graph: %d nodes\n", __func__, ggml_graph_n_nodes(graph));
+
+        auto* alloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(model.backend));
+        if (!ggml_gallocr_reserve(alloc, graph) || !ggml_gallocr_alloc_graph(alloc, graph)) {
+            fprintf(stderr, "%s: segmentation head alloc failed\n", __func__);
+            ggml_gallocr_free(alloc); ggml_free(ctx); return result;
+        }
+
+        // Check buffer allocation for all input tensors
+        fprintf(stderr, "%s: seg buffers: enc_h=%p fpn0=%p fpn1=%p fpn2=%p oq=%p txt=%p tab=%p\n",
+                __func__, (void*)enc_h->buffer, (void*)fpn0->buffer, (void*)fpn1->buffer,
+                (void*)fpn2->buffer, (void*)oq->buffer, (void*)txt->buffer, (void*)tab->buffer);
+
+        ggml_backend_tensor_set(enc_h, fenc_output_cpu.data(), 0,
+                                D * N_spatial * sizeof(float));
+
+        // Copy FPN features from state
+        {
+            size_t s0 = (size_t)D * H0 * H0 * sizeof(float);
+            size_t s1 = (size_t)D * H1 * H1 * sizeof(float);
+            size_t s2 = (size_t)D * H * H * sizeof(float);
+            std::vector<float> b0(D * H0 * H0), b1(D * H1 * H1), b2(D * H * H);
+            ggml_backend_tensor_get(state.neck_det[0], b0.data(), 0, s0);
+            if (fpn0->buffer) ggml_backend_tensor_set(fpn0, b0.data(), 0, s0);
+            ggml_backend_tensor_get(state.neck_det[1], b1.data(), 0, s1);
+            if (fpn1->buffer) ggml_backend_tensor_set(fpn1, b1.data(), 0, s1);
+            ggml_backend_tensor_get(state.neck_det[2], b2.data(), 0, s2);
+            if (fpn2->buffer) ggml_backend_tensor_set(fpn2, b2.data(), 0, s2);
+        }
+
+        // Object queries: extract from DETR queries (skip presence token at slot 0)
+        // queries_data is flat [D * 201], presence token is at positions [0..D-1]
+        // Object queries start at position [D..D*(NQ+1)-1]
+        ggml_backend_tensor_set(oq, queries_data.data() + D, 0, D * NQ * sizeof(float));
+
+        ggml_backend_tensor_set(txt, combined_prompt_cpu.data(), 0, D * T * sizeof(float));
+        ggml_backend_tensor_set(tab, combined_bias_cpu.data(), 0, T * sizeof(float));
+
+        sam3_graph_compute(model.backend, graph, state.n_threads);
+        ggml_backend_tensor_get(out, all_masks.data(), 0, all_masks.size() * sizeof(float));
+
+        ggml_gallocr_free(alloc); ggml_free(ctx);
+    }
+
+    // ═══════════════════════════════════════════════════════════════════
+    //  Post-processing: thresholding + NMS + mask resize
+    // ═══════════════════════════════════════════════════════════════════
     std::vector<sam3_detection> dets;
     for (int q = 0; q < NQ; ++q) {
         float class_prob = 1.0f / (1.0f + expf(-scores_data[q]));
@@ -5163,11 +5834,6 @@ sam3_result sam3_segment_pcs(sam3_state& state,
         if (score < params.score_threshold) continue;
 
         sam3_detection det;
-        // boxes are [4, NQ] in ggml layout: (cx, cy, w, h) per query
-        // boxes_data is flat [4*NQ], ggml stores [ne[0]=4, ne[1]=NQ] column-major
-        // So box for query q: boxes_data[0 + q*4] through boxes_data[3 + q*4]
-        // Wait — ggml reads with ggml_backend_tensor_get as flat bytes.
-        // Tensor is [4, NQ, 1] with ne[0]=4. So element (i, q) = data[i + q*4].
         float cx = boxes_data[0 + q * 4];
         float cy = boxes_data[1 + q * 4];
         float bw = boxes_data[2 + q * 4];
@@ -5176,18 +5842,14 @@ sam3_result sam3_segment_pcs(sam3_state& state,
         det.box = sam3_cxcywh_to_xyxy(cx, cy, bw, bh, state.orig_width, state.orig_height);
         det.score = score;
 
-        // Extract mask for this query and resize to original image size
         const float* mask_ptr = all_masks.data() + q * mask_hw * mask_hw;
         auto mask_resized = sam3_bilinear_interpolate(mask_ptr, mask_hw, mask_hw,
                                                       state.orig_width, state.orig_height);
-
-        // Binarize mask at threshold 0.0 (sigmoid > 0.5 ↔ logit > 0.0)
         det.mask.width = state.orig_width;
         det.mask.height = state.orig_height;
         det.mask.data.resize(state.orig_width * state.orig_height);
-        for (int i = 0; i < (int)mask_resized.size(); ++i) {
+        for (int i = 0; i < (int)mask_resized.size(); ++i)
             det.mask.data[i] = (mask_resized[i] > 0.0f) ? 255 : 0;
-        }
         det.mask.iou_score = score;
 
         dets.push_back(std::move(det));
@@ -5196,7 +5858,6 @@ sam3_result sam3_segment_pcs(sam3_state& state,
     fprintf(stderr, "%s: %zu detections above threshold %.2f (presence=%.3f, logit=%.3f)\n",
             __func__, dets.size(), params.score_threshold, presence_prob, presence_logit);
 
-    // ── NMS ──────────────────────────────────────────────────────────────
     auto keep = sam3_nms(dets, params.nms_threshold);
     for (int i = 0; i < (int)keep.size(); ++i) {
         dets[keep[i]].instance_id = i + 1;
@@ -5204,10 +5865,6 @@ sam3_result sam3_segment_pcs(sam3_state& state,
     }
 
     fprintf(stderr, "%s: %zu detections after NMS\n", __func__, result.detections.size());
-
-    // ── Cleanup ──────────────────────────────────────────────────────────
-    ggml_gallocr_free(galloc);
-    ggml_free(ctx0);
 
     auto t_end = std::chrono::high_resolution_clock::now();
     double total_ms = std::chrono::duration<double, std::milli>(t_end - t_start).count();
@@ -5797,20 +6454,35 @@ sam3_result sam3_segment_pvs(sam3_state& state,
     // ── SAM prompt encoder (CPU pre-compute + input tensors) ─────────────
     auto pe_out = sam3_build_sam_pe(ctx0, params, D, H);
 
-    // Match the Python image predictor: add the learned no-memory token to the
-    // lowest-resolution tracker feature map before the SAM decoder.
-    auto * no_mem = ggml_reshape_4d(ctx0, model.tensors.at("no_mem_embed"), D, 1, 1, 1);
-    auto * image_feats = ggml_add(ctx0, state.neck_trk[2], no_mem);
+    // ── Create fresh input tensors for tracker features ──────────────────
+    // CRITICAL: Do NOT use state.neck_trk[*] directly in graph operations
+    // (like ggml_add). They are tensors from a previous graph, and
+    // ggml_build_forward_expand traces all ancestors — which would pull in
+    // the ENTIRE ViT + neck recomputation (2500+ nodes, ~37 seconds).
+    // Instead: create fresh input tensors and copy data from state on CPU.
+    const int H0 = H * 4;  // 288
+    const int H1 = H * 2;  // 144
+
+    auto * image_feats = ggml_new_tensor_4d(ctx0, GGML_TYPE_F32, D, H, H, 1);
     ggml_set_name(image_feats, "sam_dec_image_feats");
+    ggml_set_input(image_feats);
+
+    auto * feat_s0 = ggml_new_tensor_4d(ctx0, GGML_TYPE_F32, D, H0, H0, 1);
+    ggml_set_name(feat_s0, "pvs_feat_s0");
+    ggml_set_input(feat_s0);
+
+    auto * feat_s1 = ggml_new_tensor_4d(ctx0, GGML_TYPE_F32, D, H1, H1, 1);
+    ggml_set_name(feat_s1, "pvs_feat_s1");
+    ggml_set_input(feat_s1);
 
     // ── SAM mask decoder graph ───────────────────────────────────────────
     auto dec_out = sam3_build_sam_dec_graph(ctx0, model,
-                                            image_feats,        // [D, 72, 72, 1]
+                                            image_feats,
                                             pe_out.image_pe,
                                             pe_out.sparse,
                                             pe_out.dense,
-                                            state.neck_trk[0],   // [D, 288, 288, 1]
-                                            state.neck_trk[1]);  // [D, 144, 144, 1]
+                                            feat_s0,
+                                            feat_s1);
 
     // Mark outputs
     ggml_set_output(dec_out.masks);
@@ -5880,6 +6552,29 @@ sam3_result sam3_segment_pvs(sam3_state& state,
                                 0, D * H * H * sizeof(float));
         ggml_backend_tensor_set(pe_out.dense, state.dense_nomask_cache.data(),
                                 0, D * H * H * sizeof(float));
+    }
+
+    // ── Copy tracker features from state to fresh input tensors ─────────
+    // image_feats = neck_trk[2] + no_mem_embed (computed on CPU)
+    {
+        const int n2 = D * H * H;
+        std::vector<float> trk2(n2), no_mem_data(D);
+        ggml_backend_tensor_get(state.neck_trk[2], trk2.data(), 0, n2 * sizeof(float));
+        ggml_backend_tensor_get(model.tensors.at("no_mem_embed"), no_mem_data.data(), 0, D * sizeof(float));
+        // Add no_mem_embed (broadcast [D] to [D, H, H])
+        for (int s = 0; s < H * H; ++s)
+            for (int d = 0; d < D; ++d)
+                trk2[d + s * D] += no_mem_data[d];
+        ggml_backend_tensor_set(image_feats, trk2.data(), 0, n2 * sizeof(float));
+
+        // feat_s0 = neck_trk[0], feat_s1 = neck_trk[1]
+        const int n0 = D * H0 * H0;
+        const int n1 = D * H1 * H1;
+        std::vector<float> trk0(n0), trk1(n1);
+        ggml_backend_tensor_get(state.neck_trk[0], trk0.data(), 0, n0 * sizeof(float));
+        ggml_backend_tensor_set(feat_s0, trk0.data(), 0, n0 * sizeof(float));
+        ggml_backend_tensor_get(state.neck_trk[1], trk1.data(), 0, n1 * sizeof(float));
+        ggml_backend_tensor_set(feat_s1, trk1.data(), 0, n1 * sizeof(float));
     }
 
     // ── Compute ──────────────────────────────────────────────────────────
@@ -7020,6 +7715,11 @@ bool sam3_test_dump_phase5(const sam3_model & model,
     auto * text_features = ggml_reshape_3d(ctx0, text_features_2d, D, L, 1);
     ggml_set_name(text_features, "text_features");
 
+    // Make a snapshot copy of text_features for dumping — the graph allocator
+    // may reuse the view's underlying buffer for later ops.
+    auto * text_features_snap = ggml_cont(ctx0, ggml_reshape_2d(ctx0, text_features_2d, D, L));
+    ggml_set_name(text_features_snap, "text_features_snap");
+
     auto * img_feats = ggml_reshape_3d(ctx0, state.neck_det[2], D, H * H, 1);
     auto * img_pe = ggml_reshape_3d(ctx0, state.neck_det_pe[2], D, H * H, 1);
 
@@ -7069,11 +7769,11 @@ bool sam3_test_dump_phase5(const sam3_model & model,
     };
 
     const std::vector<named_tensor> direct_tensors = {
-        {"text_features", text_features},
+        {"text_features", text_features_snap},
         {"text_valid_mask", text_valid_mask},
         {"fenc_img_input", img_feats},
         {"fenc_pos_embed", img_pe},
-        {"fenc_prompt", text_features},
+        {"fenc_prompt", text_features_snap},
         {"img_pe_72", state.neck_det_pe[2]},
         {"ddec_query_embed", model.ddec.query_embed},
         {"ddec_ref_pts_raw", model.tensors.at("ddec.reference_points.weight")},
@@ -7123,7 +7823,7 @@ bool sam3_test_dump_phase5(const sam3_model & model,
         named_outputs.emplace_back(box_name);
     }
 
-    ggml_set_output(text_features);
+    ggml_set_output(text_features_snap);
     ggml_set_output(text_valid_mask);
     ggml_set_output(img_feats);
     ggml_set_output(img_pe);
@@ -7143,7 +7843,7 @@ bool sam3_test_dump_phase5(const sam3_model & model,
     ggml_build_forward_expand(graph, ddec_out.pred_boxes);
     ggml_build_forward_expand(graph, ddec_out.presence_score);
     ggml_build_forward_expand(graph, mask_logits);
-    ggml_build_forward_expand(graph, text_features);
+    ggml_build_forward_expand(graph, text_features_snap);
     ggml_build_forward_expand(graph, text_valid_mask);
     ggml_build_forward_expand(graph, img_feats);
     ggml_build_forward_expand(graph, img_pe);
@@ -7539,6 +8239,165 @@ bool sam3_test_dump_phase5_from_ref_inputs(const sam3_model & model,
     return ok;
 }
 
+bool sam3_test_fenc_only(const sam3_model & model,
+                         const std::string & ref_dir,
+                         const std::string & output_dir,
+                         int n_threads) {
+    const auto & hp = model.hparams;
+    const int D = hp.neck_dim;       // 256
+    const int H = hp.n_img_embd();   // 72
+    const int N = H * H;             // 5184
+
+    fprintf(stderr, "%s: D=%d H=%d N=%d fenc_layers=%d\n",
+            __func__, D, H, N, hp.fenc_layers);
+
+    // ── Load reference tensors from Python dump ──
+    // The Python script saves batch-first [1, N, D] tensors.
+    // Memory layout: N blocks of D floats = same as ggml [D, N, 1].
+    std::vector<float> img_feat_data;
+    std::vector<float> pos_data;
+    std::vector<float> prompt_data;
+    std::vector<float> attn_bias_data;
+
+    if (!sam3_load_ref_f32_data(ref_dir + "/fenc_input_tgt", img_feat_data, D * N)) {
+        fprintf(stderr, "%s: failed to load fenc_input_tgt\n", __func__);
+        return false;
+    }
+    if (!sam3_load_ref_f32_data(ref_dir + "/fenc_input_pos", pos_data, D * N)) {
+        fprintf(stderr, "%s: failed to load fenc_input_pos\n", __func__);
+        return false;
+    }
+    if (!sam3_load_ref_f32_data(ref_dir + "/fenc_input_prompt", prompt_data)) {
+        fprintf(stderr, "%s: failed to load fenc_input_prompt\n", __func__);
+        return false;
+    }
+
+    // Determine prompt length from loaded data
+    const int T = (int) prompt_data.size() / D;
+    fprintf(stderr, "%s: prompt tokens T=%d\n", __func__, T);
+
+    // Attn bias: [1, T] float (0.0 valid, -1e9 padding)
+    // If not present, assume all valid (no bias)
+    bool have_attn_bias = sam3_load_ref_f32_data(ref_dir + "/fenc_attn_bias", attn_bias_data, T);
+    if (!have_attn_bias) {
+        fprintf(stderr, "%s: no fenc_attn_bias found, assuming all tokens valid\n", __func__);
+        attn_bias_data.assign(T, 0.0f);
+    }
+
+    // ── Build fenc-only graph ──
+    const size_t buf_size = ggml_tensor_overhead() * 16384 + ggml_graph_overhead() * 2;
+    struct ggml_init_params gparams = {
+        /*.mem_size   =*/buf_size,
+        /*.mem_buffer =*/nullptr,
+        /*.no_alloc   =*/true,
+    };
+    struct ggml_context * ctx0 = ggml_init(gparams);
+    if (!ctx0) {
+        fprintf(stderr, "%s: failed to init compute context\n", __func__);
+        return false;
+    }
+
+    // Create input tensors (ggml layout: [D, N, 1])
+    auto * img_feats = ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, D, N, 1);
+    ggml_set_name(img_feats, "fenc_img_input");
+    ggml_set_input(img_feats);
+
+    auto * pos_enc = ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, D, N, 1);
+    ggml_set_name(pos_enc, "fenc_pos_input");
+    ggml_set_input(pos_enc);
+
+    auto * prompt_tokens = ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, D, T, 1);
+    ggml_set_name(prompt_tokens, "fenc_prompt_input");
+    ggml_set_input(prompt_tokens);
+
+    auto * text_attn_bias = ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, T, 1, 1);
+    ggml_set_name(text_attn_bias, "fenc_attn_bias");
+    ggml_set_input(text_attn_bias);
+
+    // Build fusion encoder graph
+    auto * conditioned = sam3_build_fenc_graph(ctx0, model, img_feats, prompt_tokens,
+                                               pos_enc, text_attn_bias);
+    // sam3_build_fenc_graph names the last layer fenc_layer5_out.  ggml_set_name
+    // will overwrite it, so create a cont copy so both names resolve.
+    auto * fenc_last = ggml_cont(ctx0, conditioned);
+    ggml_set_name(fenc_last, "fenc_layer5_out");
+    ggml_set_name(conditioned, "fenc_output");
+
+    // Mark all per-layer outputs as graph outputs for extraction
+    std::vector<std::string> output_names = {"fenc_output"};
+    for (int i = 0; i < hp.fenc_layers; ++i) {
+        char name[64];
+        snprintf(name, sizeof(name), "fenc_layer%d_out", i);
+        output_names.emplace_back(name);
+    }
+
+    ggml_set_output(img_feats);
+    ggml_set_output(pos_enc);
+    ggml_set_output(prompt_tokens);
+    for (const auto & name : output_names) {
+        auto * t = ggml_get_tensor(ctx0, name.c_str());
+        if (t) {
+            ggml_set_output(t);
+        }
+    }
+
+    // Build and allocate graph
+    struct ggml_cgraph * graph = ggml_new_graph_custom(ctx0, 16384, false);
+    ggml_build_forward_expand(graph, conditioned);
+    ggml_build_forward_expand(graph, fenc_last);
+    for (const auto & name : output_names) {
+        auto * t = ggml_get_tensor(ctx0, name.c_str());
+        if (t) {
+            ggml_build_forward_expand(graph, t);
+        }
+    }
+
+    auto * galloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(model.backend));
+    if (!ggml_gallocr_reserve(galloc, graph) || !ggml_gallocr_alloc_graph(galloc, graph)) {
+        fprintf(stderr, "%s: failed to allocate fenc graph\n", __func__);
+        ggml_gallocr_free(galloc);
+        ggml_free(ctx0);
+        return false;
+    }
+
+    // ── Set input data ──
+    ggml_backend_tensor_set(img_feats, img_feat_data.data(), 0,
+                            img_feat_data.size() * sizeof(float));
+    ggml_backend_tensor_set(pos_enc, pos_data.data(), 0,
+                            pos_data.size() * sizeof(float));
+    ggml_backend_tensor_set(prompt_tokens, prompt_data.data(), 0,
+                            prompt_data.size() * sizeof(float));
+    ggml_backend_tensor_set(text_attn_bias, attn_bias_data.data(), 0,
+                            attn_bias_data.size() * sizeof(float));
+
+    // ── Compute ──
+    fprintf(stderr, "%s: computing fenc graph (%d nodes)...\n", __func__, ggml_graph_n_nodes(graph));
+    sam3_graph_compute(model.backend, graph, n_threads);
+
+    // ── Dump outputs ──
+    bool ok = true;
+    for (const auto & name : output_names) {
+        auto * t = ggml_get_tensor(ctx0, name.c_str());
+        if (!t) {
+            fprintf(stderr, "%s: tensor '%s' not found\n", __func__, name.c_str());
+            ok = false;
+            continue;
+        }
+        if (!sam3_dump_tensor_to_path(t, name, output_dir + "/" + name)) {
+            ok = false;
+        }
+    }
+
+    // Also dump inputs for verification
+    sam3_dump_tensor_to_path(img_feats, "fenc_img_input", output_dir + "/fenc_img_input");
+    sam3_dump_tensor_to_path(pos_enc, "fenc_pos_input", output_dir + "/fenc_pos_input");
+    sam3_dump_tensor_to_path(prompt_tokens, "fenc_prompt_input", output_dir + "/fenc_prompt_input");
+
+    ggml_gallocr_free(galloc);
+    ggml_free(ctx0);
+    return ok;
+}
+
 static bool sam3_test_dump_phase6_impl(const sam3_model & model,
                                        struct ggml_tensor * state_neck0,
                                        struct ggml_tensor * state_neck1,
@@ -7784,6 +8643,150 @@ bool sam3_test_dump_phase6_from_ref_inputs(const sam3_model & model,
                                       nullptr, nullptr, nullptr,
                                       &neck_trk_0, &neck_trk_1, &neck_trk_2,
                                       params, output_dir, n_threads);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  Test: Geometry encoder dump
+// ═══════════════════════════════════════════════════════════════════════════════
+
+bool sam3_test_dump_geom_enc(const sam3_model   & model,
+                              const std::string  & prephase_ref_dir,
+                              const sam3_pcs_params & params,
+                              const std::string  & output_dir,
+                              int                  n_threads) {
+    const auto & hp = model.hparams;
+    const int D = hp.neck_dim;         // 256
+    const int H = hp.n_img_embd();     // 72
+
+    // Load backbone features from Phase 3 reference (NCHW format)
+    std::vector<float> neck_det_2;
+    if (!sam3_load_ref_f32_data(prephase_ref_dir + "/neck_det_2", neck_det_2, D * H * H)) {
+        fprintf(stderr, "%s: failed to load neck_det_2\n", __func__);
+        return false;
+    }
+    // Reorder from NCHW to ggml [D, W, H] layout
+    auto neck_det_2_ggml = sam3_reorder_nchw_to_ggml_dwh(neck_det_2, D, H, H);
+
+    // Compute sinusoidal PE for image features (matching Python PositionEmbeddingSine)
+    std::vector<float> img_pe_nchw(D * H * H);
+    {
+        const float scale = 2.0f * (float)M_PI;
+        const float eps = 1e-6f;
+        const int num_pos_feats = D / 2;  // 128
+
+        for (int row = 0; row < H; ++row) {
+            for (int col = 0; col < H; ++col) {
+                float y_embed = ((float)(row + 1) - 0.5f) / ((float)H + eps) * scale;
+                float x_embed = ((float)(col + 1) - 0.5f) / ((float)H + eps) * scale;
+
+                for (int i = 0; i < num_pos_feats; ++i) {
+                    int div_idx = 2 * (i / 2);
+                    float dim_t = powf(10000.0f, (float)div_idx / (float)num_pos_feats);
+
+                    float px = x_embed / dim_t;
+                    float py = y_embed / dim_t;
+
+                    float pe_y, pe_x;
+                    if (i % 2 == 0) {
+                        pe_y = sinf(py);
+                        pe_x = sinf(px);
+                    } else {
+                        pe_y = cosf(py);
+                        pe_x = cosf(px);
+                    }
+                    // Output: [1, D, H, W] NCHW — pos_y first half, pos_x second half
+                    img_pe_nchw[i * H * H + row * H + col] = pe_y;
+                    img_pe_nchw[(num_pos_feats + i) * H * H + row * H + col] = pe_x;
+                }
+            }
+        }
+    }
+    auto img_pe_ggml = sam3_reorder_nchw_to_ggml_dwh(img_pe_nchw, D, H, H);
+
+    // ── Build graph ─────────────────────────────────────────────────────
+    const size_t buf_size = ggml_tensor_overhead() * 8192 + ggml_graph_overhead() * 2;
+    struct ggml_init_params gparams = {
+        /*.mem_size   =*/buf_size,
+        /*.mem_buffer =*/nullptr,
+        /*.no_alloc   =*/true,
+    };
+    struct ggml_context* ctx0 = ggml_init(gparams);
+    if (!ctx0) {
+        fprintf(stderr, "%s: failed to init context\n", __func__);
+        return false;
+    }
+
+    // Image features as input tensors (from reference data)
+    auto* img_feats_t = ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, D, H * H, 1);
+    ggml_set_name(img_feats_t, "img_feats_input");
+    ggml_set_input(img_feats_t);
+
+    auto* img_pe_t = ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, D, H * H, 1);
+    ggml_set_name(img_pe_t, "img_pe_input");
+    ggml_set_input(img_pe_t);
+
+    // Build geometry encoder graph
+    auto geom_out = sam3_build_geom_enc_graph(ctx0, model, params, img_feats_t, img_pe_t);
+
+    // Build and allocate graph
+    struct ggml_cgraph* graph = ggml_new_graph_custom(ctx0, 16384, false);
+    ggml_build_forward_expand(graph, geom_out.geo_feats);
+
+    auto* galloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(model.backend));
+    if (!ggml_gallocr_reserve(galloc, graph) || !ggml_gallocr_alloc_graph(galloc, graph)) {
+        fprintf(stderr, "%s: failed to allocate graph\n", __func__);
+        ggml_gallocr_free(galloc);
+        ggml_free(ctx0);
+        return false;
+    }
+
+    // Upload image features
+    ggml_backend_tensor_set(img_feats_t, neck_det_2_ggml.data(), 0, D * H * H * sizeof(float));
+    ggml_backend_tensor_set(img_pe_t, img_pe_ggml.data(), 0, D * H * H * sizeof(float));
+
+    // Pre-compute geometry input on CPU and upload
+    auto geom_data = sam3_precompute_geom_input(model, params, neck_det_2_ggml.data(), H, H);
+    auto* gi = ggml_get_tensor(ctx0, "geom_post_final_proj");
+    if (gi) {
+        ggml_backend_tensor_set(gi, geom_data.data(), 0, geom_data.size() * sizeof(float));
+    }
+
+    // Compute
+    sam3_graph_compute(model.backend, graph, n_threads);
+
+    // Dump outputs
+    mkdir(output_dir.c_str(), 0755);
+
+    // Dump the pre-computed input (after final_proj + norm, before transformer)
+    {
+        auto* pre_proj = ggml_get_tensor(ctx0, "geom_post_final_proj");
+        if (pre_proj) sam3_dump_tensor_to_path(pre_proj, "post_final_proj", output_dir + "/post_final_proj");
+    }
+
+    // Dump final output
+    {
+        auto* out = ggml_get_tensor(ctx0, "geom_output");
+        if (out) sam3_dump_tensor_to_path(out, "geom_output", output_dir + "/geom_output");
+    }
+
+    // Also dump the pre-computed input data (before ggml processing)
+    {
+        const int N_geo = geom_out.n_tokens;
+        std::string path = output_dir + "/geom_input_precomputed";
+        {
+            std::ofstream f(path + ".bin", std::ios::binary);
+            f.write(reinterpret_cast<const char*>(geom_data.data()), geom_data.size() * sizeof(float));
+        }
+        {
+            std::ofstream f(path + ".shape");
+            f << D << "," << N_geo;
+        }
+        fprintf(stderr, "%s: dumped geom_input_precomputed [%d, %d]\n", __func__, D, N_geo);
+    }
+
+    ggml_gallocr_free(galloc);
+    ggml_free(ctx0);
+    return true;
 }
 
 static bool sam3_test_dump_phase7_mem_slot_current(

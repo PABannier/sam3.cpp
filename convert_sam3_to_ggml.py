@@ -123,6 +123,7 @@ def rename_key(k: str) -> str | None:
     # DETR decoder
     k = k.replace("detector.transformer.decoder.layers.", "ddec.layers.")
     k = k.replace("detector.transformer.decoder.", "ddec.")
+    k = k.replace(".cross_attn_image.", ".ca.")
     k = k.replace(".cross_attn.", ".ca.")
     k = k.replace(".self_attn.",  ".sa.")
     k = k.replace(".ca_text.",    ".ca_text.")
