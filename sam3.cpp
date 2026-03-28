@@ -1,5 +1,6 @@
 #include "sam3.h"
 
+/* ggml */
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
 #include "ggml-cpu.h"
@@ -9,11 +10,13 @@
 #include "ggml-metal.h"
 #endif
 
+/* stb (implementation compiled here -- order is pinned) */
 #define STB_IMAGE_IMPLEMENTATION
 #include "stb_image.h"
 #define STB_IMAGE_WRITE_IMPLEMENTATION
 #include <sys/stat.h>
 
+/* C++ standard library */
 #include <algorithm>
 #include <cassert>
 #include <chrono>
@@ -29,64 +32,66 @@
 
 #include "stb_image_write.h"
 
-// ═══════════════════════════════════════════════════════════════════════════════
-//  Constants
-// ═══════════════════════════════════════════════════════════════════════════════
+
+/*****************************************************************************
+** Constants
+*****************************************************************************/
 
 static constexpr uint32_t SAM3_MAGIC     = 0x73616D33;  // "sam3"
 static constexpr uint32_t SAM3_TOK_MAGIC = 0x746F6B00;  // "tok\0"
-static constexpr int SAM3_VERSION = 3;
+static constexpr int      SAM3_VERSION   = 3;
 
-// ═══════════════════════════════════════════════════════════════════════════════
-//  Internal data types — hyperparameters
-// ═══════════════════════════════════════════════════════════════════════════════
+
+/*****************************************************************************
+** Internal Data Types -- Hyperparameters
+*****************************************************************************/
 
 struct sam3_hparams {
-    int32_t img_size = 1008;
-    int32_t patch_size = 14;
-    int32_t vit_embed_dim = 1024;
-    int32_t vit_depth = 32;
-    int32_t vit_num_heads = 16;
-    int32_t vit_mlp_dim = 4736;  // 1024 * 4.625
+    int32_t img_size        = 1008;
+    int32_t patch_size      = 14;
+    int32_t vit_embed_dim   = 1024;
+    int32_t vit_depth       = 32;
+    int32_t vit_num_heads   = 16;
+    int32_t vit_mlp_dim     = 4736;  // 1024 * 4.625
     int32_t vit_window_size = 24;
-    int32_t n_global_attn = 4;
+    int32_t n_global_attn   = 4;
     int32_t global_attn_idx[4] = {7, 15, 23, 31};
 
-    int32_t text_width = 1024;
-    int32_t text_heads = 16;
-    int32_t text_layers = 24;
-    int32_t text_ctx_len = 32;
+    int32_t text_width      = 1024;
+    int32_t text_heads      = 16;
+    int32_t text_layers     = 24;
+    int32_t text_ctx_len    = 32;
     int32_t text_vocab_size = 49408;
-    int32_t text_out_dim = 256;
+    int32_t text_out_dim    = 256;
 
-    int32_t neck_dim = 256;
+    int32_t neck_dim        = 256;
 
-    int32_t fenc_layers = 6;
-    int32_t fenc_heads = 8;
-    int32_t fenc_ffn_dim = 2048;
+    int32_t fenc_layers     = 6;
+    int32_t fenc_heads      = 8;
+    int32_t fenc_ffn_dim    = 2048;
 
-    int32_t ddec_layers = 6;
-    int32_t ddec_heads = 8;
-    int32_t ddec_ffn_dim = 2048;
-    int32_t ddec_num_queries = 200;
+    int32_t ddec_layers       = 6;
+    int32_t ddec_heads        = 8;
+    int32_t ddec_ffn_dim      = 2048;
+    int32_t ddec_num_queries  = 200;
 
-    int32_t geom_layers = 3;
-    int32_t n_presence_tokens = 1;
-    int32_t n_geom_queries = 4;
+    int32_t geom_layers        = 3;
+    int32_t n_presence_tokens  = 1;
+    int32_t n_geom_queries     = 4;
 
-    int32_t sam_embed_dim = 256;
-    int32_t sam_dec_depth = 2;
-    int32_t sam_n_multimask = 3;
+    int32_t sam_embed_dim     = 256;
+    int32_t sam_dec_depth     = 2;
+    int32_t sam_n_multimask   = 3;
     int32_t sam_iou_head_depth = 3;
 
-    int32_t mem_out_dim = 64;
+    int32_t mem_out_dim     = 64;
     int32_t mem_attn_layers = 4;
-    int32_t num_maskmem = 7;
-    int32_t max_obj_ptrs = 16;
+    int32_t num_maskmem     = 7;
+    int32_t max_obj_ptrs    = 16;
 
-    int32_t n_amb_experts = 2;
+    int32_t n_amb_experts   = 2;
 
-    int32_t visual_only = 0;  // 1 = no text encoder / detector path
+    int32_t visual_only     = 0;  // 1 = no text encoder / detector path
 
     // derived helpers
     int32_t n_img_embd() const { return img_size / patch_size; }            // 72
@@ -101,47 +106,51 @@ struct sam3_hparams {
     }
 };
 
-// ═══════════════════════════════════════════════════════════════════════════════
-//  Internal data types — layer weight structs
-// ═══════════════════════════════════════════════════════════════════════════════
+/*****************************************************************************
+** Internal Data Types -- Layer Weight Structs
+*****************************************************************************/
 
-// ── ViT backbone ─────────────────────────────────────────────────────────────
+/*
+** ── ViT Backbone ─────────────────────────────────────────────────────────
+*/
 
 struct sam3_vit_block {
-    struct ggml_tensor* norm1_w = nullptr;
-    struct ggml_tensor* norm1_b = nullptr;
-    struct ggml_tensor* qkv_w = nullptr;
-    struct ggml_tensor* qkv_b = nullptr;
-    struct ggml_tensor* proj_w = nullptr;
-    struct ggml_tensor* proj_b = nullptr;
-    struct ggml_tensor* norm2_w = nullptr;
-    struct ggml_tensor* norm2_b = nullptr;
+    struct ggml_tensor* norm1_w   = nullptr;
+    struct ggml_tensor* norm1_b   = nullptr;
+    struct ggml_tensor* qkv_w     = nullptr;
+    struct ggml_tensor* qkv_b     = nullptr;
+    struct ggml_tensor* proj_w    = nullptr;
+    struct ggml_tensor* proj_b    = nullptr;
+    struct ggml_tensor* norm2_w   = nullptr;
+    struct ggml_tensor* norm2_b   = nullptr;
     struct ggml_tensor* mlp_fc1_w = nullptr;
     struct ggml_tensor* mlp_fc1_b = nullptr;
     struct ggml_tensor* mlp_fc2_w = nullptr;
     struct ggml_tensor* mlp_fc2_b = nullptr;
-    struct ggml_tensor* freqs_cis = nullptr;  // [N, 32, 2] RoPE (N=576 window, 5184 global)
+    struct ggml_tensor* freqs_cis = nullptr;  // [N, 32, 2] RoPE
 };
 
 struct sam3_vit {
-    struct ggml_tensor* patch_embed_w = nullptr;  // [patch, patch, 3, embed] (ggml conv kernel)
-    struct ggml_tensor* pos_embed = nullptr;      // [embed, 24, 24, 1] (pretrained res, tiled at runtime)
-    struct ggml_tensor* ln_pre_w = nullptr;
-    struct ggml_tensor* ln_pre_b = nullptr;
-    std::vector<sam3_vit_block> blocks;
+    struct ggml_tensor*          patch_embed_w = nullptr;  // [patch, patch, 3, embed]
+    struct ggml_tensor*          pos_embed     = nullptr;  // [embed, 24, 24, 1]
+    struct ggml_tensor*          ln_pre_w      = nullptr;
+    struct ggml_tensor*          ln_pre_b      = nullptr;
+    std::vector<sam3_vit_block>  blocks;
 };
 
-// ── Neck (SimpleFPN) ─────────────────────────────────────────────────────────
+/*
+** ── Neck (SimpleFPN) ─────────────────────────────────────────────────────
+*/
 
 struct sam3_neck_scale {
-    struct ggml_tensor* deconv1_w = nullptr;
-    struct ggml_tensor* deconv1_b = nullptr;
-    struct ggml_tensor* deconv2_w = nullptr;  // only for 4x scale
-    struct ggml_tensor* deconv2_b = nullptr;
-    struct ggml_tensor* conv1x1_w = nullptr;
-    struct ggml_tensor* conv1x1_b = nullptr;
-    struct ggml_tensor* conv3x3_w = nullptr;
-    struct ggml_tensor* conv3x3_b = nullptr;
+    struct ggml_tensor* deconv1_w  = nullptr;
+    struct ggml_tensor* deconv1_b  = nullptr;
+    struct ggml_tensor* deconv2_w  = nullptr;  // only for 4x scale
+    struct ggml_tensor* deconv2_b  = nullptr;
+    struct ggml_tensor* conv1x1_w  = nullptr;
+    struct ggml_tensor* conv1x1_b  = nullptr;
+    struct ggml_tensor* conv3x3_w  = nullptr;
+    struct ggml_tensor* conv3x3_b  = nullptr;
 };
 
 struct sam3_neck {
@@ -150,32 +159,34 @@ struct sam3_neck {
     struct ggml_tensor* norms_b[4] = {};
 };
 
-// ── Text encoder ─────────────────────────────────────────────────────────────
+/*
+** ── Text Encoder ─────────────────────────────────────────────────────────
+*/
 
 struct sam3_text_block {
-    struct ggml_tensor* attn_in_proj_w = nullptr;
-    struct ggml_tensor* attn_in_proj_b = nullptr;
+    struct ggml_tensor* attn_in_proj_w  = nullptr;
+    struct ggml_tensor* attn_in_proj_b  = nullptr;
     struct ggml_tensor* attn_out_proj_w = nullptr;
     struct ggml_tensor* attn_out_proj_b = nullptr;
-    struct ggml_tensor* ln1_w = nullptr;
-    struct ggml_tensor* ln1_b = nullptr;
-    struct ggml_tensor* ln2_w = nullptr;
-    struct ggml_tensor* ln2_b = nullptr;
-    struct ggml_tensor* mlp_fc1_w = nullptr;
-    struct ggml_tensor* mlp_fc1_b = nullptr;
-    struct ggml_tensor* mlp_fc2_w = nullptr;
-    struct ggml_tensor* mlp_fc2_b = nullptr;
-    struct ggml_tensor* ls1 = nullptr;  // LayerScale (may be null)
-    struct ggml_tensor* ls2 = nullptr;
+    struct ggml_tensor* ln1_w           = nullptr;
+    struct ggml_tensor* ln1_b           = nullptr;
+    struct ggml_tensor* ln2_w           = nullptr;
+    struct ggml_tensor* ln2_b           = nullptr;
+    struct ggml_tensor* mlp_fc1_w       = nullptr;
+    struct ggml_tensor* mlp_fc1_b       = nullptr;
+    struct ggml_tensor* mlp_fc2_w       = nullptr;
+    struct ggml_tensor* mlp_fc2_b       = nullptr;
+    struct ggml_tensor* ls1             = nullptr;  // LayerScale
+    struct ggml_tensor* ls2             = nullptr;
 };
 
 struct sam3_text_encoder {
     struct ggml_tensor* token_embed_w = nullptr;  // [vocab, width]
-    struct ggml_tensor* pos_embed = nullptr;      // [ctx_len, width]
-    struct ggml_tensor* ln_final_w = nullptr;
-    struct ggml_tensor* ln_final_b = nullptr;
-    struct ggml_tensor* resizer_w = nullptr;  // [out_dim, width]
-    struct ggml_tensor* resizer_b = nullptr;
+    struct ggml_tensor* pos_embed     = nullptr;  // [ctx_len, width]
+    struct ggml_tensor* ln_final_w    = nullptr;
+    struct ggml_tensor* ln_final_b    = nullptr;
+    struct ggml_tensor* resizer_w     = nullptr;  // [out_dim, width]
+    struct ggml_tensor* resizer_b     = nullptr;
     // Note: text_projection ([width, proj_dim]) exists in the checkpoint but is
     // intentionally not loaded. In SAM3, VETextEncoder discards the pooled output
     // that text_projection operates on — only the full token sequence (through
@@ -183,203 +194,215 @@ struct sam3_text_encoder {
     std::vector<sam3_text_block> blocks;
 };
 
-// ── Fusion encoder ───────────────────────────────────────────────────────────
+/*
+** ── Fusion Encoder ───────────────────────────────────────────────────────
+*/
 
 struct sam3_fenc_layer {
     // self-attention
-    struct ggml_tensor* sa_in_proj_w = nullptr;
-    struct ggml_tensor* sa_in_proj_b = nullptr;
+    struct ggml_tensor* sa_in_proj_w  = nullptr;
+    struct ggml_tensor* sa_in_proj_b  = nullptr;
     struct ggml_tensor* sa_out_proj_w = nullptr;
     struct ggml_tensor* sa_out_proj_b = nullptr;
-    struct ggml_tensor* norm1_w = nullptr;
-    struct ggml_tensor* norm1_b = nullptr;
+    struct ggml_tensor* norm1_w       = nullptr;
+    struct ggml_tensor* norm1_b       = nullptr;
     // cross-attention to prompt tokens
-    struct ggml_tensor* ca_q_w = nullptr;
-    struct ggml_tensor* ca_q_b = nullptr;
-    struct ggml_tensor* ca_kv_w = nullptr;
-    struct ggml_tensor* ca_kv_b = nullptr;
-    struct ggml_tensor* ca_out_w = nullptr;
-    struct ggml_tensor* ca_out_b = nullptr;
-    struct ggml_tensor* norm2_w = nullptr;
-    struct ggml_tensor* norm2_b = nullptr;
+    struct ggml_tensor* ca_q_w        = nullptr;
+    struct ggml_tensor* ca_q_b        = nullptr;
+    struct ggml_tensor* ca_kv_w       = nullptr;
+    struct ggml_tensor* ca_kv_b       = nullptr;
+    struct ggml_tensor* ca_out_w      = nullptr;
+    struct ggml_tensor* ca_out_b      = nullptr;
+    struct ggml_tensor* norm2_w       = nullptr;
+    struct ggml_tensor* norm2_b       = nullptr;
     // FFN
-    struct ggml_tensor* ffn_fc1_w = nullptr;
-    struct ggml_tensor* ffn_fc1_b = nullptr;
-    struct ggml_tensor* ffn_fc2_w = nullptr;
-    struct ggml_tensor* ffn_fc2_b = nullptr;
-    struct ggml_tensor* norm3_w = nullptr;
-    struct ggml_tensor* norm3_b = nullptr;
+    struct ggml_tensor* ffn_fc1_w     = nullptr;
+    struct ggml_tensor* ffn_fc1_b     = nullptr;
+    struct ggml_tensor* ffn_fc2_w     = nullptr;
+    struct ggml_tensor* ffn_fc2_b     = nullptr;
+    struct ggml_tensor* norm3_w       = nullptr;
+    struct ggml_tensor* norm3_b       = nullptr;
 };
 
 struct sam3_fusion_encoder {
     std::vector<sam3_fenc_layer> layers;
 };
 
-// ── DETR decoder ─────────────────────────────────────────────────────────────
+/*
+** ── DETR Decoder ─────────────────────────────────────────────────────────
+*/
 
 struct sam3_ddec_layer {
     // self-attention
-    struct ggml_tensor* sa_in_proj_w = nullptr;
-    struct ggml_tensor* sa_in_proj_b = nullptr;
-    struct ggml_tensor* sa_out_proj_w = nullptr;
-    struct ggml_tensor* sa_out_proj_b = nullptr;
-    struct ggml_tensor* norm1_w = nullptr;
-    struct ggml_tensor* norm1_b = nullptr;
+    struct ggml_tensor* sa_in_proj_w   = nullptr;
+    struct ggml_tensor* sa_in_proj_b   = nullptr;
+    struct ggml_tensor* sa_out_proj_w  = nullptr;
+    struct ggml_tensor* sa_out_proj_b  = nullptr;
+    struct ggml_tensor* norm1_w        = nullptr;
+    struct ggml_tensor* norm1_b        = nullptr;
     // cross-attention to image
-    struct ggml_tensor* ca_q_w = nullptr;
-    struct ggml_tensor* ca_q_b = nullptr;
-    struct ggml_tensor* ca_kv_w = nullptr;
-    struct ggml_tensor* ca_kv_b = nullptr;
-    struct ggml_tensor* ca_out_w = nullptr;
-    struct ggml_tensor* ca_out_b = nullptr;
-    struct ggml_tensor* norm2_w = nullptr;
-    struct ggml_tensor* norm2_b = nullptr;
+    struct ggml_tensor* ca_q_w         = nullptr;
+    struct ggml_tensor* ca_q_b         = nullptr;
+    struct ggml_tensor* ca_kv_w        = nullptr;
+    struct ggml_tensor* ca_kv_b        = nullptr;
+    struct ggml_tensor* ca_out_w       = nullptr;
+    struct ggml_tensor* ca_out_b       = nullptr;
+    struct ggml_tensor* norm2_w        = nullptr;
+    struct ggml_tensor* norm2_b        = nullptr;
     // cross-attention to text
-    struct ggml_tensor* ca_text_q_w = nullptr;
-    struct ggml_tensor* ca_text_q_b = nullptr;
-    struct ggml_tensor* ca_text_kv_w = nullptr;
-    struct ggml_tensor* ca_text_kv_b = nullptr;
-    struct ggml_tensor* ca_text_out_w = nullptr;
-    struct ggml_tensor* ca_text_out_b = nullptr;
-    struct ggml_tensor* norm3_w = nullptr;
-    struct ggml_tensor* norm3_b = nullptr;
+    struct ggml_tensor* ca_text_q_w    = nullptr;
+    struct ggml_tensor* ca_text_q_b    = nullptr;
+    struct ggml_tensor* ca_text_kv_w   = nullptr;
+    struct ggml_tensor* ca_text_kv_b   = nullptr;
+    struct ggml_tensor* ca_text_out_w  = nullptr;
+    struct ggml_tensor* ca_text_out_b  = nullptr;
+    struct ggml_tensor* norm3_w        = nullptr;
+    struct ggml_tensor* norm3_b        = nullptr;
     // FFN
-    struct ggml_tensor* ffn_fc1_w = nullptr;
-    struct ggml_tensor* ffn_fc1_b = nullptr;
-    struct ggml_tensor* ffn_fc2_w = nullptr;
-    struct ggml_tensor* ffn_fc2_b = nullptr;
-    struct ggml_tensor* norm4_w = nullptr;
-    struct ggml_tensor* norm4_b = nullptr;
+    struct ggml_tensor* ffn_fc1_w      = nullptr;
+    struct ggml_tensor* ffn_fc1_b      = nullptr;
+    struct ggml_tensor* ffn_fc2_w      = nullptr;
+    struct ggml_tensor* ffn_fc2_b      = nullptr;
+    struct ggml_tensor* norm4_w        = nullptr;
+    struct ggml_tensor* norm4_b        = nullptr;
     // box refinement MLP (3 layers)
-    struct ggml_tensor* bbox_w[3] = {};
-    struct ggml_tensor* bbox_b[3] = {};
+    struct ggml_tensor* bbox_w[3]      = {};
+    struct ggml_tensor* bbox_b[3]      = {};
 };
 
 struct sam3_detr_decoder {
-    struct ggml_tensor* query_embed = nullptr;     // [num_queries, 512]
-    struct ggml_tensor* presence_token = nullptr;  // [1, 256]
+    struct ggml_tensor*          query_embed      = nullptr;  // [num_queries, 512]
+    struct ggml_tensor*          presence_token   = nullptr;  // [1, 256]
     // DotProductScoring MLP
-    struct ggml_tensor* score_mlp_w[2] = {};
-    struct ggml_tensor* score_mlp_b[2] = {};
-    struct ggml_tensor* score_ln_w = nullptr;
-    struct ggml_tensor* score_ln_b = nullptr;
+    struct ggml_tensor*          score_mlp_w[2]   = {};
+    struct ggml_tensor*          score_mlp_b[2]   = {};
+    struct ggml_tensor*          score_ln_w       = nullptr;
+    struct ggml_tensor*          score_ln_b       = nullptr;
     // Presence head
-    struct ggml_tensor* presence_head_w[2] = {};
-    struct ggml_tensor* presence_head_b[2] = {};
+    struct ggml_tensor*          presence_head_w[2] = {};
+    struct ggml_tensor*          presence_head_b[2] = {};
     std::vector<sam3_ddec_layer> layers;
 };
 
-// ── Geometry / exemplar encoder ──────────────────────────────────────────────
+/*
+** ── Geometry / Exemplar Encoder ──────────────────────────────────────────
+*/
 
 struct sam3_geom_layer {
-    struct ggml_tensor* sa_in_proj_w = nullptr;
-    struct ggml_tensor* sa_in_proj_b = nullptr;
+    struct ggml_tensor* sa_in_proj_w  = nullptr;
+    struct ggml_tensor* sa_in_proj_b  = nullptr;
     struct ggml_tensor* sa_out_proj_w = nullptr;
     struct ggml_tensor* sa_out_proj_b = nullptr;
-    struct ggml_tensor* norm1_w = nullptr;
-    struct ggml_tensor* norm1_b = nullptr;
-    struct ggml_tensor* ca_q_w = nullptr;
-    struct ggml_tensor* ca_q_b = nullptr;
-    struct ggml_tensor* ca_kv_w = nullptr;
-    struct ggml_tensor* ca_kv_b = nullptr;
-    struct ggml_tensor* ca_out_w = nullptr;
-    struct ggml_tensor* ca_out_b = nullptr;
-    struct ggml_tensor* norm2_w = nullptr;
-    struct ggml_tensor* norm2_b = nullptr;
-    struct ggml_tensor* ffn_fc1_w = nullptr;
-    struct ggml_tensor* ffn_fc1_b = nullptr;
-    struct ggml_tensor* ffn_fc2_w = nullptr;
-    struct ggml_tensor* ffn_fc2_b = nullptr;
-    struct ggml_tensor* norm3_w = nullptr;
-    struct ggml_tensor* norm3_b = nullptr;
+    struct ggml_tensor* norm1_w       = nullptr;
+    struct ggml_tensor* norm1_b       = nullptr;
+    struct ggml_tensor* ca_q_w        = nullptr;
+    struct ggml_tensor* ca_q_b        = nullptr;
+    struct ggml_tensor* ca_kv_w       = nullptr;
+    struct ggml_tensor* ca_kv_b       = nullptr;
+    struct ggml_tensor* ca_out_w      = nullptr;
+    struct ggml_tensor* ca_out_b      = nullptr;
+    struct ggml_tensor* norm2_w       = nullptr;
+    struct ggml_tensor* norm2_b       = nullptr;
+    struct ggml_tensor* ffn_fc1_w     = nullptr;
+    struct ggml_tensor* ffn_fc1_b     = nullptr;
+    struct ggml_tensor* ffn_fc2_w     = nullptr;
+    struct ggml_tensor* ffn_fc2_b     = nullptr;
+    struct ggml_tensor* norm3_w       = nullptr;
+    struct ggml_tensor* norm3_b       = nullptr;
 };
 
 struct sam3_geom_encoder {
     // Direct projections
-    struct ggml_tensor* point_proj_w = nullptr;  // Linear(2, D)
-    struct ggml_tensor* point_proj_b = nullptr;
-    struct ggml_tensor* box_proj_w = nullptr;  // Linear(4, D)
-    struct ggml_tensor* box_proj_b = nullptr;
+    struct ggml_tensor* point_proj_w      = nullptr;  // Linear(2, D)
+    struct ggml_tensor* point_proj_b      = nullptr;
+    struct ggml_tensor* box_proj_w        = nullptr;  // Linear(4, D)
+    struct ggml_tensor* box_proj_b        = nullptr;
     // Pooling projections
     struct ggml_tensor* point_pool_proj_w = nullptr;  // Linear(D, D)
     struct ggml_tensor* point_pool_proj_b = nullptr;
-    struct ggml_tensor* box_pool_proj_w = nullptr;  // Conv2d(D, D, 7)
-    struct ggml_tensor* box_pool_proj_b = nullptr;
+    struct ggml_tensor* box_pool_proj_w   = nullptr;  // Conv2d(D, D, 7)
+    struct ggml_tensor* box_pool_proj_b   = nullptr;
     // Positional encoding projections
-    struct ggml_tensor* point_pos_proj_w = nullptr;  // Linear(D, D)
-    struct ggml_tensor* point_pos_proj_b = nullptr;
-    struct ggml_tensor* box_pos_proj_w = nullptr;  // Linear(D+2, D) = Linear(258, 256)
-    struct ggml_tensor* box_pos_proj_b = nullptr;
+    struct ggml_tensor* point_pos_proj_w  = nullptr;  // Linear(D, D)
+    struct ggml_tensor* point_pos_proj_b  = nullptr;
+    struct ggml_tensor* box_pos_proj_w    = nullptr;  // Linear(258, 256)
+    struct ggml_tensor* box_pos_proj_b    = nullptr;
     // Label and CLS embeddings
-    struct ggml_tensor* type_embed = nullptr;  // Embedding(2, D)
-    struct ggml_tensor* cls_token = nullptr;   // Embedding(1, D)
+    struct ggml_tensor* type_embed        = nullptr;  // Embedding(2, D)
+    struct ggml_tensor* cls_token         = nullptr;  // Embedding(1, D)
     // Final projection + norms
-    struct ggml_tensor* post_proj_w = nullptr;  // Linear(D, D)
-    struct ggml_tensor* post_proj_b = nullptr;
-    struct ggml_tensor* norm_w = nullptr;  // LayerNorm for final_proj
-    struct ggml_tensor* norm_b = nullptr;
-    struct ggml_tensor* encode_norm_w = nullptr;  // LayerNorm after transformer
-    struct ggml_tensor* encode_norm_b = nullptr;
-    struct ggml_tensor* img_pre_norm_w = nullptr;  // LayerNorm before pooling
-    struct ggml_tensor* img_pre_norm_b = nullptr;
+    struct ggml_tensor* post_proj_w       = nullptr;  // Linear(D, D)
+    struct ggml_tensor* post_proj_b       = nullptr;
+    struct ggml_tensor* norm_w            = nullptr;  // LayerNorm final_proj
+    struct ggml_tensor* norm_b            = nullptr;
+    struct ggml_tensor* encode_norm_w     = nullptr;  // LayerNorm after xfmr
+    struct ggml_tensor* encode_norm_b     = nullptr;
+    struct ggml_tensor* img_pre_norm_w    = nullptr;  // LayerNorm before pool
+    struct ggml_tensor* img_pre_norm_b    = nullptr;
     std::vector<sam3_geom_layer> layers;
 };
 
-// ── Segmentation head (MaskFormer) ───────────────────────────────────────────
+/*
+** ── Segmentation Head (MaskFormer) ───────────────────────────────────────
+*/
 
 struct sam3_seg_head {
-    struct ggml_tensor* up_conv_w[3] = {};
-    struct ggml_tensor* up_conv_b[3] = {};
-    struct ggml_tensor* up_norm_w[3] = {};
-    struct ggml_tensor* up_norm_b[3] = {};
-    struct ggml_tensor* ca_prompt_q_w = nullptr;
-    struct ggml_tensor* ca_prompt_q_b = nullptr;
-    struct ggml_tensor* ca_prompt_kv_w = nullptr;
-    struct ggml_tensor* ca_prompt_kv_b = nullptr;
-    struct ggml_tensor* ca_prompt_out_w = nullptr;
-    struct ggml_tensor* ca_prompt_out_b = nullptr;
-    struct ggml_tensor* mask_embed_w = nullptr;
-    struct ggml_tensor* mask_embed_b = nullptr;
+    struct ggml_tensor* up_conv_w[3]      = {};
+    struct ggml_tensor* up_conv_b[3]      = {};
+    struct ggml_tensor* up_norm_w[3]      = {};
+    struct ggml_tensor* up_norm_b[3]      = {};
+    struct ggml_tensor* ca_prompt_q_w     = nullptr;
+    struct ggml_tensor* ca_prompt_q_b     = nullptr;
+    struct ggml_tensor* ca_prompt_kv_w    = nullptr;
+    struct ggml_tensor* ca_prompt_kv_b    = nullptr;
+    struct ggml_tensor* ca_prompt_out_w   = nullptr;
+    struct ggml_tensor* ca_prompt_out_b   = nullptr;
+    struct ggml_tensor* mask_embed_w      = nullptr;
+    struct ggml_tensor* mask_embed_b      = nullptr;
 };
 
-// ── SAM prompt encoder (tracker path) ────────────────────────────────────────
+/*
+** ── SAM Prompt Encoder (Tracker Path) ────────────────────────────────────
+*/
 
 struct sam3_sam_prompt_enc {
-    struct ggml_tensor* pe_gaussian = nullptr;        // [2, 128]
-    struct ggml_tensor* point_embed[4] = {};          // neg, pos, box_tl, box_br
-    struct ggml_tensor* not_a_point_embed = nullptr;  // [256]
-    struct ggml_tensor* no_mask_embed = nullptr;      // [256]
-    struct ggml_tensor* mask_ds_conv_w[3] = {};
-    struct ggml_tensor* mask_ds_conv_b[3] = {};
-    struct ggml_tensor* mask_ds_norm_w[2] = {};
-    struct ggml_tensor* mask_ds_norm_b[2] = {};
+    struct ggml_tensor* pe_gaussian         = nullptr;  // [2, 128]
+    struct ggml_tensor* point_embed[4]      = {};       // neg, pos, box_tl, box_br
+    struct ggml_tensor* not_a_point_embed   = nullptr;  // [256]
+    struct ggml_tensor* no_mask_embed       = nullptr;  // [256]
+    struct ggml_tensor* mask_ds_conv_w[3]   = {};
+    struct ggml_tensor* mask_ds_conv_b[3]   = {};
+    struct ggml_tensor* mask_ds_norm_w[2]   = {};
+    struct ggml_tensor* mask_ds_norm_b[2]   = {};
 };
 
-// ── SAM mask decoder (tracker path) ──────────────────────────────────────────
+/*
+** ── SAM Mask Decoder (Tracker Path) ──────────────────────────────────────
+*/
 
 struct sam3_sam_attn {
-    struct ggml_tensor* q_w = nullptr;
-    struct ggml_tensor* q_b = nullptr;
-    struct ggml_tensor* k_w = nullptr;
-    struct ggml_tensor* k_b = nullptr;
-    struct ggml_tensor* v_w = nullptr;
-    struct ggml_tensor* v_b = nullptr;
+    struct ggml_tensor* q_w   = nullptr;
+    struct ggml_tensor* q_b   = nullptr;
+    struct ggml_tensor* k_w   = nullptr;
+    struct ggml_tensor* k_b   = nullptr;
+    struct ggml_tensor* v_w   = nullptr;
+    struct ggml_tensor* v_b   = nullptr;
     struct ggml_tensor* out_w = nullptr;
     struct ggml_tensor* out_b = nullptr;
 };
 
 struct sam3_twoway_block {
-    sam3_sam_attn self_attn;
-    sam3_sam_attn ca_tok2img;
-    sam3_sam_attn ca_img2tok;
-    struct ggml_tensor* norm1_w = nullptr;
-    struct ggml_tensor* norm1_b = nullptr;
-    struct ggml_tensor* norm2_w = nullptr;
-    struct ggml_tensor* norm2_b = nullptr;
-    struct ggml_tensor* norm3_w = nullptr;
-    struct ggml_tensor* norm3_b = nullptr;
-    struct ggml_tensor* norm4_w = nullptr;
-    struct ggml_tensor* norm4_b = nullptr;
+    sam3_sam_attn       self_attn;
+    sam3_sam_attn       ca_tok2img;
+    sam3_sam_attn       ca_img2tok;
+    struct ggml_tensor* norm1_w   = nullptr;
+    struct ggml_tensor* norm1_b   = nullptr;
+    struct ggml_tensor* norm2_w   = nullptr;
+    struct ggml_tensor* norm2_b   = nullptr;
+    struct ggml_tensor* norm3_w   = nullptr;
+    struct ggml_tensor* norm3_b   = nullptr;
+    struct ggml_tensor* norm4_w   = nullptr;
+    struct ggml_tensor* norm4_b   = nullptr;
     struct ggml_tensor* mlp_fc1_w = nullptr;
     struct ggml_tensor* mlp_fc1_b = nullptr;
     struct ggml_tensor* mlp_fc2_w = nullptr;
@@ -387,110 +410,116 @@ struct sam3_twoway_block {
 };
 
 struct sam3_sam_mask_dec {
-    struct ggml_tensor* iou_token = nullptr;        // [1, 256]
-    struct ggml_tensor* mask_tokens = nullptr;      // [4, 256]
-    struct ggml_tensor* obj_score_token = nullptr;  // [1, 256]
+    struct ggml_tensor*           iou_token       = nullptr;  // [1, 256]
+    struct ggml_tensor*           mask_tokens     = nullptr;  // [4, 256]
+    struct ggml_tensor*           obj_score_token = nullptr;  // [1, 256]
 
-    std::vector<sam3_twoway_block> twoway_blocks;  // [2]
+    std::vector<sam3_twoway_block> twoway_blocks;             // [2]
 
-    sam3_sam_attn final_attn;
-    struct ggml_tensor* final_norm_w = nullptr;
-    struct ggml_tensor* final_norm_b = nullptr;
+    sam3_sam_attn                 final_attn;
+    struct ggml_tensor*           final_norm_w    = nullptr;
+    struct ggml_tensor*           final_norm_b    = nullptr;
 
     // upscaling
-    struct ggml_tensor* up1_w = nullptr;
-    struct ggml_tensor* up1_b = nullptr;
-    struct ggml_tensor* up1_norm_w = nullptr;
-    struct ggml_tensor* up1_norm_b = nullptr;
-    struct ggml_tensor* up2_w = nullptr;
-    struct ggml_tensor* up2_b = nullptr;
+    struct ggml_tensor* up1_w        = nullptr;
+    struct ggml_tensor* up1_b        = nullptr;
+    struct ggml_tensor* up1_norm_w   = nullptr;
+    struct ggml_tensor* up1_norm_b   = nullptr;
+    struct ggml_tensor* up2_w        = nullptr;
+    struct ggml_tensor* up2_b        = nullptr;
 
     // high-res feature convolutions
-    struct ggml_tensor* conv_s0_w = nullptr;
-    struct ggml_tensor* conv_s0_b = nullptr;
-    struct ggml_tensor* conv_s1_w = nullptr;
-    struct ggml_tensor* conv_s1_b = nullptr;
+    struct ggml_tensor* conv_s0_w    = nullptr;
+    struct ggml_tensor* conv_s0_b    = nullptr;
+    struct ggml_tensor* conv_s1_w    = nullptr;
+    struct ggml_tensor* conv_s1_b    = nullptr;
 
-    // hypernetwork MLPs: 4 masks × 3 layers
-    struct ggml_tensor* hyper_w[4][3] = {};
-    struct ggml_tensor* hyper_b[4][3] = {};
+    // hypernetwork MLPs: 4 masks x 3 layers
+    struct ggml_tensor* hyper_w[4][3]  = {};
+    struct ggml_tensor* hyper_b[4][3]  = {};
 
     // IoU prediction head (3 layers)
-    struct ggml_tensor* iou_head_w[3] = {};
-    struct ggml_tensor* iou_head_b[3] = {};
+    struct ggml_tensor* iou_head_w[3]  = {};
+    struct ggml_tensor* iou_head_b[3]  = {};
 
     // object score head (3 layers)
-    struct ggml_tensor* obj_head_w[3] = {};
-    struct ggml_tensor* obj_head_b[3] = {};
+    struct ggml_tensor* obj_head_w[3]  = {};
+    struct ggml_tensor* obj_head_b[3]  = {};
 };
 
-// ── Memory encoder ───────────────────────────────────────────────────────────
+/*
+** ── Memory Encoder ───────────────────────────────────────────────────────
+*/
 
 struct sam3_mem_enc {
     // mask downsampler (4 conv stages + final 1x1)
-    struct ggml_tensor* ds_conv_w[5] = {};
-    struct ggml_tensor* ds_conv_b[5] = {};
-    struct ggml_tensor* ds_norm_w[4] = {};
-    struct ggml_tensor* ds_norm_b[4] = {};
+    struct ggml_tensor* ds_conv_w[5]      = {};
+    struct ggml_tensor* ds_conv_b[5]      = {};
+    struct ggml_tensor* ds_norm_w[4]      = {};
+    struct ggml_tensor* ds_norm_b[4]      = {};
     // pixel feature projection
-    struct ggml_tensor* pix_proj_w = nullptr;
-    struct ggml_tensor* pix_proj_b = nullptr;
+    struct ggml_tensor* pix_proj_w        = nullptr;
+    struct ggml_tensor* pix_proj_b        = nullptr;
     // fuser (2 CXBlock layers)
-    struct ggml_tensor* fuser_dw_w[2] = {};
-    struct ggml_tensor* fuser_dw_b[2] = {};
-    struct ggml_tensor* fuser_norm_w[2] = {};
-    struct ggml_tensor* fuser_norm_b[2] = {};
-    struct ggml_tensor* fuser_fc1_w[2] = {};
-    struct ggml_tensor* fuser_fc1_b[2] = {};
-    struct ggml_tensor* fuser_fc2_w[2] = {};
-    struct ggml_tensor* fuser_fc2_b[2] = {};
-    struct ggml_tensor* fuser_gamma[2] = {};
+    struct ggml_tensor* fuser_dw_w[2]     = {};
+    struct ggml_tensor* fuser_dw_b[2]     = {};
+    struct ggml_tensor* fuser_norm_w[2]   = {};
+    struct ggml_tensor* fuser_norm_b[2]   = {};
+    struct ggml_tensor* fuser_fc1_w[2]    = {};
+    struct ggml_tensor* fuser_fc1_b[2]    = {};
+    struct ggml_tensor* fuser_fc2_w[2]    = {};
+    struct ggml_tensor* fuser_fc2_b[2]    = {};
+    struct ggml_tensor* fuser_gamma[2]    = {};
     // output projection
-    struct ggml_tensor* out_proj_w = nullptr;
-    struct ggml_tensor* out_proj_b = nullptr;
+    struct ggml_tensor* out_proj_w        = nullptr;
+    struct ggml_tensor* out_proj_b        = nullptr;
     // temporal pos encodings
-    struct ggml_tensor* tpos[7] = {};
+    struct ggml_tensor* tpos[7]           = {};
 };
 
-// ── Memory attention (tracker transformer) ───────────────────────────────────
+/*
+** ── Memory Attention (Tracker Transformer) ───────────────────────────────
+*/
 
 struct sam3_mem_attn_layer {
     // self-attention (RoPE, 1 head, 256-dim)
-    struct ggml_tensor* sa_q_w = nullptr;
-    struct ggml_tensor* sa_q_b = nullptr;
-    struct ggml_tensor* sa_k_w = nullptr;
-    struct ggml_tensor* sa_k_b = nullptr;
-    struct ggml_tensor* sa_v_w = nullptr;
-    struct ggml_tensor* sa_v_b = nullptr;
-    struct ggml_tensor* sa_out_w = nullptr;
-    struct ggml_tensor* sa_out_b = nullptr;
-    struct ggml_tensor* norm1_w = nullptr;
-    struct ggml_tensor* norm1_b = nullptr;
+    struct ggml_tensor* sa_q_w    = nullptr;
+    struct ggml_tensor* sa_q_b    = nullptr;
+    struct ggml_tensor* sa_k_w    = nullptr;
+    struct ggml_tensor* sa_k_b    = nullptr;
+    struct ggml_tensor* sa_v_w    = nullptr;
+    struct ggml_tensor* sa_v_b    = nullptr;
+    struct ggml_tensor* sa_out_w  = nullptr;
+    struct ggml_tensor* sa_out_b  = nullptr;
+    struct ggml_tensor* norm1_w   = nullptr;
+    struct ggml_tensor* norm1_b   = nullptr;
     // cross-attention (RoPE, kv_dim=64)
-    struct ggml_tensor* ca_q_w = nullptr;
-    struct ggml_tensor* ca_q_b = nullptr;
-    struct ggml_tensor* ca_k_w = nullptr;  // [256, 64]
-    struct ggml_tensor* ca_k_b = nullptr;
-    struct ggml_tensor* ca_v_w = nullptr;  // [256, 64]
-    struct ggml_tensor* ca_v_b = nullptr;
-    struct ggml_tensor* ca_out_w = nullptr;
-    struct ggml_tensor* ca_out_b = nullptr;
-    struct ggml_tensor* norm2_w = nullptr;
-    struct ggml_tensor* norm2_b = nullptr;
+    struct ggml_tensor* ca_q_w    = nullptr;
+    struct ggml_tensor* ca_q_b    = nullptr;
+    struct ggml_tensor* ca_k_w    = nullptr;  // [256, 64]
+    struct ggml_tensor* ca_k_b    = nullptr;
+    struct ggml_tensor* ca_v_w    = nullptr;  // [256, 64]
+    struct ggml_tensor* ca_v_b    = nullptr;
+    struct ggml_tensor* ca_out_w  = nullptr;
+    struct ggml_tensor* ca_out_b  = nullptr;
+    struct ggml_tensor* norm2_w   = nullptr;
+    struct ggml_tensor* norm2_b   = nullptr;
     // FFN
     struct ggml_tensor* ffn_fc1_w = nullptr;
     struct ggml_tensor* ffn_fc1_b = nullptr;
     struct ggml_tensor* ffn_fc2_w = nullptr;
     struct ggml_tensor* ffn_fc2_b = nullptr;
-    struct ggml_tensor* norm3_w = nullptr;
-    struct ggml_tensor* norm3_b = nullptr;
+    struct ggml_tensor* norm3_w   = nullptr;
+    struct ggml_tensor* norm3_b   = nullptr;
 };
 
 struct sam3_mem_attn {
     std::vector<sam3_mem_attn_layer> layers;
 };
 
-// ── BPE tokenizer ────────────────────────────────────────────────────────────
+/*
+** ── BPE Tokenizer ────────────────────────────────────────────────────────
+*/
 
 struct sam3_bpe_tokenizer {
     std::unordered_map<std::string, int> encoder;
@@ -503,42 +532,42 @@ struct sam3_bpe_tokenizer {
     int eot_token = 49407;
 };
 
-// ═══════════════════════════════════════════════════════════════════════════════
-//  Top-level opaque types (defined here, forward-declared in sam3.h)
-// ═══════════════════════════════════════════════════════════════════════════════
+/*****************************************************************************
+** Top-Level Opaque Types (defined here, forward-declared in sam3.h)
+*****************************************************************************/
 
 struct sam3_model {
-    sam3_hparams hparams;
-    ggml_type weight_type = GGML_TYPE_F16;
+    sam3_hparams        hparams;
+    ggml_type           weight_type = GGML_TYPE_F16;
 
-    sam3_vit vit;
-    sam3_neck neck_det;
-    sam3_neck neck_trk;
-    sam3_text_encoder text_enc;
+    sam3_vit            vit;
+    sam3_neck           neck_det;
+    sam3_neck           neck_trk;
+    sam3_text_encoder   text_enc;
     sam3_fusion_encoder fenc;
-    sam3_detr_decoder ddec;
-    sam3_geom_encoder geom_enc;
-    sam3_seg_head seg_head;
+    sam3_detr_decoder   ddec;
+    sam3_geom_encoder   geom_enc;
+    sam3_seg_head       seg_head;
 
     sam3_sam_prompt_enc sam_pe;
-    sam3_sam_mask_dec sam_dec;
-    sam3_mem_enc mem_enc;
-    sam3_mem_attn mem_attn;
+    sam3_sam_mask_dec   sam_dec;
+    sam3_mem_enc        mem_enc;
+    sam3_mem_attn       mem_attn;
 
     // object pointer projection
-    struct ggml_tensor* obj_ptr_proj_w[3] = {};
-    struct ggml_tensor* obj_ptr_proj_b[3] = {};
-    struct ggml_tensor* no_obj_ptr = nullptr;
-    struct ggml_tensor* obj_ptr_tpos_w = nullptr;
-    struct ggml_tensor* obj_ptr_tpos_b = nullptr;
+    struct ggml_tensor* obj_ptr_proj_w[3]  = {};
+    struct ggml_tensor* obj_ptr_proj_b[3]  = {};
+    struct ggml_tensor* no_obj_ptr         = nullptr;
+    struct ggml_tensor* obj_ptr_tpos_w     = nullptr;
+    struct ggml_tensor* obj_ptr_tpos_b     = nullptr;
 
     // precomputed RoPE frequencies
-    struct ggml_tensor* rope_freqs = nullptr;  // [n_img_tokens, head_dim]
+    struct ggml_tensor* rope_freqs         = nullptr;  // [n_img_tokens, head_dim]
 
     // ggml backend
-    struct ggml_context* ctx = nullptr;
-    ggml_backend_t backend = nullptr;
-    ggml_backend_buffer_t buffer = nullptr;
+    struct ggml_context*    ctx     = nullptr;
+    ggml_backend_t          backend = nullptr;
+    ggml_backend_buffer_t   buffer  = nullptr;
 
     // tensor lookup
     std::map<std::string, struct ggml_tensor*> tensors;
@@ -549,44 +578,46 @@ struct sam3_model {
 
 struct sam3_state {
     // cached backbone outputs
-    struct ggml_tensor* vit_output = nullptr;  // [1, embed, H, W]
-    struct ggml_tensor* neck_det[4] = {};      // FPN levels (det path)
-    struct ggml_tensor* neck_trk[4] = {};      // FPN levels (trk path)
-    struct ggml_tensor* neck_det_pe[4] = {};   // sinusoidal PE
-    struct ggml_tensor* neck_trk_pe[4] = {};
+    struct ggml_tensor* vit_output       = nullptr;  // [1, embed, H, W]
+    struct ggml_tensor* neck_det[4]      = {};       // FPN levels (det path)
+    struct ggml_tensor* neck_trk[4]      = {};       // FPN levels (trk path)
+    struct ggml_tensor* neck_det_pe[4]   = {};       // sinusoidal PE
+    struct ggml_tensor* neck_trk_pe[4]   = {};
 
-    int orig_width = 0;
+    int orig_width  = 0;
     int orig_height = 0;
-    int n_threads = 4;
+    int n_threads   = 4;
 
-    struct ggml_context* ctx = nullptr;
-    ggml_backend_t backend = nullptr;
-    ggml_backend_buffer_t buffer = nullptr;
-    struct ggml_gallocr* galloc = nullptr;
+    struct ggml_context*  ctx     = nullptr;
+    ggml_backend_t        backend = nullptr;
+    ggml_backend_buffer_t buffer  = nullptr;
+    struct ggml_gallocr*  galloc  = nullptr;
 
     // PE buffer: holds sinusoidal PE tensors for neck outputs
-    struct ggml_context* pe_ctx = nullptr;
-    ggml_backend_buffer_t pe_buf = nullptr;
+    struct ggml_context*  pe_ctx  = nullptr;
+    ggml_backend_buffer_t pe_buf  = nullptr;
 
-    // Cached SAM prompt encoder embeddings (read from GPU once, reused per PVS call)
+    // Cached SAM prompt encoder embeddings (read from GPU once, reused)
     bool pe_cache_valid = false;
-    std::vector<float> pe_gauss_cache;  // [2 * num_pos_feats]
-    float point_emb_cache[4][256] = {};
-    float not_a_point_cache[256] = {};
-    float no_mask_emb_cache[256] = {};
-    std::vector<float> dense_pe_cache;      // [D * H * H] — positional encoding grid
-    std::vector<float> dense_nomask_cache;  // [D * H * H] — no-mask embedding tiled
+    std::vector<float> pe_gauss_cache;      // [2 * num_pos_feats]
+    float point_emb_cache[4][256]   = {};
+    float not_a_point_cache[256]    = {};
+    float no_mask_emb_cache[256]    = {};
+    std::vector<float> dense_pe_cache;      // [D * H * H] -- PE grid
+    std::vector<float> dense_nomask_cache;  // [D * H * H] -- no-mask tiled
 };
 
-// ── Video tracker state ──────────────────────────────────────────────────────
+/*
+** ── Video Tracker State ──────────────────────────────────────────────────
+*/
 
 struct sam3_masklet {
-    int instance_id = -1;
-    int first_frame = -1;
-    int last_seen = -1;
-    float last_score = 0.0f;
-    bool confirmed = false;
-    int mds_sum = 0;
+    int   instance_id = -1;
+    int   first_frame = -1;
+    int   last_seen   = -1;
+    float last_score  = 0.0f;
+    bool  confirmed   = false;
+    int   mds_sum     = 0;
 
     // last predicted mask logits (owned by tracker ctx)
     struct ggml_tensor* mask_logits = nullptr;  // [1, 1, 288, 288]
@@ -594,15 +625,15 @@ struct sam3_masklet {
 };
 
 struct sam3_memory_slot {
-    struct ggml_tensor* spatial_feats = nullptr;  // [64, 72, 72]
-    struct ggml_tensor* spatial_pe = nullptr;     // [64, 72, 72]
-    int frame_index = -1;
-    bool is_cond_frame = false;
+    struct ggml_tensor* spatial_feats  = nullptr;  // [64, 72, 72]
+    struct ggml_tensor* spatial_pe     = nullptr;  // [64, 72, 72]
+    int                 frame_index    = -1;
+    bool                is_cond_frame  = false;
 };
 
 struct sam3_tracker {
     sam3_video_params params;
-    int frame_index = 0;
+    int frame_index  = 0;
     int next_inst_id = 1;
 
     std::vector<sam3_masklet> masklets;
@@ -625,9 +656,9 @@ struct sam3_tracker {
     std::vector<float> cached_axial_cis_reord; // reordered axial CIS for RoPE Q
 };
 
-// ═══════════════════════════════════════════════════════════════════════════════
-//  Internal helper declarations
-// ═══════════════════════════════════════════════════════════════════════════════
+/*****************************************************************************
+** Internal Helper Declarations
+*****************************************************************************/
 
 // graph execution
 static void sam3_graph_compute(ggml_backend_t backend, struct ggml_cgraph* graph, int n_threads);
@@ -643,9 +674,9 @@ static struct ggml_tensor* sam3_layer_norm_2d(struct ggml_context* ctx,
                                               struct ggml_tensor* w,
                                               struct ggml_tensor* b);
 
-// ═══════════════════════════════════════════════════════════════════════════════
-//  Internal helper implementations
-// ═══════════════════════════════════════════════════════════════════════════════
+/*****************************************************************************
+** Internal Helper Implementations
+*****************************************************************************/
 
 static void sam3_graph_compute(ggml_backend_t backend, struct ggml_cgraph* graph, int n_threads) {
     if (ggml_backend_is_cpu(backend)) {
@@ -714,11 +745,13 @@ static struct ggml_tensor* sam3_conv_transpose_weight(struct ggml_context* ctx,
     return w->type == GGML_TYPE_F16 ? w : ggml_cast(ctx, w, GGML_TYPE_F16);
 }
 
-// ═══════════════════════════════════════════════════════════════════════════════
-//  BPE Tokenizer — CLIP-style byte-level BPE
-// ═══════════════════════════════════════════════════════════════════════════════
+/*****************************************************************************
+** BPE Tokenizer — CLIP-style byte-level BPE
+*****************************************************************************/
 
-// ── UTF-8 helpers ────────────────────────────────────────────────────────────
+/*
+** ── UTF-8 helpers ────────────────────────────────────────────────────────────
+*/
 
 static int sam3_utf8_len(uint8_t c) {
     if (c < 0x80) return 1;
@@ -758,7 +791,9 @@ static bool sam3_is_letter(const std::string& s, size_t i) {
     return false;
 }
 
-// ── Byte-to-unicode mapping (CLIP / GPT-2 style) ────────────────────────────
+/*
+** ── Byte-to-unicode mapping (CLIP / GPT-2 style) ────────────────────────────
+*/
 
 // Maps each byte 0-255 to a unique unicode character (as UTF-8 string).
 // Printable bytes map to themselves; non-printable bytes map to U+0100..U+0143.
@@ -788,7 +823,9 @@ static void sam3_init_byte_encoder(std::unordered_map<uint8_t, std::string>& enc
     }
 }
 
-// ── Merge key helper ─────────────────────────────────────────────────────────
+/*
+** ── Merge key helper ─────────────────────────────────────────────────────────
+*/
 
 // Unit separator (0x1F) cannot appear in byte-encoded BPE tokens.
 static inline std::string sam3_merge_key(const std::string& a, const std::string& b) {
@@ -800,7 +837,9 @@ static inline std::string sam3_merge_key(const std::string& a, const std::string
     return k;
 }
 
-// ── Load embedded BPE tokenizer from binary stream ──────────────────────────
+/*
+** ── Load embedded BPE tokenizer from binary stream ──────────────────────────
+*/
 
 static bool sam3_load_bpe_vocab_from_stream(std::ifstream& fin, sam3_bpe_tokenizer& tok) {
     uint32_t tok_magic;
@@ -857,7 +896,9 @@ static bool sam3_load_bpe_vocab_from_stream(std::ifstream& fin, sam3_bpe_tokeniz
     return true;
 }
 
-// ── BPE encode a single word ─────────────────────────────────────────────────
+/*
+** ── BPE encode a single word ─────────────────────────────────────────────────
+*/
 
 // Split a UTF-8 string into individual unicode characters.
 static std::vector<std::string> sam3_utf8_chars(const std::string& s) {
@@ -930,7 +971,9 @@ static std::string sam3_bpe_encode(sam3_bpe_tokenizer& tok, const std::string& t
     return result;
 }
 
-// ── Pre-tokenizer (CLIP regex approximation) ─────────────────────────────────
+/*
+** ── Pre-tokenizer (CLIP regex approximation) ─────────────────────────────────
+*/
 
 // Splits text into word tokens following the CLIP pattern:
 //   <|startoftext|> | <|endoftext|> | 's|'t|'re|'ve|'m|'ll|'d
@@ -1016,7 +1059,9 @@ static std::vector<std::string> sam3_pretokenize(const std::string& text) {
     return tokens;
 }
 
-// ── sam3_tokenize — full pipeline ────────────────────────────────────────────
+/*
+** ── sam3_tokenize — full pipeline ────────────────────────────────────────────
+*/
 
 // Tokenize text into a fixed-length token ID vector [ctx_len].
 // Format: [SOT, bpe_tokens..., EOT, 0, 0, ..., 0]
@@ -1099,9 +1144,9 @@ static std::vector<int32_t> sam3_tokenize(sam3_bpe_tokenizer& tok,
     return ids;
 }
 
-// ═══════════════════════════════════════════════════════════════════════════════
-//  Model loading — internal helpers
-// ═══════════════════════════════════════════════════════════════════════════════
+/*****************************************************************************
+** Model loading — internal helpers
+*****************************************************************************/
 
 static bool sam3_load_hparams(std::ifstream& fin, sam3_hparams& hp) {
     auto rd = [&](int32_t& v) { fin.read(reinterpret_cast<char*>(&v), 4); };
@@ -1912,9 +1957,9 @@ static bool sam3_load_tensors(std::ifstream& fin, sam3_model& model, int n_tenso
     return true;
 }
 
-// ═══════════════════════════════════════════════════════════════════════════════
-//  Model loading — public API
-// ═══════════════════════════════════════════════════════════════════════════════
+/*****************************************************************************
+** Model loading — public API
+*****************************************************************************/
 
 std::shared_ptr<sam3_model> sam3_load_model(const sam3_params& params) {
     fprintf(stderr, "%s: loading model from '%s'\n", __func__, params.model_path.c_str());
@@ -2051,9 +2096,9 @@ bool sam3_is_visual_only(const sam3_model& model) {
     return model.hparams.visual_only != 0;
 }
 
-// ═══════════════════════════════════════════════════════════════════════════════
-//  Inference state
-// ═══════════════════════════════════════════════════════════════════════════════
+/*****************************************************************************
+** Inference state
+*****************************************************************************/
 
 // Deleter implementations for opaque types
 void sam3_state_deleter::operator()(sam3_state* p) const {
@@ -2103,9 +2148,9 @@ void sam3_free_state(sam3_state& state) {
     }
 }
 
-// ═══════════════════════════════════════════════════════════════════════════════
-//  Image preprocessing
-// ═══════════════════════════════════════════════════════════════════════════════
+/*****************************************************************************
+** Image preprocessing
+*****************************************************************************/
 
 // Bilinear resize of a [H, W, 3] uint8 image to [dst_h, dst_w, 3].
 static void sam3_resize_bilinear(const uint8_t* src, int src_w, int src_h,
@@ -2183,9 +2228,9 @@ static std::vector<float> sam3_preprocess_image(const sam3_image& image, int img
     return result;
 }
 
-// ═══════════════════════════════════════════════════════════════════════════════
-//  RoPE — 2D axial rotary positional embeddings
-// ═══════════════════════════════════════════════════════════════════════════════
+/*****************************************************************************
+** RoPE — 2D axial rotary positional embeddings
+*****************************************************************************/
 
 // Precompute RoPE frequencies as [N, head_dim/2, 2] (cos, sin pairs).
 // This matches compute_axial_cis() from vitdet.py stored as real (cos, sin)
@@ -2225,9 +2270,9 @@ static void sam3_compute_axial_cis(float* out,
     }
 }
 
-// ═══════════════════════════════════════════════════════════════════════════════
-//  Sinusoidal 2D positional encoding (for FPN neck outputs)
-// ═══════════════════════════════════════════════════════════════════════════════
+/*****************************************************************************
+** Sinusoidal 2D positional encoding (for FPN neck outputs)
+*****************************************************************************/
 
 // Generates sinusoidal PE matching PositionEmbeddingSine from Python.
 // num_pos_feats = d_model / 2 = 128, temperature = 10000, normalize = true, scale = 2pi.
@@ -2286,9 +2331,9 @@ static void sam3_get_1d_sine_pe(float* out, float pos_ind, int dim,
     }
 }
 
-// ═══════════════════════════════════════════════════════════════════════════════
-//  ViT forward pass — graph building
-// ═══════════════════════════════════════════════════════════════════════════════
+/*****************************************************************************
+** ViT forward pass — graph building
+*****************************************************************************/
 
 // All ViT graph functions use the sam.cpp convention:
 //   ne[0] = embed_dim (E=1024), ne[1] = spatial W, ne[2] = spatial H, ne[3] = batch
@@ -2507,9 +2552,9 @@ static struct ggml_tensor* sam3_build_vit_graph(struct ggml_context* ctx,
     return x;
 }
 
-// ═══════════════════════════════════════════════════════════════════════════════
-//  Neck (SimpleFPN) — graph building
-// ═══════════════════════════════════════════════════════════════════════════════
+/*****************************************************************************
+** Neck (SimpleFPN) — graph building
+*****************************************************************************/
 
 // Build the SimpleFPN neck graph for one path (detector or tracker).
 // Input: ViT output [E, W, H, B] with E=1024, W=H=72
@@ -2580,9 +2625,9 @@ static void sam3_build_neck_graph(struct ggml_context* ctx,
     }
 }
 
-// ═══════════════════════════════════════════════════════════════════════════════
-//  Text Encoder — graph building (Phase 4)
-// ═══════════════════════════════════════════════════════════════════════════════
+/*****************************************************************************
+** Text Encoder — graph building (Phase 4)
+*****************************************************************************/
 
 // Build a causal (lower-triangular) attention mask for the text encoder.
 // Returns: [L, L] F16 tensor. mask[kv][q] = 0 if kv <= q, -inf otherwise.
@@ -2751,9 +2796,9 @@ static struct ggml_tensor* sam3_build_text_encoder_graph(struct ggml_context* ct
     return x;
 }
 
-// ═══════════════════════════════════════════════════════════════════════════════
-//  Image backbone — public API
-// ═══════════════════════════════════════════════════════════════════════════════
+/*****************************************************************************
+** Image backbone — public API
+*****************************************************************************/
 
 bool sam3_encode_image(sam3_state& state,
                        const sam3_model& model,
@@ -3142,9 +3187,9 @@ bool sam3_encode_image_from_preprocessed(sam3_state& state,
     return true;
 }
 
-// ═══════════════════════════════════════════════════════════════════════════════
-//  Multi-head attention helper (used by fusion encoder, DETR decoder, seg head)
-// ═══════════════════════════════════════════════════════════════════════════════
+/*****************************************************************************
+** Multi-head attention helper (used by fusion encoder, DETR decoder, seg head)
+*****************************************************************************/
 
 // Standard multi-head attention with fused in_proj.
 // q_in, k_in, v_in: [D, N, B]  (if fused_qkv, only q_in is used and contains QKV stacked)
@@ -3234,9 +3279,9 @@ static struct ggml_tensor* sam3_expand_token_attn_bias(
     return ggml_cont(ctx, ggml_cast(ctx, full_bias, GGML_TYPE_F16));
 }
 
-// ═══════════════════════════════════════════════════════════════════════════════
-//  Geometry / exemplar encoder — graph building
-// ═══════════════════════════════════════════════════════════════════════════════
+/*****************************************************************************
+** Geometry / exemplar encoder — graph building
+*****************************************************************************/
 
 // Sinusoidal positional encoding for box coordinates.
 // Matches Python PositionEmbeddingSine.encode_boxes(cx, cy, w, h).
@@ -3689,9 +3734,9 @@ static std::vector<float> sam3_precompute_geom_input(
     return out;
 }
 
-// ═══════════════════════════════════════════════════════════════════════════════
-//  Fusion encoder — graph building (6 layers)
-// ═══════════════════════════════════════════════════════════════════════════════
+/*****************************************************************************
+** Fusion encoder — graph building (6 layers)
+*****************************************************************************/
 
 // Single fusion encoder layer.
 // x: [D, N, B] image features (N=5184), prompt: [D, T, B] text/exemplar tokens, pos: [D, N, B]
@@ -3836,9 +3881,9 @@ static struct ggml_tensor* sam3_build_fenc_graph(
     return x;
 }
 
-// ═══════════════════════════════════════════════════════════════════════════════
-//  DETR decoder — graph building (6 layers)
-// ═══════════════════════════════════════════════════════════════════════════════
+/*****************************************************************************
+** DETR decoder — graph building (6 layers)
+*****************************************************************************/
 
 // inverse_sigmoid: log(x / (1 - x)), clamped to avoid inf
 // Python reference uses eps=1e-3: x1 = x.clamp(min=eps), x2 = (1-x).clamp(min=eps)
@@ -4549,9 +4594,9 @@ static sam3_ddec_output sam3_build_ddec_graph(
     return out;
 }
 
-// ═══════════════════════════════════════════════════════════════════════════════
-//  Segmentation head (MaskFormer) — graph building
-// ═══════════════════════════════════════════════════════════════════════════════
+/*****************************************************************************
+** Segmentation head (MaskFormer) — graph building
+*****************************************************************************/
 
 // Build pixel decoder: progressively upsample FPN features.
 // fpn_feats[0]: [D, 288, 288, B] (highest res)
@@ -4743,9 +4788,9 @@ static struct ggml_tensor* sam3_build_seg_head_graph(
     return masks;
 }
 
-// ═══════════════════════════════════════════════════════════════════════════════
-//  Memory encoder (Phase 7, Step 7.1)
-// ═══════════════════════════════════════════════════════════════════════════════
+/*****************************************************************************
+** Memory encoder (Phase 7, Step 7.1)
+*****************************************************************************/
 
 // CXBlock: depthwise conv + LayerNorm + pointwise MLP with residual scaling.
 static struct ggml_tensor* sam3_cxblock_forward(
@@ -4791,9 +4836,9 @@ static struct ggml_tensor* sam3_cxblock_forward(
     return ggml_add(ctx, x, h);
 }
 
-// ═══════════════════════════════════════════════════════════════════════════════
-//  Prompt building for memory attention (Phase 7)
-// ═══════════════════════════════════════════════════════════════════════════════
+/*****************************************************************************
+** Prompt building for memory attention (Phase 7)
+*****************************************************************************/
 
 struct sam3_prompt_data {
     std::vector<float> prompt;      // [MD * M_total] flat
@@ -4893,9 +4938,9 @@ static sam3_prompt_data sam3_build_prompt_and_pos(
     return pd;
 }
 
-// ═══════════════════════════════════════════════════════════════════════════════
-//  Memory attention (Phase 7, Step 7.2)
-// ═══════════════════════════════════════════════════════════════════════════════
+/*****************************************************************************
+** Memory attention (Phase 7, Step 7.2)
+*****************************************************************************/
 
 // Build memory attention graph.
 // curr_tokens: [D, N, 1] — current frame image tokens (flattened from 72x72 = 5184)
@@ -5021,9 +5066,9 @@ static struct ggml_tensor* sam3_build_mem_attn_graph(
     return x;  // [D, N, 1]
 }
 
-// ═══════════════════════════════════════════════════════════════════════════════
-//  Object pointer extraction (Phase 7, Step 7.3)
-// ═══════════════════════════════════════════════════════════════════════════════
+/*****************************************************************************
+** Object pointer extraction (Phase 7, Step 7.3)
+*****************************************************************************/
 
 // Extract object pointer from SAM output token via 3-layer MLP (CPU-side).
 static void sam3_extract_obj_ptr_cpu(
@@ -5066,9 +5111,9 @@ static void sam3_extract_obj_ptr_cpu(
     std::copy(h.begin(), h.end(), out_ptr);
 }
 
-// ═══════════════════════════════════════════════════════════════════════════════
-//  Tracker infrastructure (Phase 7, Step 7.4)
-// ═══════════════════════════════════════════════════════════════════════════════
+/*****************************************************************************
+** Tracker infrastructure (Phase 7, Step 7.4)
+*****************************************************************************/
 
 // Select memory frames for propagation (most recent + evenly spaced).
 static std::vector<int> sam3_select_memory_frames(
@@ -5108,9 +5153,9 @@ static float sam3_mask_iou(const uint8_t* a, const uint8_t* b, int n) {
     return (uni > 0) ? (float)inter / uni : 0.0f;
 }
 
-// ═══════════════════════════════════════════════════════════════════════════════
-//  Post-processing: hole filling and sprinkle removal (Phase 7, Step 7.8)
-// ═══════════════════════════════════════════════════════════════════════════════
+/*****************************************************************************
+** Post-processing: hole filling and sprinkle removal (Phase 7, Step 7.8)
+*****************************************************************************/
 
 // Fill small holes in a binary mask using BFS connected components.
 static void sam3_fill_holes(uint8_t* mask, int w, int h, int area_threshold) {
@@ -5216,9 +5261,9 @@ static void sam3_resolve_overlaps(std::vector<sam3_detection>& dets) {
     }
 }
 
-// ═══════════════════════════════════════════════════════════════════════════════
-//  Post-processing: NMS, bilinear interpolation, mask binarization
-// ═══════════════════════════════════════════════════════════════════════════════
+/*****************************************************************************
+** Post-processing: NMS, bilinear interpolation, mask binarization
+*****************************************************************************/
 
 // Compute IoU between two boxes [x0, y0, x1, y1].
 static float sam3_box_iou(const sam3_box& a, const sam3_box& b) {
@@ -5338,9 +5383,9 @@ static void sam3_sine_pos_embed_boxes(float* out, const float* boxes, int NQ, in
     }
 }
 
-// ═══════════════════════════════════════════════════════════════════════════════
-//  Image segmentation — PCS (text-prompted)
-// ═══════════════════════════════════════════════════════════════════════════════
+/*****************************************************************************
+** Image segmentation — PCS (text-prompted)
+*****************************************************************************/
 
 sam3_result sam3_segment_pcs(sam3_state& state,
                              const sam3_model& model,
@@ -5428,9 +5473,9 @@ sam3_result sam3_segment_pcs(sam3_state& state,
     for (int i = 0; i < N_geo; ++i)
         text_valid_mask_cpu[L + i] = tvm_scale;
 
-    // ═══════════════════════════════════════════════════════════════════
-    //  SUB-GRAPH 1: Text Encoder
-    // ═══════════════════════════════════════════════════════════════════
+    /*
+    ** ── SUB-GRAPH 1: Text Encoder ────────────────────────────────────
+    */
     std::vector<float> text_feats_cpu(D * L);
     {
         const size_t sz = ggml_tensor_overhead() * 16384 + ggml_graph_overhead() * 2;
@@ -5479,9 +5524,9 @@ sam3_result sam3_segment_pcs(sam3_state& state,
 
     fprintf(stderr, "%s: text encoder done\n", __func__);
 
-    // ═══════════════════════════════════════════════════════════════════
-    //  SUB-GRAPH 2: Geometry Encoder
-    // ═══════════════════════════════════════════════════════════════════
+    /*
+    ** ── SUB-GRAPH 2: Geometry Encoder ────────────────────────────────
+    */
     std::vector<float> geo_feats_cpu(D * N_geo);
     {
         const size_t sz = ggml_tensor_overhead() * 4096 + ggml_graph_overhead() * 2;
@@ -5536,9 +5581,9 @@ sam3_result sam3_segment_pcs(sam3_state& state,
     memcpy(combined_prompt_cpu.data() + D * L, geo_feats_cpu.data(), D * N_geo * sizeof(float));
 
     fprintf(stderr, "%s: starting fusion encoder\n", __func__);
-    // ═══════════════════════════════════════════════════════════════════
-    //  SUB-GRAPH 3: Fusion Encoder
-    // ═══════════════════════════════════════════════════════════════════
+    /*
+    ** ── SUB-GRAPH 3: Fusion Encoder ──────────────────────────────────
+    */
     std::vector<float> fenc_output_cpu(D * N_spatial);
     {
         const size_t sz = ggml_tensor_overhead() * 16384 + ggml_graph_overhead() * 2;
@@ -5589,9 +5634,9 @@ sam3_result sam3_segment_pcs(sam3_state& state,
     }
 
     fprintf(stderr, "%s: fusion encoder done\n", __func__);
-    // ═══════════════════════════════════════════════════════════════════
-    //  SUB-GRAPH 4: DETR Decoder + Scoring
-    // ═══════════════════════════════════════════════════════════════════
+    /*
+    ** ── SUB-GRAPH 4: DETR Decoder + Scoring ──────────────────────────
+    */
     std::vector<float> scores_data(NQ);
     std::vector<float> boxes_data(4 * NQ);
     std::vector<float> queries_data(D * (NQ + 1));  // 201 = NQ + presence token
@@ -5679,9 +5724,9 @@ sam3_result sam3_segment_pcs(sam3_state& state,
     float presence_prob = 1.0f / (1.0f + expf(-presence_logit));
 
     fprintf(stderr, "%s: DETR decoder done\n", __func__);
-    // ═══════════════════════════════════════════════════════════════════
-    //  SUB-GRAPH 5: Segmentation Head
-    // ═══════════════════════════════════════════════════════════════════
+    /*
+    ** ── SUB-GRAPH 5: Segmentation Head ───────────────────────────────
+    */
     const int mask_hw = 288;
     std::vector<float> all_masks(NQ * mask_hw * mask_hw);
     {
@@ -5772,9 +5817,9 @@ sam3_result sam3_segment_pcs(sam3_state& state,
         ggml_free(ctx);
     }
 
-    // ═══════════════════════════════════════════════════════════════════
-    //  Post-processing: thresholding + NMS + mask resize
-    // ═══════════════════════════════════════════════════════════════════
+    /*
+    ** ── Post-processing: thresholding + NMS + mask resize ────────────
+    */
     std::vector<sam3_detection> dets;
     for (int q = 0; q < NQ; ++q) {
         float class_prob = 1.0f / (1.0f + expf(-scores_data[q]));
@@ -5821,9 +5866,9 @@ sam3_result sam3_segment_pcs(sam3_state& state,
     return result;
 }
 
-// ═══════════════════════════════════════════════════════════════════════════════
-//  SAM attention helper (separate Q, K, V weight/bias)
-// ═══════════════════════════════════════════════════════════════════════════════
+/*****************************************************************************
+** SAM attention helper (separate Q, K, V weight/bias)
+*****************************************************************************/
 
 static struct ggml_tensor* sam3_sam_attention(
     struct ggml_context* ctx,
@@ -5869,9 +5914,9 @@ static struct ggml_tensor* sam3_sam_attention(
     return out;
 }
 
-// ═══════════════════════════════════════════════════════════════════════════════
-//  SAM prompt encoder — graph building (Phase 6, Step 6.1)
-// ═══════════════════════════════════════════════════════════════════════════════
+/*****************************************************************************
+** SAM prompt encoder — graph building (Phase 6, Step 6.1)
+*****************************************************************************/
 
 // Random Fourier positional encoding for a single (x, y) coordinate
 // coords_norm: normalized to [0, 1], pe_gaussian: PyTorch row-major [2, 128]
@@ -6048,9 +6093,9 @@ static sam3_pe_result sam3_build_sam_pe(
     return result;
 }
 
-// ═══════════════════════════════════════════════════════════════════════════════
-//  SAM mask decoder — graph building (Phase 6, Step 6.2)
-// ═══════════════════════════════════════════════════════════════════════════════
+/*****************************************************************************
+** SAM mask decoder — graph building (Phase 6, Step 6.2)
+*****************************************************************************/
 
 // TwoWayAttentionBlock forward
 static void sam3_twoway_block_forward(
@@ -6357,9 +6402,9 @@ static sam3_dec_result sam3_build_sam_dec_graph(
     return res;
 }
 
-// ═══════════════════════════════════════════════════════════════════════════════
-//  Image segmentation — PVS (visual-prompted) (Phase 6, Step 6.3)
-// ═══════════════════════════════════════════════════════════════════════════════
+/*****************************************************************************
+** Image segmentation — PVS (visual-prompted) (Phase 6, Step 6.3)
+*****************************************************************************/
 
 sam3_result sam3_segment_pvs(sam3_state& state,
                              const sam3_model& model,
@@ -6619,9 +6664,9 @@ sam3_result sam3_segment_pvs(sam3_state& state,
     return result;
 }
 
-// ═══════════════════════════════════════════════════════════════════════════════
-//  Video tracking (Phase 7)
-// ═══════════════════════════════════════════════════════════════════════════════
+/*****************************************************************************
+** Video tracking (Phase 7)
+*****************************************************************************/
 
 struct sam3_prop_output {
     std::vector<float> mask_logits;
@@ -7426,9 +7471,9 @@ void sam3_tracker_reset(sam3_tracker& tracker) {
     }
 }
 
-// ═══════════════════════════════════════════════════════════════════════════════
-//  Visual-only video tracking
-// ═══════════════════════════════════════════════════════════════════════════════
+/*****************************************************************************
+** Visual-only video tracking
+*****************************************************************************/
 
 sam3_tracker_ptr sam3_create_visual_tracker(
         const sam3_model& model,
@@ -7576,9 +7621,9 @@ sam3_result sam3_propagate_frame(
     return result;
 }
 
-// ═══════════════════════════════════════════════════════════════════════════════
-//  Utility — image I/O
-// ═══════════════════════════════════════════════════════════════════════════════
+/*****************************************************************************
+** Utility — image I/O
+*****************************************************************************/
 
 sam3_image sam3_load_image(const std::string& path) {
     sam3_image img;
@@ -7670,9 +7715,9 @@ sam3_video_info sam3_get_video_info(const std::string& video_path) {
     return info;
 }
 
-// ═══════════════════════════════════════════════════════════════════════════════
-//  Tokenizer — standalone test API (does not require model weights)
-// ═══════════════════════════════════════════════════════════════════════════════
+/*****************************************************************************
+** Tokenizer — standalone test API (does not require model weights)
+*****************************************************************************/
 
 // Global tokenizer instance for the test API.
 static sam3_bpe_tokenizer g_test_tokenizer;
@@ -9016,9 +9061,9 @@ bool sam3_test_dump_phase6_from_ref_inputs(const sam3_model& model,
                                       params, output_dir, n_threads);
 }
 
-// ═══════════════════════════════════════════════════════════════════════════════
-//  Test: Geometry encoder dump
-// ═══════════════════════════════════════════════════════════════════════════════
+/*****************************************************************************
+** Test: Geometry encoder dump
+*****************************************************************************/
 
 bool sam3_test_dump_geom_enc(const sam3_model& model,
                              const std::string& prephase_ref_dir,
@@ -9609,9 +9654,9 @@ bool sam3_test_dump_phase7_from_ref_inputs(const sam3_model& model,
     return ok;
 }
 
-// ═══════════════════════════════════════════════════════════════════════════════
-//  Debug: dump state tensors
-// ═══════════════════════════════════════════════════════════════════════════════
+/*****************************************************************************
+** Debug: dump state tensors
+*****************************************************************************/
 
 bool sam3_dump_state_tensor(const sam3_state& state,
                             const std::string& tensor_name,

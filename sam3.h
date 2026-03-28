@@ -5,20 +5,26 @@
 #include <string>
 #include <vector>
 
-// ─── Forward declarations (opaque, defined in sam3.cpp) ───
+/*
+** ── Forward Declarations ─────────────────────────────────────────────────
+*/
 
 struct sam3_model;
 struct sam3_state;
 struct sam3_tracker;
 
-// Custom deleters so unique_ptr works with forward-declared opaque types.
+/* Custom deleters so unique_ptr works with forward-declared opaque types. */
 struct sam3_state_deleter   { void operator()(sam3_state * p) const; };
 struct sam3_tracker_deleter { void operator()(sam3_tracker * p) const; };
 
 using sam3_state_ptr   = std::unique_ptr<sam3_state,   sam3_state_deleter>;
 using sam3_tracker_ptr = std::unique_ptr<sam3_tracker,  sam3_tracker_deleter>;
 
-// ─── Public data types ───
+/*****************************************************************************
+** Public Data Types
+**
+** Geometry primitives, images, masks, and detection results.
+*****************************************************************************/
 
 struct sam3_point {
     float x;
@@ -60,7 +66,11 @@ struct sam3_result {
     std::vector<sam3_detection> detections;
 };
 
-// ─── Parameters ───
+/*****************************************************************************
+** Parameters
+**
+** Configuration for model loading, segmentation, and video tracking.
+*****************************************************************************/
 
 struct sam3_params {
     std::string model_path;
@@ -103,46 +113,81 @@ struct sam3_video_info {
     float fps      = 0.0f;
 };
 
-// ─── Model lifecycle ───
+/*****************************************************************************
+** Public API
+**
+** Model lifecycle, image encoding, segmentation, and video tracking.
+*****************************************************************************/
 
+/*
+** ── Model Lifecycle ──────────────────────────────────────────────────────
+*/
+
+/*
+** Load a SAM3 model from the file specified in params.model_path.
+** Returns nullptr on failure.
+*/
 std::shared_ptr<sam3_model> sam3_load_model(const sam3_params & params);
+
+/* Free all resources held by a loaded model. */
 void sam3_free_model(sam3_model & model);
 
-// Returns true if the model was loaded as visual-only (no text/detector path).
+/* Returns true if the model was loaded as visual-only (no text/detector path). */
 bool sam3_is_visual_only(const sam3_model & model);
 
-// ─── Inference state ───
+/*
+** ── Inference State ──────────────────────────────────────────────────────
+*/
 
+/* Allocate inference state (backbone caches, PE buffers). */
 sam3_state_ptr sam3_create_state(const sam3_model & model,
                                 const sam3_params & params);
+
+/* Free inference state and its GPU buffers. */
 void sam3_free_state(sam3_state & state);
 
-// ─── Image backbone (call once per image) ───
+/*
+** ── Image Backbone ───────────────────────────────────────────────────────
+*/
 
+/*
+** Encode an image through the ViT backbone and FPN neck.
+** Call once per image before segmentation or tracking.
+** Returns true on success, false on failure.
+*/
 bool sam3_encode_image(sam3_state       & state,
                        const sam3_model & model,
                        const sam3_image & image);
 
-// ─── Image segmentation ───
+/*
+** ── Image Segmentation ──────────────────────────────────────────────────
+*/
 
+/* Segment using text prompt + exemplar boxes (PCS path). */
 sam3_result sam3_segment_pcs(sam3_state             & state,
                              const sam3_model       & model,
                              const sam3_pcs_params  & params);
 
+/* Segment using point/box prompts (PVS path). */
 sam3_result sam3_segment_pvs(sam3_state             & state,
                              const sam3_model       & model,
                              const sam3_pvs_params  & params);
 
-// ─── Video tracking ───
+/*
+** ── Video Tracking ──────────────────────────────────────────────────────
+*/
 
+/* Create a tracker for text-prompted video segmentation. */
 sam3_tracker_ptr sam3_create_tracker(const sam3_model       & model,
                                     const sam3_video_params & params);
 
+/* Encode a frame, detect objects, and update tracked instances. */
 sam3_result sam3_track_frame(sam3_tracker     & tracker,
                              sam3_state       & state,
                              const sam3_model & model,
                              const sam3_image & frame);
 
+/* Refine a tracked instance with interactive point prompts. */
 bool sam3_refine_instance(sam3_tracker                   & tracker,
                           sam3_state                     & state,
                           const sam3_model               & model,
@@ -150,18 +195,25 @@ bool sam3_refine_instance(sam3_tracker                   & tracker,
                           const std::vector<sam3_point>  & pos_points,
                           const std::vector<sam3_point>  & neg_points);
 
-// Add a new instance to the tracker from PVS prompts (points/box) on the
-// current frame.  The image must already be encoded (via sam3_track_frame or
-// sam3_encode_image).  Returns assigned instance_id, or -1 on failure.
+/*
+** Add a new instance to the tracker from PVS prompts (points/box) on the
+** current frame.  The image must already be encoded (via sam3_track_frame
+** or sam3_encode_image).  Returns assigned instance_id, or -1 on failure.
+*/
 int sam3_tracker_add_instance(sam3_tracker         & tracker,
                               sam3_state            & state,
                               const sam3_model      & model,
                               const sam3_pvs_params & pvs_params);
 
+/* Return the current frame index of the tracker. */
 int  sam3_tracker_frame_index(const sam3_tracker & tracker);
+
+/* Reset the tracker, clearing all instances and memory. */
 void sam3_tracker_reset(sam3_tracker & tracker);
 
-// ─── Visual-only video tracking ───
+/*
+** ── Visual-Only Video Tracking ──────────────────────────────────────────
+*/
 
 struct sam3_visual_track_params {
     float assoc_iou_threshold = 0.1f;
@@ -170,52 +222,68 @@ struct sam3_visual_track_params {
     int   fill_hole_area      = 16;
 };
 
-// Create a tracker for visual-only models. Instances are added manually
-// via sam3_tracker_add_instance().
+/*
+** Create a tracker for visual-only models.  Instances are added manually
+** via sam3_tracker_add_instance().
+*/
 sam3_tracker_ptr sam3_create_visual_tracker(
     const sam3_model               & model,
     const sam3_visual_track_params & params);
 
-// Propagate all tracked instances to the next frame (no detection step).
-// The image is encoded, then each tracked instance is propagated via
-// memory attention + SAM mask decode, and the memory bank is updated.
+/*
+** Propagate all tracked instances to the next frame (no detection step).
+** The image is encoded, then each tracked instance is propagated via
+** memory attention + SAM mask decode, and the memory bank is updated.
+*/
 sam3_result sam3_propagate_frame(
     sam3_tracker     & tracker,
     sam3_state       & state,
     const sam3_model & model,
     const sam3_image & frame);
 
-// ─── Utility ───
+/*
+** ── Utility ─────────────────────────────────────────────────────────────
+*/
 
 sam3_image      sam3_load_image(const std::string & path);
 bool            sam3_save_mask(const sam3_mask & mask, const std::string & path);
 sam3_image      sam3_decode_video_frame(const std::string & video_path, int frame_index);
 sam3_video_info sam3_get_video_info(const std::string & video_path);
 
-// ─── Tokenizer (standalone, loads embedded tokenizer from .ggml file) ───
+/*****************************************************************************
+** Test and Debug API
+**
+** Standalone tokenizer, intermediate tensor dumps, and debug utilities.
+** These functions are intended for testing and development only.
+*****************************************************************************/
 
 bool                  sam3_test_load_tokenizer(const std::string & model_path);
 std::vector<int32_t>  sam3_test_tokenize(const std::string & text);
 
-// Test-only: run the text encoder on fixed token IDs and dump standard
-// intermediate tensors to <output_dir>/<tensor_name>.{bin,shape}.
+/*
+** Run the text encoder on fixed token IDs and dump standard intermediate
+** tensors to <output_dir>/<tensor_name>.{bin,shape}.
+*/
 bool sam3_test_dump_text_encoder(const sam3_model & model,
                                  const std::vector<int32_t> & token_ids,
                                  const std::string & output_dir,
                                  int n_threads = 4);
 
-// Test-only: run the full phase 5 detector path (fusion encoder + DETR decoder
-// + dot-product scoring + segmentation head) on an already encoded image state
-// and dump standard intermediate tensors to <output_dir>/<tensor_name>.{bin,shape}.
+/*
+** Run the full phase 5 detector path (fusion encoder + DETR decoder +
+** dot-product scoring + segmentation head) on an already-encoded image
+** and dump intermediate tensors.
+*/
 bool sam3_test_dump_phase5(const sam3_model & model,
                            const sam3_state & state,
                            const std::vector<int32_t> & token_ids,
                            const std::string & output_dir,
                            int n_threads = 4);
 
-// Test-only: run the phase 5 detector path from pre-dumped phase inputs
-// instead of re-running the image/text encoders. This isolates the detector
-// numerics from earlier phases and is intended for cross-phase regression tests.
+/*
+** Run the phase 5 detector from pre-dumped inputs instead of re-running
+** the image/text encoders.  Isolates detector numerics from earlier phases.
+*/
 bool sam3_test_dump_phase5_from_ref_inputs(const sam3_model & model,
                                            const std::vector<int32_t> & token_ids,
                                            const std::string & prephase_ref_dir,
@@ -223,60 +291,71 @@ bool sam3_test_dump_phase5_from_ref_inputs(const sam3_model & model,
                                            const std::string & output_dir,
                                            int n_threads = 4);
 
-// Test-only: run the phase 6 prompt encoder + SAM decoder on an already
-// encoded tracker image state and dump standard intermediate tensors to
-// <output_dir>/<tensor_name>.{bin,shape}.
+/*
+** Run the phase 6 prompt encoder + SAM decoder on an already-encoded
+** tracker image state and dump intermediate tensors.
+*/
 bool sam3_test_dump_phase6(const sam3_model & model,
                            const sam3_state & state,
                            const sam3_pvs_params & params,
                            const std::string & output_dir,
                            int n_threads = 4);
 
-// Test-only: run the phase 6 prompt encoder + SAM decoder from pre-dumped
-// phase 3 tracker features. This isolates phase 6 numerics from earlier phases
-// and is intended to be reused by later tracker-stage tests.
+/*
+** Run the phase 6 prompt encoder + SAM decoder from pre-dumped phase 3
+** tracker features.  Isolates phase 6 numerics from earlier phases.
+*/
 bool sam3_test_dump_phase6_from_ref_inputs(const sam3_model & model,
                                            const std::string & prephase_ref_dir,
                                            const sam3_pvs_params & params,
                                            const std::string & output_dir,
                                            int n_threads = 4);
 
-// Test-only: run the phase 7 tracker subgraph from pre-dumped case inputs and
-// dump standard intermediate tensors to <output_dir>/<tensor_name>.{bin,shape}.
-// The case directory is produced by tests/dump_phase7_reference.py.
+/*
+** Run the phase 7 tracker subgraph from pre-dumped case inputs and dump
+** intermediate tensors.  Case directory produced by dump_phase7_reference.py.
+*/
 bool sam3_test_dump_phase7_from_ref_inputs(const sam3_model & model,
                                            const std::string & case_ref_dir,
                                            const std::string & output_dir,
                                            int n_threads = 4);
 
-// Test-only: run the geometry encoder from pre-computed backbone features and
-// dump intermediate tensors to <output_dir>/<tensor_name>.{bin,shape}.
-// Tests exemplar box coordinate encoding against Python reference.
+/*
+** Run the geometry encoder from pre-computed backbone features and dump
+** intermediate tensors.  Tests exemplar box coordinate encoding against
+** Python reference.
+*/
 bool sam3_test_dump_geom_enc(const sam3_model   & model,
                               const std::string  & prephase_ref_dir,
                               const sam3_pcs_params & params,
                               const std::string  & output_dir,
                               int                  n_threads = 4);
 
-// Test-only: run ONLY the fusion encoder (6 layers) from pre-dumped inputs
-// (image features, pos encoding, prompt tokens, attn bias).  Dumps per-layer
-// outputs for isolated fenc debugging.  Input tensors should come from the
-// actual Python package via tests/dump_fenc_from_package.py.
+/*
+** Run ONLY the fusion encoder (6 layers) from pre-dumped inputs (image
+** features, pos encoding, prompt tokens, attn bias).  Dumps per-layer
+** outputs for isolated fenc debugging.
+*/
 bool sam3_test_fenc_only(const sam3_model  & model,
                           const std::string & ref_dir,
                           const std::string & output_dir,
                           int                 n_threads = 4);
 
-// ─── Debug: dump state tensors to files for verification ───
+/*
+** ── Debug ────────────────────────────────────────────────────────────────
+*/
 
+/* Dump a named state tensor to a binary file for verification. */
 bool sam3_dump_state_tensor(const sam3_state & state,
                              const std::string & tensor_name,
                              const std::string & output_path);
 
-// Test-only: encode an image from pre-preprocessed float data (CHW layout, already
-// resized to img_size x img_size and normalized).  This bypasses the C++ preprocessing
-// so that numerical comparisons against the Python reference are not polluted by
-// differences in image resize implementations.
+/*
+** Encode an image from pre-preprocessed float data (CHW layout, already
+** resized and normalized).  Bypasses C++ preprocessing so that numerical
+** comparisons against the Python reference are not polluted by resize
+** implementation differences.
+*/
 bool sam3_encode_image_from_preprocessed(sam3_state       & state,
                                           const sam3_model & model,
                                           const float      * chw_data,
