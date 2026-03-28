@@ -617,6 +617,12 @@ struct sam3_tracker {
     // Per-tensor backend buffers allocated by sam3_encode_memory / sam3_store_obj_ptr.
     // Tracked here so they can be freed on tracker reset.
     std::vector<ggml_backend_buffer_t> owned_buffers;
+
+    // Cached PE / RoPE data — pure functions of fixed hyperparameters, computed once.
+    bool pe_caches_valid = false;
+    std::vector<float> cached_sinpe_256;       // sam3_sinusoidal_pe_2d(72, 72, 256)
+    std::vector<float> cached_sinpe_64;        // sam3_sinusoidal_pe_2d(72, 72, 64)
+    std::vector<float> cached_axial_cis_reord; // reordered axial CIS for RoPE Q
 };
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -662,9 +668,9 @@ static struct ggml_tensor* sam3_layer_norm(struct ggml_context* ctx,
                                            struct ggml_tensor* w,
                                            struct ggml_tensor* b) {
     x = ggml_norm(ctx, x, 1e-5f);
-    x = ggml_mul(ctx, x, w);
+    x = ggml_mul_inplace(ctx, x, w);
     if (b) {
-        x = ggml_add(ctx, x, b);
+        x = ggml_add_inplace(ctx, x, b);
     }
     return x;
 }
@@ -676,9 +682,9 @@ static struct ggml_tensor* sam3_layer_norm_2d(struct ggml_context* ctx,
     // x is [C, H, W, B] in ggml layout — norm over C dimension (dim 0)
     x = ggml_norm(ctx, x, 1e-6f);
     // w, b are [C, 1, 1] — broadcast multiply/add
-    x = ggml_mul(ctx, x, w);
+    x = ggml_mul_inplace(ctx, x, w);
     if (b) {
-        x = ggml_add(ctx, x, b);
+        x = ggml_add_inplace(ctx, x, b);
     }
     return x;
 }
@@ -2647,8 +2653,7 @@ static struct ggml_tensor* sam3_text_block_forward(struct ggml_context* ctx,
     K = ggml_reshape_4d(ctx, K, HD, L, NH, 1);
 
     V = ggml_reshape_3d(ctx, V, HD, NH, L);
-    V = ggml_cont(ctx, ggml_permute(ctx, V, 0, 2, 1, 3));
-    V = ggml_reshape_4d(ctx, V, HD, L, NH, 1);
+    V = ggml_permute(ctx, V, 0, 2, 1, 3);  // non-contiguous; flash_attn uses strides
 
     // flash_attn_ext:
     //   Q: [HD, L, NH, 1], K: [HD, L, NH, 1], V: [HD, L, NH, 1]
@@ -3191,7 +3196,7 @@ static struct ggml_tensor* sam3_multihead_attn_fused(
     K = ggml_cont(ctx, ggml_permute(ctx, K, 0, 2, 1, 3));  // [HD, N_kv, NH, B]
 
     V = ggml_reshape_4d(ctx, V, HD, n_heads, N_kv, B);
-    V = ggml_cont(ctx, ggml_permute(ctx, V, 0, 2, 1, 3));  // [HD, N_kv, NH, B]
+    V = ggml_permute(ctx, V, 0, 2, 1, 3);  // [HD, N_kv, NH, B] non-contiguous; flash_attn uses strides
 
     // Attention
     float scale = 1.0f / sqrtf((float)HD);
@@ -3379,7 +3384,7 @@ static sam3_geom_result sam3_build_geom_enc_graph(
             K = ggml_reshape_4d(ctx, K, HD, n_heads, S, 1);
             K = ggml_cont(ctx, ggml_permute(ctx, K, 0, 2, 1, 3));
             V = ggml_reshape_4d(ctx, V, HD, n_heads, S, 1);
-            V = ggml_cont(ctx, ggml_permute(ctx, V, 0, 2, 1, 3));
+            V = ggml_permute(ctx, V, 0, 2, 1, 3);
 
             float scale = 1.0f / sqrtf((float)HD);
             auto* sa_out = ggml_flash_attn_ext(ctx, Q, K, V, nullptr, scale, 0.0f, 0.0f);
@@ -3421,7 +3426,7 @@ static sam3_geom_result sam3_build_geom_enc_graph(
             K = ggml_reshape_4d(ctx, K, HD, n_heads, S_kv, 1);
             K = ggml_cont(ctx, ggml_permute(ctx, K, 0, 2, 1, 3));
             V = ggml_reshape_4d(ctx, V, HD, n_heads, S_kv, 1);
-            V = ggml_cont(ctx, ggml_permute(ctx, V, 0, 2, 1, 3));
+            V = ggml_permute(ctx, V, 0, 2, 1, 3);
 
             float scale = 1.0f / sqrtf((float)HD);
             auto* ca_out = ggml_flash_attn_ext(ctx, Q, K, V, nullptr, scale, 0.0f, 0.0f);
@@ -3734,7 +3739,7 @@ static struct ggml_tensor* sam3_fenc_layer_forward(
         K = ggml_reshape_4d(ctx, K, HD, n_heads, N, B);
         K = ggml_cont(ctx, ggml_permute(ctx, K, 0, 2, 1, 3));
         V = ggml_reshape_4d(ctx, V, HD, n_heads, N, B);
-        V = ggml_cont(ctx, ggml_permute(ctx, V, 0, 2, 1, 3));
+        V = ggml_permute(ctx, V, 0, 2, 1, 3);
 
         float scale = 1.0f / sqrtf((float)HD);
         auto* sa_out = ggml_flash_attn_ext(ctx, Q, K, V, nullptr, scale, 0.0f, 0.0f);
@@ -3777,7 +3782,7 @@ static struct ggml_tensor* sam3_fenc_layer_forward(
         K = ggml_reshape_4d(ctx, K, HD, n_heads, N_kv, B);
         K = ggml_cont(ctx, ggml_permute(ctx, K, 0, 2, 1, 3));
         V = ggml_reshape_4d(ctx, V, HD, n_heads, N_kv, B);
-        V = ggml_cont(ctx, ggml_permute(ctx, V, 0, 2, 1, 3));
+        V = ggml_permute(ctx, V, 0, 2, 1, 3);
 
         auto* ca_mask = sam3_expand_token_attn_bias(ctx, prompt_attn_bias, N_q, n_heads, B);
         float scale = 1.0f / sqrtf((float)HD);
@@ -4155,7 +4160,7 @@ static struct ggml_tensor* sam3_ddec_layer_forward(
         K = ggml_reshape_4d(ctx, K, HD, n_heads, N, B);
         K = ggml_cont(ctx, ggml_permute(ctx, K, 0, 2, 1, 3));
         V = ggml_reshape_4d(ctx, V, HD, n_heads, N, B);
-        V = ggml_cont(ctx, ggml_permute(ctx, V, 0, 2, 1, 3));
+        V = ggml_permute(ctx, V, 0, 2, 1, 3);
 
         float scale = 1.0f / sqrtf((float)HD);
         auto* sa_out = ggml_flash_attn_ext(ctx, Q, K, V, nullptr, scale, 0.0f, 0.0f);
@@ -4197,7 +4202,7 @@ static struct ggml_tensor* sam3_ddec_layer_forward(
         K = ggml_reshape_4d(ctx, K, HD, n_heads, N_kv, B);
         K = ggml_cont(ctx, ggml_permute(ctx, K, 0, 2, 1, 3));
         V = ggml_reshape_4d(ctx, V, HD, n_heads, N_kv, B);
-        V = ggml_cont(ctx, ggml_permute(ctx, V, 0, 2, 1, 3));
+        V = ggml_permute(ctx, V, 0, 2, 1, 3);
 
         auto* text_mask = sam3_expand_token_attn_bias(ctx, text_attn_bias, N_q, n_heads, B);
         float scale = 1.0f / sqrtf((float)HD);
@@ -4241,7 +4246,7 @@ static struct ggml_tensor* sam3_ddec_layer_forward(
         K = ggml_reshape_4d(ctx, K, HD, n_heads, N_kv, B);
         K = ggml_cont(ctx, ggml_permute(ctx, K, 0, 2, 1, 3));
         V = ggml_reshape_4d(ctx, V, HD, n_heads, N_kv, B);
-        V = ggml_cont(ctx, ggml_permute(ctx, V, 0, 2, 1, 3));
+        V = ggml_permute(ctx, V, 0, 2, 1, 3);
 
         float scale = 1.0f / sqrtf((float)HD);
         struct ggml_tensor* ca_out = nullptr;
@@ -4941,7 +4946,7 @@ static struct ggml_tensor* sam3_build_mem_attn_graph(
             v = ggml_reshape_4d(ctx, v, D, 1, N, 1);
             q = ggml_cont(ctx, ggml_permute(ctx, q, 0, 2, 1, 3));
             k = ggml_cont(ctx, ggml_permute(ctx, k, 0, 2, 1, 3));
-            v = ggml_cont(ctx, ggml_permute(ctx, v, 0, 2, 1, 3));
+            v = ggml_permute(ctx, v, 0, 2, 1, 3);
 
             float scale = 1.0f / sqrtf((float)D);
             auto* sa_out = ggml_flash_attn_ext(ctx, q, k, v, nullptr, scale, 0.0f, 0.0f);
@@ -4986,7 +4991,7 @@ static struct ggml_tensor* sam3_build_mem_attn_graph(
             v = ggml_reshape_4d(ctx, v, D, 1, M_total, 1);
             q = ggml_cont(ctx, ggml_permute(ctx, q, 0, 2, 1, 3));
             k = ggml_cont(ctx, ggml_permute(ctx, k, 0, 2, 1, 3));
-            v = ggml_cont(ctx, ggml_permute(ctx, v, 0, 2, 1, 3));
+            v = ggml_permute(ctx, v, 0, 2, 1, 3);
 
             float scale = 1.0f / sqrtf((float)D);
             auto* ca_out = ggml_flash_attn_ext(ctx, q, k, v, nullptr, scale, 0.0f, 0.0f);
@@ -5572,31 +5577,6 @@ sam3_result sam3_segment_pcs(sam3_state& state,
         ggml_backend_tensor_set(prompt, combined_prompt_cpu.data(), 0, D * T * sizeof(float));
         ggml_backend_tensor_set(bias, combined_bias_cpu.data(), 0, T * sizeof(float));
 
-        // Dump fenc inputs for comparison with isolated test
-        {
-            FILE* f;
-            f = fopen("/tmp/fenc_subgraph_img.bin", "wb");
-            if (f) {
-                fwrite(img_feats_cpu.data(), sizeof(float), D * N_spatial, f);
-                fclose(f);
-            }
-            f = fopen("/tmp/fenc_subgraph_pe.bin", "wb");
-            if (f) {
-                fwrite(img_pe_cpu.data(), sizeof(float), D * N_spatial, f);
-                fclose(f);
-            }
-            f = fopen("/tmp/fenc_subgraph_prompt.bin", "wb");
-            if (f) {
-                fwrite(combined_prompt_cpu.data(), sizeof(float), D * T, f);
-                fclose(f);
-            }
-            f = fopen("/tmp/fenc_subgraph_bias.bin", "wb");
-            if (f) {
-                fwrite(combined_bias_cpu.data(), sizeof(float), T, f);
-                fclose(f);
-            }
-        }
-
         sam3_graph_compute(model.backend, graph, state.n_threads);
         ggml_backend_tensor_get(out, fenc_output_cpu.data(), 0, D * N_spatial * sizeof(float));
 
@@ -5873,7 +5853,7 @@ static struct ggml_tensor* sam3_sam_attention(
     K = ggml_cont(ctx, ggml_permute(ctx, K, 0, 2, 1, 3));  // [HD, N_kv, NH, B]
 
     V = ggml_reshape_4d(ctx, V, HD, n_heads, N_kv, B);
-    V = ggml_cont(ctx, ggml_permute(ctx, V, 0, 2, 1, 3));  // [HD, N_kv, NH, B]
+    V = ggml_permute(ctx, V, 0, 2, 1, 3);  // [HD, N_kv, NH, B] non-contiguous; flash_attn uses strides
 
     // Attention
     float scale = 1.0f / sqrtf((float)HD);
@@ -6651,8 +6631,37 @@ struct sam3_prop_output {
     int n_masks, mask_h, mask_w;
 };
 
+// Lazily compute and cache PE/RoPE data that is identical across all propagation calls.
+static void sam3_ensure_tracker_pe_caches(sam3_tracker& tracker, const sam3_hparams& hp) {
+    if (tracker.pe_caches_valid) return;
+
+    const int D = hp.neck_dim;       // 256
+    const int MD = hp.mem_out_dim;   // 64
+    const int H = hp.n_img_embd();   // 72
+    const int N = H * H;             // 5184
+    const int half_d = D / 2;        // 128
+
+    tracker.cached_sinpe_256 = sam3_sinusoidal_pe_2d(H, H, D);
+    tracker.cached_sinpe_64  = sam3_sinusoidal_pe_2d(H, H, MD);
+
+    // Compute axial CIS and reorder to [2, half_d, N] layout
+    std::vector<float> rope_raw(N * D);
+    sam3_compute_axial_cis(rope_raw.data(), D, H, H, 10000.0f, 1.0f);
+    tracker.cached_axial_cis_reord.resize(2 * half_d * N);
+    for (int n = 0; n < N; ++n)
+        for (int i = 0; i < half_d; ++i) {
+            tracker.cached_axial_cis_reord[0 + i * 2 + n * D] = rope_raw[n * D + i * 2 + 0];
+            tracker.cached_axial_cis_reord[1 + i * 2 + n * D] = rope_raw[n * D + i * 2 + 1];
+        }
+
+    tracker.pe_caches_valid = true;
+    fprintf(stderr, "%s: tracker PE caches populated (%.1f KB)\n", __func__,
+            (tracker.cached_sinpe_256.size() + tracker.cached_sinpe_64.size() +
+             tracker.cached_axial_cis_reord.size()) * sizeof(float) / 1024.0f);
+}
+
 static sam3_prop_output sam3_propagate_single(
-    sam3_state& state, const sam3_model& model,
+    sam3_tracker& tracker, sam3_state& state, const sam3_model& model,
     const sam3_masklet& masklet,
     const std::vector<sam3_memory_slot>& mem_bank,
     const std::vector<std::pair<int, struct ggml_tensor*>>& ptr_bank) {
@@ -6677,8 +6686,8 @@ static sam3_prop_output sam3_propagate_single(
             ggml_backend_tensor_get(mem_bank[sel[s]].spatial_pe,
                                     slot_pes[s].data(), 0, MD * N * sizeof(float));
         } else {
-            auto pe = sam3_sinusoidal_pe_2d(H, H, MD);
-            slot_pes[s] = pe;
+            sam3_ensure_tracker_pe_caches(tracker, hp);
+            slot_pes[s] = tracker.cached_sinpe_64;
         }
         spatial_tpos[s] = mem_bank[sel[s]].is_cond_frame ? 0 : (n_sel - s);
     }
@@ -6694,18 +6703,11 @@ static sam3_prop_output sam3_propagate_single(
 
     auto pd = sam3_build_prompt_and_pos(model, slot_feats, slot_pes, spatial_tpos, obj_ptrs, ptr_tpos);
 
-    // ── Precompute RoPE frequencies ─────────────────────────────────────
+    // ── RoPE frequencies (cached) ──────────────────────────────────────
+    sam3_ensure_tracker_pe_caches(tracker, hp);
     const int half_d = D / 2;  // 128
-    std::vector<float> rope_q_data(N * D);
-    sam3_compute_axial_cis(rope_q_data.data(), D, H, H, 10000.0f, 1.0f);
-    // Reorder from [N, D] flat (cos,sin interleaved) to [2, half, N]
-    std::vector<float> rope_q_reord(2 * half_d * N);
-    for (int n = 0; n < N; ++n)
-        for (int i = 0; i < half_d; ++i) {
-            rope_q_reord[0 + i * 2 + n * D] = rope_q_data[n * D + i * 2 + 0];  // cos
-            rope_q_reord[1 + i * 2 + n * D] = rope_q_data[n * D + i * 2 + 1];  // sin
-        }
-    // For cross-attn K: repeat for M_spatial tokens
+    const auto& rope_q_reord = tracker.cached_axial_cis_reord;
+    // For cross-attn K: repeat cached Q pattern for M_spatial tokens
     std::vector<float> rope_k_data;
     if (pd.M_spatial > 0) {
         rope_k_data.resize(2 * half_d * pd.M_spatial);
@@ -6805,55 +6807,16 @@ static sam3_prop_output sam3_propagate_single(
         ggml_backend_tensor_set(rope_k_t, rope_k_data.data(), 0, rope_k_data.size() * sizeof(float));
 
     // Upload src_pos (sinusoidal PE 256-dim for 72×72)
-    auto src_pos_data = sam3_sinusoidal_pe_2d(H, H, D);
-    ggml_backend_tensor_set(src_pos_t, src_pos_data.data(), 0, src_pos_data.size() * sizeof(float));
+    ggml_backend_tensor_set(src_pos_t, tracker.cached_sinpe_256.data(), 0,
+                            tracker.cached_sinpe_256.size() * sizeof(float));
 
-    // Upload not_a_point_embed for sparse prompt
-    {
-        float nap[256];
-        if (model.sam_pe.not_a_point_embed->type == GGML_TYPE_F16) {
-            std::vector<ggml_fp16_t> tmp(D);
-            ggml_backend_tensor_get(model.sam_pe.not_a_point_embed, tmp.data(), 0, D * sizeof(ggml_fp16_t));
-            ggml_fp16_to_fp32_row(tmp.data(), nap, D);
-        } else {
-            ggml_backend_tensor_get(model.sam_pe.not_a_point_embed, nap, 0, D * sizeof(float));
-        }
-        ggml_backend_tensor_set(sparse_in, nap, 0, D * sizeof(float));
-    }
-
-    // Upload image_pe and dense_emb
-    {
-        const int npf = D / 2;
-        std::vector<float> pe_g(D);
-        if (model.sam_pe.pe_gaussian->type == GGML_TYPE_F16) {
-            std::vector<ggml_fp16_t> tmp(D);
-            ggml_backend_tensor_get(model.sam_pe.pe_gaussian, tmp.data(), 0, D * sizeof(ggml_fp16_t));
-            ggml_fp16_to_fp32_row(tmp.data(), pe_g.data(), D);
-        } else
-            ggml_backend_tensor_get(model.sam_pe.pe_gaussian, pe_g.data(), 0, D * sizeof(float));
-        std::vector<float> pe_d(D * H * H);
-        for (int r = 0; r < H; ++r)
-            for (int c = 0; c < H; ++c) {
-                float xn = ((float)c + 0.5f) / H, yn = ((float)r + 0.5f) / H;
-                float pv[256];
-                sam3_pe_encode_coord(pv, xn, yn, pe_g.data(), npf);
-                for (int d = 0; d < D; ++d) pe_d[d + c * D + r * D * H] = pv[d];
-            }
-        ggml_backend_tensor_set(image_pe, pe_d.data(), 0, pe_d.size() * sizeof(float));
-
-        float nm[256];
-        if (model.sam_pe.no_mask_embed->type == GGML_TYPE_F16) {
-            std::vector<ggml_fp16_t> tmp(D);
-            ggml_backend_tensor_get(model.sam_pe.no_mask_embed, tmp.data(), 0, D * sizeof(ggml_fp16_t));
-            ggml_fp16_to_fp32_row(tmp.data(), nm, D);
-        } else
-            ggml_backend_tensor_get(model.sam_pe.no_mask_embed, nm, 0, D * sizeof(float));
-        std::vector<float> dd(D * H * H);
-        for (int r = 0; r < H; ++r)
-            for (int c = 0; c < H; ++c)
-                for (int d = 0; d < D; ++d) dd[d + c * D + r * D * H] = nm[d];
-        ggml_backend_tensor_set(dense_emb, dd.data(), 0, dd.size() * sizeof(float));
-    }
+    // Upload not_a_point_embed, image_pe, dense_emb from state PE cache
+    sam3_populate_pe_cache(state, model);
+    ggml_backend_tensor_set(sparse_in, state.not_a_point_cache, 0, D * sizeof(float));
+    ggml_backend_tensor_set(image_pe, state.dense_pe_cache.data(), 0,
+                            state.dense_pe_cache.size() * sizeof(float));
+    ggml_backend_tensor_set(dense_emb, state.dense_nomask_cache.data(), 0,
+                            state.dense_nomask_cache.size() * sizeof(float));
 
     // Copy tracker features from state to fresh input tensors
     {
@@ -6950,8 +6913,7 @@ static bool sam3_encode_memory(
 
     // Mask preprocessing: 288→1008→sigmoid→scale→bias→1152
     auto m_hires = sam3_bilinear_interpolate(mask_logits, mask_w, mask_h, HIGH_RES, HIGH_RES);
-    for (auto& v : m_hires) v = 1.0f / (1.0f + expf(-v));
-    for (auto& v : m_hires) v = v * 20.0f - 10.0f;
+    for (auto& v : m_hires) { float s = 1.0f / (1.0f + expf(-v)); v = s * 20.0f - 10.0f; }
     auto m_interp = sam3_bilinear_interpolate(m_hires.data(), HIGH_RES, HIGH_RES, INTERPOL, INTERPOL);
 
     const size_t bs = ggml_tensor_overhead() * 16384 + ggml_graph_overhead();
@@ -7054,7 +7016,8 @@ static bool sam3_encode_memory(
     ggml_backend_tensor_set(st, md.data(), 0, md.size() * sizeof(float));
 
     // Compute and store sinusoidal spatial PE
-    auto pe_data = sam3_sinusoidal_pe_2d(H, H, MD);
+    sam3_ensure_tracker_pe_caches(tracker, hp);
+    const auto& pe_data = tracker.cached_sinpe_64;
     auto* spe = ggml_new_tensor_4d(tracker.ctx, GGML_TYPE_F32, MD, H, H, 1);
     auto* speb = ggml_backend_alloc_buffer(model.backend, MD * H * H * sizeof(float));
     struct ggml_tallocr ta2 = ggml_tallocr_new(speb);
@@ -7133,7 +7096,7 @@ sam3_result sam3_track_frame(sam3_tracker& tracker, sam3_state& state,
         int id = ml.instance_id;
         auto im = tracker.mem_banks.find(id);
         if (im == tracker.mem_banks.end() || im->second.empty()) continue;
-        po[id] = sam3_propagate_single(state, model, ml, im->second, tracker.ptr_banks[id]);
+        po[id] = sam3_propagate_single(tracker, state, model, ml, im->second, tracker.ptr_banks[id]);
         if (po[id].mask_logits.empty()) continue;
         auto rs = sam3_bilinear_interpolate(po[id].mask_logits.data(),
                                             po[id].mask_w, po[id].mask_h, state.orig_width, state.orig_height);
@@ -7155,7 +7118,7 @@ sam3_result sam3_track_frame(sam3_tracker& tracker, sam3_state& state,
         int id = ml.instance_id;
         auto im = tracker.mem_banks.find(id);
         if (im == tracker.mem_banks.end() || im->second.empty()) continue;
-        auto p2 = sam3_propagate_single(state, model, ml, im->second, tracker.ptr_banks[id]);
+        auto p2 = sam3_propagate_single(tracker, state, model, ml, im->second, tracker.ptr_banks[id]);
         if (!p2.mask_logits.empty()) {
             ml.last_score = p2.iou_scores[0];
             ml.last_seen = fi;
@@ -7500,7 +7463,7 @@ sam3_result sam3_propagate_frame(
         int id = ml.instance_id;
         auto im = tracker.mem_banks.find(id);
         if (im == tracker.mem_banks.end() || im->second.empty()) continue;
-        po[id] = sam3_propagate_single(state, model, ml, im->second, tracker.ptr_banks[id]);
+        po[id] = sam3_propagate_single(tracker, state, model, ml, im->second, tracker.ptr_banks[id]);
         if (po[id].mask_logits.empty()) continue;
         auto rs = sam3_bilinear_interpolate(po[id].mask_logits.data(),
                                             po[id].mask_w, po[id].mask_h,
@@ -7525,7 +7488,7 @@ sam3_result sam3_propagate_frame(
         int id = ml.instance_id;
         auto im = tracker.mem_banks.find(id);
         if (im == tracker.mem_banks.end() || im->second.empty()) continue;
-        auto p2 = sam3_propagate_single(state, model, ml, im->second, tracker.ptr_banks[id]);
+        auto p2 = sam3_propagate_single(tracker, state, model, ml, im->second, tracker.ptr_banks[id]);
         if (!p2.mask_logits.empty()) {
             ml.last_score = p2.iou_scores[0];
             ml.last_seen = fi;
@@ -9217,8 +9180,7 @@ static bool sam3_test_dump_phase7_mem_slot_current(
 
     // Mask preprocessing: 288→1008 sigmoid scale bias → 1152
     auto m_hires = sam3_bilinear_interpolate(low_res_mask_logits.data(), MASK_HW, MASK_HW, HIGH_RES, HIGH_RES);
-    for (auto& v : m_hires) v = 1.0f / (1.0f + expf(-v));
-    for (auto& v : m_hires) v = v * 20.0f - 10.0f;
+    for (auto& v : m_hires) { float s = 1.0f / (1.0f + expf(-v)); v = s * 20.0f - 10.0f; }
     auto m_interp = sam3_bilinear_interpolate(m_hires.data(), HIGH_RES, HIGH_RES, INTERPOL, INTERPOL);
 
     const size_t buf_size = ggml_tensor_overhead() * 16384 + ggml_graph_overhead();
