@@ -3894,19 +3894,25 @@ static void sam2_build_fpn_neck_graph(struct ggml_context* ctx,
 
     // Lateral 1x1 convolutions: convs[n-i] maps stage i
     // convs[0] -> stage 3 (highest dim), convs[3] -> stage 0 (lowest dim)
-    // ggml_conv_2d expects input [W, H, C, B], so we permute from [C, W, H, B].
+    // Use ggml_conv_2d_sk_p0 (same as SAM3 neck) — operates on [W, H, C, B] layout.
     struct ggml_tensor* laterals[4];
     for (int i = 0; i < 4; ++i) {
-        int conv_idx = 3 - i;  // stage 0 uses convs[3], stage 3 uses convs[0]
-        // Permute [C, W, H, 1] -> [W, H, C, 1] for conv2d
+        int conv_idx = 3 - i;
+        // Permute [C, W, H, 1] -> [W, H, C, 1] for conv
         auto* inp = ggml_cont(ctx, ggml_permute(ctx, stage_outs[i], 2, 0, 1, 3));
-        auto* conv_out = ggml_conv_2d(ctx, model.fpn_neck.levels[conv_idx].conv_w,
-                                       inp, 1, 1, 0, 0, 1, 1);
-        // conv_out: [OW, OH, D, 1]  (1x1 conv preserves spatial)
-        conv_out = ggml_add(ctx, conv_out,
-                             ggml_reshape_4d(ctx, model.fpn_neck.levels[conv_idx].conv_b, 1, 1, D, 1));
+        auto* conv_out = ggml_conv_2d_sk_p0(ctx, model.fpn_neck.levels[conv_idx].conv_w, inp);
+        // Add bias
+        auto* bias = ggml_reshape_3d(ctx, model.fpn_neck.levels[conv_idx].conv_b, 1, 1,
+                                      model.fpn_neck.levels[conv_idx].conv_b->ne[0]);
+        conv_out = ggml_add(ctx, conv_out, ggml_repeat(ctx, bias, conv_out));
         // Permute back to [D, W, H, 1]
         laterals[i] = ggml_cont(ctx, ggml_permute(ctx, conv_out, 1, 2, 0, 3));
+        {
+            char name[64];
+            snprintf(name, sizeof(name), "dbg_fpn_lateral_%d", i);
+            ggml_set_name(laterals[i], name);
+            ggml_set_output(laterals[i]);
+        }
     }
 
     // Top-down fusion: process in reverse order (high to low resolution)
@@ -5200,6 +5206,8 @@ bool sam3_encode_image_from_preprocessed(sam3_state& state,
                     "dbg_blk0_norm1", "dbg_blk0_attn_out", "dbg_blk0_res1",
                     "dbg_block_0", "dbg_block_1", "dbg_block_2",
                     "dbg_block_5", "dbg_block_21",
+                    "dbg_fpn_lateral_0", "dbg_fpn_lateral_1",
+                    "dbg_fpn_lateral_2", "dbg_fpn_lateral_3",
                 };
                 for (const char* dn : dbg_names) {
                     auto* t = ggml_graph_get_tensor(graph, dn);
