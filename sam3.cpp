@@ -1578,11 +1578,12 @@ static void sam2_register_tensors(sam3_model& model) {
     model.hiera.patch_embed_b = T1f("hiera.patch_embed.bias", E0);
 
     // Positional embeddings
-    model.hiera.pos_embed = T4f("hiera.pos_embed", E0, hp.hiera_pos_embed_bkg_w,
-                                 hp.hiera_pos_embed_bkg_h, 1);
-    model.hiera.pos_embed_window = T4f("hiera.pos_embed_window", E0,
-                                        hp.hiera_window_spec[0],
-                                        hp.hiera_window_spec[0], 1);
+    // PyTorch pos_embed [1, E, bkg_h, bkg_w] → ggml reversed [bkg_w, bkg_h, E, 1]
+    model.hiera.pos_embed = T4f("hiera.pos_embed",
+                                 hp.hiera_pos_embed_bkg_w, hp.hiera_pos_embed_bkg_h, E0, 1);
+    // PyTorch pos_embed_window [1, E, ws, ws] → ggml reversed [ws, ws, E, 1]
+    model.hiera.pos_embed_window = T4f("hiera.pos_embed_window",
+                                        hp.hiera_window_spec[0], hp.hiera_window_spec[0], E0, 1);
 
     // Hiera blocks
     const int total_blocks = hp.hiera_total_blocks();
@@ -3427,11 +3428,13 @@ static struct ggml_tensor* sam3_build_text_encoder_graph(struct ggml_context* ct
 // Used for background positional embedding interpolation.
 static void sam2_bicubic_interpolate_cpu(const float* src, int C, int H_in, int W_in,
                                           float* dst, int H_out, int W_out) {
-    // Cubic weight function (matching PyTorch's bicubic interpolation)
+    // Keys cubic kernel with a = -0.75 (matching PyTorch's bicubic interpolation)
+    // w(x) = (a+2)|x|^3 - (a+3)|x|^2 + 1,          |x| <= 1
+    // w(x) = a|x|^3 - 5a|x|^2 + 8a|x| - 4a,        1 < |x| < 2
     auto cubic = [](float x) -> float {
         x = fabsf(x);
-        if (x < 1.0f) return (1.5f*x - 2.5f)*x*x + 1.0f;
-        if (x < 2.0f) { float t = 2.0f - x; return -0.5f*t*t*t + 2.5f*t*t - 4.0f*t + 2.0f; }
+        if (x < 1.0f) return (1.25f*x - 2.25f)*x*x + 1.0f;
+        if (x < 2.0f) return ((-0.75f*x + 3.75f)*x - 6.0f)*x + 3.0f;
         return 0.0f;
     };
 
@@ -3472,36 +3475,23 @@ static std::vector<float> sam2_compute_pos_embed(const sam3_model& model, int H,
     const int bkg_w = hp.hiera_pos_embed_bkg_w;
     const int ws = hp.hiera_window_spec[0];
 
-    // Read background PE from GPU: stored as [E, bkg_w, bkg_h, 1] in ggml layout
-    std::vector<float> bkg_data(E * bkg_h * bkg_w);
-    ggml_backend_tensor_get(model.hiera.pos_embed, bkg_data.data(), 0,
-                            bkg_data.size() * sizeof(float));
-
-    // Rearrange from ggml [E, W, H, 1] to CHW [E, H, W] for interpolation
-    // ggml layout: element (e, x, y) at e + x*E + y*E*W
-    // CHW layout: element (c, y, x) at c*H*W + y*W + x
+    // Read background PE from GPU.
+    // Registered as [bkg_w, bkg_h, E, 1] in ggml; raw bytes match PyTorch NCHW [1,E,H,W].
+    // ggml flat index for ne=[W,H,E,1]: w + h*W + e*W*H = same as CHW[e,h,w] = e*H*W + h*W + w.
+    // So we can use the raw data directly as CHW layout for bicubic interpolation.
     std::vector<float> bkg_chw(E * bkg_h * bkg_w);
-    for (int e = 0; e < E; ++e)
-        for (int y = 0; y < bkg_h; ++y)
-            for (int x = 0; x < bkg_w; ++x)
-                bkg_chw[e * bkg_h * bkg_w + y * bkg_w + x] = bkg_data[e + x * E + y * E * bkg_w];
+    ggml_backend_tensor_get(model.hiera.pos_embed, bkg_chw.data(), 0,
+                            bkg_chw.size() * sizeof(float));
 
     // Bicubic interpolate to [E, H, W]
     std::vector<float> bkg_interp(E * H * W);
     sam2_bicubic_interpolate_cpu(bkg_chw.data(), E, bkg_h, bkg_w,
                                   bkg_interp.data(), H, W);
 
-    // Read window PE from GPU: [E, ws, ws, 1]
-    std::vector<float> win_data(E * ws * ws);
-    ggml_backend_tensor_get(model.hiera.pos_embed_window, win_data.data(), 0,
-                            win_data.size() * sizeof(float));
-
-    // Rearrange from ggml to CHW
+    // Read window PE from GPU: registered [ws, ws, E, 1], raw bytes = CHW [E, ws, ws]
     std::vector<float> win_chw(E * ws * ws);
-    for (int e = 0; e < E; ++e)
-        for (int y = 0; y < ws; ++y)
-            for (int x = 0; x < ws; ++x)
-                win_chw[e * ws * ws + y * ws + x] = win_data[e + x * E + y * E * ws];
+    ggml_backend_tensor_get(model.hiera.pos_embed_window, win_chw.data(), 0,
+                            win_chw.size() * sizeof(float));
 
     // Tile window PE to [E, H, W]
     std::vector<float> win_tiled(E * H * W);
@@ -3509,6 +3499,22 @@ static std::vector<float> sam2_compute_pos_embed(const sam3_model& model, int H,
         for (int y = 0; y < H; ++y)
             for (int x = 0; x < W; ++x)
                 win_tiled[e * H * W + y * W + x] = win_chw[e * ws * ws + (y % ws) * ws + (x % ws)];
+
+    // Dump intermediates if requested
+    const char* dump_dir = getenv("SAM2_DUMP_DIR");
+    if (dump_dir) {
+        char path[512];
+        // Dump bkg_interp as CHW
+        snprintf(path, sizeof(path), "%s/cpp_pe_bkg_interp.bin", dump_dir);
+        FILE* f = fopen(path, "wb");
+        if (f) { fwrite(bkg_interp.data(), sizeof(float), bkg_interp.size(), f); fclose(f); }
+        snprintf(path, sizeof(path), "%s/cpp_pe_bkg_interp.shape", dump_dir);
+        f = fopen(path, "w"); if (f) { fprintf(f, "%d,%d,%d", E, H, W); fclose(f); }
+        // Dump win_tiled as CHW
+        snprintf(path, sizeof(path), "%s/cpp_pe_win_tiled.bin", dump_dir);
+        f = fopen(path, "wb");
+        if (f) { fwrite(win_tiled.data(), sizeof(float), win_tiled.size(), f); fclose(f); }
+    }
 
     // Sum and convert to ggml layout [E, W, H, 1]
     std::vector<float> pe(E * H * W);
@@ -3646,16 +3652,19 @@ static struct ggml_tensor* sam2_maxpool_2d(struct ggml_context* ctx,
 static struct ggml_tensor* sam2_hiera_block_forward(struct ggml_context* ctx,
                                                      struct ggml_tensor* x,
                                                      const sam2_hiera_block& blk,
-                                                     int spatial_H, int spatial_W) {
+                                                     int spatial_H, int spatial_W,
+                                                     int block_idx = -1) {
     const int64_t C_in = blk.dim_in;
     const int64_t C_out = blk.dim_out;
     const int B = 1;
+    const bool dump = (block_idx == 0);  // dump internals for block 0
 
     // ── 1. Pre-norm ──────────────────────────────────────────────────────
     // x: [C_in, W, H, B]
     auto* normed = ggml_norm(ctx, x, 1e-6f);
     normed = ggml_mul(ctx, normed, ggml_repeat(ctx, ggml_reshape_4d(ctx, blk.norm1_w, C_in, 1, 1, 1), normed));
     normed = ggml_add(ctx, normed, ggml_repeat(ctx, ggml_reshape_4d(ctx, blk.norm1_b, C_in, 1, 1, 1), normed));
+    if (dump) { ggml_set_name(normed, "dbg_blk0_norm1"); ggml_set_output(normed); }
 
     // ── 2. Shortcut with dimension projection and/or Q-stride pooling ──
     struct ggml_tensor* shortcut;
@@ -3722,20 +3731,29 @@ static struct ggml_tensor* sam2_hiera_block_forward(struct ggml_context* ctx,
         out_H = attn_input->ne[2];
     }
 
-    // Reshape for multi-head attention
-    auto* q_mh = ggml_reshape_3d(ctx, q, head_dim, N_q, blk.num_heads * B_win);
-    auto* k_mh = ggml_reshape_3d(ctx, k, head_dim, N_kv, blk.num_heads * B_win);
-    auto* v_mh = ggml_reshape_3d(ctx, v, head_dim, N_kv, blk.num_heads * B_win);
+    // Multi-head attention — follow SAM3 ViT pattern exactly:
+    // Q: [C_out, N, B_win] → [HD, NH, N, B_win] → permute(0,2,1,3) → cont → [HD, N, NH*B_win]
+    //                       → reshape_4d [HD, N, NH, B_win]
+    int64_t NH = blk.num_heads;
+    auto* Q = ggml_reshape_4d(ctx, q, head_dim, NH, N_q, B_win);
+    Q = ggml_cont(ctx, ggml_permute(ctx, Q, 0, 2, 1, 3));
+    Q = ggml_reshape_3d(ctx, Q, head_dim, N_q, NH * B_win);
+    Q = ggml_reshape_4d(ctx, Q, head_dim, N_q, NH, B_win);
 
-    auto* q4 = ggml_reshape_4d(ctx, q_mh, head_dim, N_q, blk.num_heads, B_win);
-    auto* k4 = ggml_reshape_4d(ctx, k_mh, head_dim, N_kv, blk.num_heads, B_win);
-    auto* v4 = ggml_reshape_4d(ctx, v_mh, head_dim, N_kv, blk.num_heads, B_win);
+    auto* K = ggml_reshape_4d(ctx, k, head_dim, NH, N_kv, B_win);
+    K = ggml_cont(ctx, ggml_permute(ctx, K, 0, 2, 1, 3));
+    K = ggml_reshape_3d(ctx, K, head_dim, N_kv, NH * B_win);
+    K = ggml_reshape_4d(ctx, K, head_dim, N_kv, NH, B_win);
+
+    auto* V = ggml_reshape_4d(ctx, v, head_dim, NH, N_kv, B_win);
+    V = ggml_permute(ctx, V, 0, 2, 1, 3);  // non-contiguous OK for flash_attn
 
     float scale = 1.0f / sqrtf((float)head_dim);
-    auto* attn_out = ggml_flash_attn_ext(ctx, q4, k4, v4, nullptr, scale, 0, 0);
+    auto* attn_out = ggml_flash_attn_ext(ctx, Q, K, V, nullptr, scale, 0, 0);
 
-    // Recombine heads: [head_dim, N_q, n_heads, B_win] → [C_out, N_q, B_win]
-    auto* recombined = ggml_reshape_3d(ctx, ggml_cont(ctx, attn_out), C_out, N_q, B_win);
+    // Recombine: flash_attn output is [HD, N_q, NH, B_win]
+    // → reshape to [C_out, N_q, B_win]
+    auto* recombined = ggml_reshape_3d(ctx, attn_out, C_out, N_q, B_win);
 
     // Output projection
     auto* attn_proj = ggml_mul_mat(ctx, blk.proj_w, recombined);
@@ -3769,8 +3787,11 @@ static struct ggml_tensor* sam2_hiera_block_forward(struct ggml_context* ctx,
                                                unpart_pad_hw, target_H, target_W, B);
     }
 
+    if (dump) { ggml_set_name(attn_result, "dbg_blk0_attn_out"); ggml_set_output(attn_result); }
+
     // ── 6. Residual ─────────────────────────────────────────────────────
     auto* res1 = ggml_add(ctx, shortcut, attn_result);
+    if (dump) { ggml_set_name(res1, "dbg_blk0_res1"); ggml_set_output(res1); }
 
     // ── 7. MLP + residual ───────────────────────────────────────────────
     int64_t new_H = res1->ne[2];
@@ -3832,7 +3853,7 @@ static void sam2_build_hiera_graph(struct ggml_context* ctx,
     for (int i = 0; i < hp.hiera_total_blocks(); ++i) {
         const auto& blk = hiera.blocks[i];
 
-        x = sam2_hiera_block_forward(ctx, x, blk, spatial_H, spatial_W);
+        x = sam2_hiera_block_forward(ctx, x, blk, spatial_H, spatial_W, i);
 
         // Mark key block outputs for debugging
         if (i == 0 || i == 1 || i == 2 || i == 5 || i == 21) {
@@ -5176,6 +5197,7 @@ bool sam3_encode_image_from_preprocessed(sam3_state& state,
             if (dump_dir) {
                 const char* dbg_names[] = {
                     "dbg_patch_embed", "dbg_after_pe",
+                    "dbg_blk0_norm1", "dbg_blk0_attn_out", "dbg_blk0_res1",
                     "dbg_block_0", "dbg_block_1", "dbg_block_2",
                     "dbg_block_5", "dbg_block_21",
                 };
