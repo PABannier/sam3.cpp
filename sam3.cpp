@@ -8862,6 +8862,37 @@ sam3_result sam3_segment_pvs(sam3_state& state,
 #endif
     }
 
+    // ── Dump decoder outputs if SAM2_DUMP_DIR set ──────────────────────
+    {
+        const char* dump_dir = getenv("SAM2_DUMP_DIR");
+        if (dump_dir) {
+            auto dump_t = [&](const char* name, struct ggml_tensor* t) {
+                if (!t) return;
+                int64_t nb = ggml_nbytes(t);
+                std::vector<char> buf(nb);
+                ggml_backend_tensor_get(t, buf.data(), 0, nb);
+                char path[512];
+                snprintf(path, sizeof(path), "%s/%s.bin", dump_dir, name);
+                FILE* f = fopen(path, "wb");
+                if (f) { fwrite(buf.data(), 1, nb, f); fclose(f); }
+                snprintf(path, sizeof(path), "%s/%s.shape", dump_dir, name);
+                f = fopen(path, "w");
+                if (f) {
+                    fprintf(f, "%lld,%lld,%lld,%lld",
+                            (long long)t->ne[0], (long long)t->ne[1],
+                            (long long)t->ne[2], (long long)t->ne[3]);
+                    fclose(f);
+                }
+                fprintf(stderr, "  [DUMP] %s: [%lld,%lld,%lld,%lld]\n", name,
+                        (long long)t->ne[0], (long long)t->ne[1],
+                        (long long)t->ne[2], (long long)t->ne[3]);
+            };
+            dump_t("cpp_pvs_masks", dec_out.masks);
+            dump_t("cpp_pvs_iou", dec_out.iou_pred);
+            dump_t("cpp_pvs_obj_score", dec_out.obj_score);
+        }
+    }
+
     // ── Read outputs ─────────────────────────────────────────────────────
     // masks: [H*4×H*4, 4, 1]
     const int mask_hw = H * 4;
