@@ -23,11 +23,18 @@ import torch
 torch.set_default_dtype(torch.float32)
 from PIL import Image
 
-VARIANTS = [
-    {"name": "tiny",      "config": "configs/sam2.1/sam2.1_hiera_t.yaml"},
-    {"name": "small",     "config": "configs/sam2.1/sam2.1_hiera_s.yaml"},
-    {"name": "base_plus", "config": "configs/sam2.1/sam2.1_hiera_b+.yaml"},
-    {"name": "large",     "config": "configs/sam2.1/sam2.1_hiera_l.yaml"},
+VARIANTS_21 = [
+    {"name": "tiny",      "config": "configs/sam2.1/sam2.1_hiera_t.yaml",  "prefix": "sam2.1"},
+    {"name": "small",     "config": "configs/sam2.1/sam2.1_hiera_s.yaml",  "prefix": "sam2.1"},
+    {"name": "base_plus", "config": "configs/sam2.1/sam2.1_hiera_b+.yaml", "prefix": "sam2.1"},
+    {"name": "large",     "config": "configs/sam2.1/sam2.1_hiera_l.yaml",  "prefix": "sam2.1"},
+]
+
+VARIANTS_20 = [
+    {"name": "tiny",      "config": "configs/sam2/sam2_hiera_t.yaml",  "prefix": "sam2"},
+    {"name": "small",     "config": "configs/sam2/sam2_hiera_s.yaml",  "prefix": "sam2"},
+    {"name": "base_plus", "config": "configs/sam2/sam2_hiera_b+.yaml", "prefix": "sam2"},
+    {"name": "large",     "config": "configs/sam2/sam2_hiera_l.yaml",  "prefix": "sam2"},
 ]
 
 
@@ -231,6 +238,8 @@ def main():
     parser.add_argument("--point-y", type=float, default=599)
     parser.add_argument("--variants", default="tiny,small,base_plus,large",
                         help="Comma-separated list of variants to test")
+    parser.add_argument("--version", default="2.1", choices=["2.0", "2.1", "both"],
+                        help="SAM2 version to test")
     args = parser.parse_args()
 
     cpp_dir = args.cpp_dir
@@ -249,34 +258,49 @@ def main():
 
     all_results = {}
 
-    for v in VARIANTS:
+    # Select variant list based on version
+    if args.version == "both":
+        variant_lists = [("SAM2.0", VARIANTS_20), ("SAM2.1", VARIANTS_21)]
+    elif args.version == "2.0":
+        variant_lists = [("SAM2.0", VARIANTS_20)]
+    else:
+        variant_lists = [("SAM2.1", VARIANTS_21)]
+
+    for ver_label, variants in variant_lists:
+      print(f"\n{'#'*70}")
+      print(f"# {ver_label}")
+      print(f"{'#'*70}")
+
+      for v in variants:
         if v["name"] not in selected:
             continue
 
         name = v["name"]
-        ckpt = os.path.join(cpp_dir, f"weights/sam2.1/sam2.1_hiera_{name}.pt")
-        ggml = os.path.join(cpp_dir, f"weights/ggml/sam2.1_hiera_{name}_f32.ggml")
+        prefix = v["prefix"]
+        display_name = f"{prefix}_{name}"
+        ckpt = os.path.join(cpp_dir, f"weights/{prefix}/{prefix}_hiera_{name}.pt")
+        ggml = os.path.join(cpp_dir, f"weights/ggml/{prefix}_hiera_{name}_f32.ggml")
         config = v["config"]
 
         if not os.path.exists(ckpt):
-            print(f"\nSKIP {name}: checkpoint not found at {ckpt}")
+            print(f"\nSKIP {display_name}: checkpoint not found at {ckpt}")
             continue
         if not os.path.exists(ggml):
-            print(f"\nSKIP {name}: ggml model not found at {ggml}")
+            print(f"\nSKIP {display_name}: ggml model not found at {ggml}")
             continue
 
-        py_dump = os.path.join(base_dump, f"py_{name}")
-        cpp_dump = os.path.join(base_dump, f"cpp_{name}")
+        py_dump = os.path.join(base_dump, f"py_{display_name}")
+        cpp_dump = os.path.join(base_dump, f"cpp_{display_name}")
 
         # Run Python
         py_meta = run_python_variant(
-            name, config, ckpt, args.image,
+            display_name, config, ckpt, args.image,
             args.point_x, args.point_y, py_dump
         )
 
         # Run C++
         cpp_result = run_cpp_variant(
-            name, ggml,
+            display_name, ggml,
             os.path.join(py_dump, "preprocessed.bin"),
             cpp_dump, cpp_binary,
             args.point_x, args.point_y, img_w, img_h
@@ -284,8 +308,8 @@ def main():
 
         # Compare
         if cpp_result is not None:
-            results = compare_variant(name, py_dump, cpp_dump, py_meta)
-            all_results[name] = results
+            results = compare_variant(display_name, py_dump, cpp_dump, py_meta)
+            all_results[display_name] = results
 
     # Summary
     print(f"\n{'='*70}")

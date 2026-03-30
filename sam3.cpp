@@ -2562,11 +2562,17 @@ static bool sam3_load_tensors(std::ifstream& fin, sam3_model& model, int n_tenso
     fprintf(stderr, "%s: loaded %d tensors (registered %zu)\n",
             __func__, n_loaded, model.tensors.size());
 
-    // Every registered tensor must be present in the file
+    // Check tensor count — allow optional tensors to be missing for SAM2.0 compat
     if (n_loaded != (int)model.tensors.size()) {
-        fprintf(stderr, "%s: tensor count mismatch: file has %d, model registered %zu\n",
-                __func__, n_loaded, model.tensors.size());
-        return false;
+        int n_missing = (int)model.tensors.size() - n_loaded;
+        if (model.hparams.is_sam2() && n_missing > 0 && n_missing <= 5) {
+            fprintf(stderr, "%s: %d optional tensors not in file (SAM2.0 compat, OK)\n",
+                    __func__, n_missing);
+        } else {
+            fprintf(stderr, "%s: tensor count mismatch: file has %d, model registered %zu\n",
+                    __func__, n_loaded, model.tensors.size());
+            return false;
+        }
     }
     return true;
 }
