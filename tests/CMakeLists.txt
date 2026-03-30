@@ -117,3 +117,7 @@ target_link_libraries(test_visual_only PRIVATE sam3)
 
 add_executable(test_visual_only_compare test_visual_only_compare.cpp)
 target_link_libraries(test_visual_only_compare PRIVATE sam3)
+
+add_executable(test_sam2_backbone_compare test_sam2_backbone_compare.cpp)
+target_link_libraries(test_sam2_backbone_compare PRIVATE sam3)
+

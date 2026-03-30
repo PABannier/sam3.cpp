@@ -3810,7 +3810,8 @@ static void sam2_build_hiera_graph(struct ggml_context* ctx,
                                            hp.hiera_embed_dim, 1));
     // Permute from [OW, OH, E, 1] to [E, OW, OH, 1] (channel-first convention)
     x = ggml_cont(ctx, ggml_permute(ctx, x, 1, 2, 0, 3));
-    // x: [E, 256, 256, 1] in ggml layout (assuming 1024 input)
+    ggml_set_name(x, "dbg_patch_embed");
+    ggml_set_output(x);
 
     // ── Add positional embedding (precomputed on CPU, uploaded as input) ─
     // PE is set externally as a named input tensor; added here.
@@ -3820,6 +3821,8 @@ static void sam2_build_hiera_graph(struct ggml_context* ctx,
     ggml_set_name(pe, "hiera_pos_embed");
     ggml_set_input(pe);
     x = ggml_add(ctx, x, pe);
+    ggml_set_name(x, "dbg_after_pe");
+    ggml_set_output(x);
 
     // ── Process all blocks ───────────────────────────────────────────────
     int spatial_H = hp.img_size / 4;
@@ -3830,6 +3833,14 @@ static void sam2_build_hiera_graph(struct ggml_context* ctx,
         const auto& blk = hiera.blocks[i];
 
         x = sam2_hiera_block_forward(ctx, x, blk, spatial_H, spatial_W);
+
+        // Mark key block outputs for debugging
+        if (i == 0 || i == 1 || i == 2 || i == 5 || i == 21) {
+            char dbg_name[64];
+            snprintf(dbg_name, sizeof(dbg_name), "dbg_block_%d", i);
+            ggml_set_name(x, dbg_name);
+            ggml_set_output(x);
+        }
 
         // Update spatial dims if Q-pooling happened
         if (blk.has_q_stride) {
@@ -5071,10 +5082,181 @@ bool sam3_encode_image_from_preprocessed(sam3_state& state,
 
     fprintf(stderr, "%s: encoding from preprocessed %dx%d\n", __func__, img_size, img_size);
 
+    // SAM2 dispatch: build a fake sam3_image and use the SAM2 encoder
+    if (hp.is_sam2()) {
+        state.orig_width = img_size;
+        state.orig_height = img_size;
+
+        // sam2_encode_image_hiera expects an image struct, but we have raw CHW data.
+        // We need to bypass preprocessing and inject the data directly into the graph.
+        // Build the Hiera graph, set the input from chw_data (already CHW normalized).
+
+        const size_t buf_size = ggml_tensor_overhead() * 16384 + ggml_graph_overhead() * 2;
+        struct ggml_init_params gparams = {buf_size, nullptr, true};
+        auto* ctx0 = ggml_init(gparams);
+        if (!ctx0) return false;
+
+        auto* inp = ggml_new_tensor_4d(ctx0, GGML_TYPE_F32, img_size, img_size, 3, 1);
+        ggml_set_name(inp, "input_image");
+        ggml_set_input(inp);
+
+        struct ggml_tensor* stage_outs[4] = {};
+        sam2_build_hiera_graph(ctx0, inp, model, stage_outs);
+
+        struct ggml_tensor* fpn_outs[4] = {};
+        sam2_build_fpn_neck_graph(ctx0, stage_outs, model, fpn_outs);
+
+        int n_fpn = 4 - hp.scalp;
+        for (int i = 0; i < n_fpn; ++i) {
+            char name[64];
+            snprintf(name, sizeof(name), "fpn_out_%d", i);
+            ggml_set_name(fpn_outs[i], name);
+            ggml_set_output(fpn_outs[i]);
+        }
+
+        auto* graph = ggml_new_graph_custom(ctx0, 32768, false);
+        for (int i = 0; i < n_fpn; ++i)
+            ggml_build_forward_expand(graph, fpn_outs[i]);
+
+        auto* galloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(model.backend));
+        if (!ggml_gallocr_reserve(galloc, graph) || !ggml_gallocr_alloc_graph(galloc, graph)) {
+            ggml_gallocr_free(galloc);
+            ggml_free(ctx0);
+            return false;
+        }
+
+        // Set input image — CHW data needs to go into ggml's [W, H, C, B] layout
+        // The input tensor is [img_size, img_size, 3, 1] in ggml = [W, H, C, B]
+        // CHW data: element (c, h, w) at c*H*W + h*W + w
+        // ggml data: element at w + h*W_stride... but ggml_conv_2d expects [W, H, C, B]
+        // which means ne[0]=W, ne[1]=H, ne[2]=C, ne[3]=B
+        // flat index: w + h*W + c*W*H + b*W*H*C
+        // CHW: c*H*W + h*W + w → same flat index! So we can just copy directly.
+        ggml_backend_tensor_set(inp, chw_data, 0, 3 * img_size * img_size * sizeof(float));
+
+        // Set positional embedding
+        {
+            int pe_H = img_size / 4, pe_W = img_size / 4;
+            auto pe_data = sam2_compute_pos_embed(model, pe_H, pe_W);
+            auto* pe_tensor = ggml_graph_get_tensor(graph, "hiera_pos_embed");
+            ggml_backend_tensor_set(pe_tensor, pe_data.data(), 0, pe_data.size() * sizeof(float));
+
+            // Dump PE if requested
+            const char* dump_dir = getenv("SAM2_DUMP_DIR");
+            if (dump_dir) {
+                char path[512];
+                snprintf(path, sizeof(path), "%s/cpp_pos_embed.bin", dump_dir);
+                FILE* f = fopen(path, "wb");
+                if (f) {
+                    fwrite(pe_data.data(), sizeof(float), pe_data.size(), f);
+                    fclose(f);
+                }
+                snprintf(path, sizeof(path), "%s/cpp_pos_embed.shape", dump_dir);
+                f = fopen(path, "w");
+                if (f) {
+                    fprintf(f, "%d,%d,%d,%d", hp.hiera_embed_dim, pe_W, pe_H, 1);
+                    fclose(f);
+                }
+                fprintf(stderr, "  [DUMP] cpp_pos_embed: [%d,%d,%d,1]\n",
+                        hp.hiera_embed_dim, pe_W, pe_H);
+            }
+        }
+
+        if (ggml_backend_is_cpu(model.backend))
+            ggml_backend_cpu_set_n_threads(model.backend, state.n_threads);
+        if (ggml_backend_graph_compute(model.backend, graph) != GGML_STATUS_SUCCESS) {
+            ggml_gallocr_free(galloc);
+            ggml_free(ctx0);
+            return false;
+        }
+
+        // Dump debug tensors if SAM2_DUMP_DIR is set
+        {
+            const char* dump_dir = getenv("SAM2_DUMP_DIR");
+            if (dump_dir) {
+                const char* dbg_names[] = {
+                    "dbg_patch_embed", "dbg_after_pe",
+                    "dbg_block_0", "dbg_block_1", "dbg_block_2",
+                    "dbg_block_5", "dbg_block_21",
+                };
+                for (const char* dn : dbg_names) {
+                    auto* t = ggml_graph_get_tensor(graph, dn);
+                    if (!t) continue;
+                    int64_t nb = ggml_nbytes(t);
+                    std::vector<char> buf(nb);
+                    ggml_backend_tensor_get(t, buf.data(), 0, nb);
+                    char path[512];
+                    snprintf(path, sizeof(path), "%s/%s.bin", dump_dir, dn);
+                    FILE* f = fopen(path, "wb");
+                    if (f) { fwrite(buf.data(), 1, nb, f); fclose(f); }
+                    snprintf(path, sizeof(path), "%s/%s.shape", dump_dir, dn);
+                    f = fopen(path, "w");
+                    if (f) {
+                        fprintf(f, "%lld,%lld,%lld,%lld",
+                                (long long)t->ne[0], (long long)t->ne[1],
+                                (long long)t->ne[2], (long long)t->ne[3]);
+                        fclose(f);
+                    }
+                    fprintf(stderr, "  [DUMP] %s: [%lld,%lld,%lld,%lld]\n", dn,
+                            (long long)t->ne[0], (long long)t->ne[1],
+                            (long long)t->ne[2], (long long)t->ne[3]);
+                }
+            }
+        }
+
+        // Copy to state (same as sam2_encode_image_hiera)
+        if (state.buffer) { ggml_backend_buffer_free(state.buffer); state.buffer = nullptr; }
+        if (state.pe_buf) { ggml_backend_buffer_free(state.pe_buf); state.pe_buf = nullptr; }
+        if (state.pe_ctx) { ggml_free(state.pe_ctx); state.pe_ctx = nullptr; }
+        if (state.ctx) { ggml_free(state.ctx); state.ctx = nullptr; }
+
+        size_t state_ctx_size = ggml_tensor_overhead() * 32;
+        struct ggml_init_params sparams = {state_ctx_size, nullptr, true};
+        state.ctx = ggml_init(sparams);
+
+        for (int i = 0; i < n_fpn; ++i) {
+            auto* src = fpn_outs[i];
+            state.neck_trk[i] = ggml_new_tensor_4d(state.ctx, GGML_TYPE_F32,
+                                                     src->ne[0], src->ne[1], src->ne[2], src->ne[3]);
+        }
+        for (int i = n_fpn; i < 4; ++i) state.neck_trk[i] = nullptr;
+
+        state.buffer = ggml_backend_alloc_ctx_tensors(state.ctx, model.backend);
+        for (int i = 0; i < n_fpn; ++i) {
+            int64_t n_bytes = ggml_nbytes(state.neck_trk[i]);
+            std::vector<char> buf(n_bytes);
+            ggml_backend_tensor_get(fpn_outs[i], buf.data(), 0, n_bytes);
+            ggml_backend_tensor_set(state.neck_trk[i], buf.data(), 0, n_bytes);
+        }
+
+        // Compute sinusoidal PE
+        size_t pe_ctx_size = ggml_tensor_overhead() * 16;
+        struct ggml_init_params pe_params = {pe_ctx_size, nullptr, true};
+        state.pe_ctx = ggml_init(pe_params);
+        for (int i = 0; i < n_fpn; ++i) {
+            int H = (int)state.neck_trk[i]->ne[2];
+            int W = (int)state.neck_trk[i]->ne[1];
+            state.neck_trk_pe[i] = ggml_new_tensor_4d(state.pe_ctx, GGML_TYPE_F32, hp.neck_dim, W, H, 1);
+        }
+        state.pe_buf = ggml_backend_alloc_ctx_tensors(state.pe_ctx, model.backend);
+        for (int i = 0; i < n_fpn; ++i) {
+            int H = (int)state.neck_trk[i]->ne[2];
+            int W = (int)state.neck_trk[i]->ne[1];
+            auto pe = sam3_sinusoidal_pe_2d(H, W, hp.neck_dim);
+            ggml_backend_tensor_set(state.neck_trk_pe[i], pe.data(), 0, pe.size() * sizeof(float));
+        }
+
+        ggml_gallocr_free(galloc);
+        ggml_free(ctx0);
+
+        fprintf(stderr, "%s: SAM2 encoding from preprocessed done\n", __func__);
+        return true;
+    }
+
     state.orig_width = img_size;
     state.orig_height = img_size;
 
-    // ── Build computation graph ──
+    // ── Build computation graph (SAM3 path) ──
     const size_t buf_size = ggml_tensor_overhead() * 8192 + ggml_graph_overhead() * 2;
     struct ggml_init_params gparams = {
         /*.mem_size   =*/buf_size,
