@@ -70,6 +70,7 @@ DEFAULT_HPARAMS = {
     "iou_prediction_use_sigmoid":          1,
     "use_mask_input_as_output":            1,
     "multimask_output_in_sam":             1,
+    "is_sam2_1":                           1,  # 0 = SAM2.0, 1 = SAM2.1
 }
 
 
@@ -271,6 +272,7 @@ def write_header(fout, ftype: int, n_tensors: int, hparams: dict):
         "iou_prediction_use_sigmoid",
         "use_mask_input_as_output",
         "multimask_output_in_sam",
+        "is_sam2_1",
     ]:
         fout.write(struct.pack("<i", hp[flag]))
 
@@ -431,6 +433,14 @@ def load_config_yaml(config_path: str) -> dict:
     if "iou_prediction_use_sigmoid" in sam_dec:
         hp["iou_prediction_use_sigmoid"] = int(bool(sam_dec["iou_prediction_use_sigmoid"]))
 
+    # Detect SAM2.0 vs 2.1 from config path or features
+    if "sam2.1" in config_path:
+        hp["is_sam2_1"] = 1
+    elif "no_obj_embed_spatial" in model_cfg:
+        hp["is_sam2_1"] = 1
+    else:
+        hp["is_sam2_1"] = 0
+
     return hp
 
 
@@ -472,6 +482,11 @@ def main():
         print(f"  Auto-detected variant: {variant}")
         hparams = dict(DEFAULT_HPARAMS)
         hparams.update(VARIANTS[variant])
+
+    # Detect SAM2.0 vs SAM2.1 from checkpoint tensor names
+    is_sam2_1 = int("no_obj_embed_spatial" in state_dict)
+    hparams["is_sam2_1"] = is_sam2_1
+    print(f"  SAM2 version: {'2.1' if is_sam2_1 else '2.0'}")
 
     # Print key hyperparameters
     print(f"  embed_dim={hparams['hiera_embed_dim']}, stages={hparams['hiera_stages']}")

@@ -140,6 +140,7 @@ struct sam3_hparams {
     int32_t iou_prediction_use_sigmoid          = 1;
     int32_t use_mask_input_as_output            = 1;
     int32_t multimask_output_in_sam             = 1;
+    int32_t is_sam2_1                           = 1;  // 0 = SAM2.0, 1 = SAM2.1
 
     // ── SAM3 derived helpers ────────────────────────────────────────────
     int32_t n_img_embd() const { return img_size / patch_size; }            // 72
@@ -1419,6 +1420,7 @@ static bool sam2_load_hparams(std::ifstream& fin, sam3_hparams& hp) {
     rd(hp.iou_prediction_use_sigmoid);
     rd(hp.use_mask_input_as_output);
     rd(hp.multimask_output_in_sam);
+    rd(hp.is_sam2_1);
 
     hp.model_type = SAM3_MODEL_SAM2;
 
@@ -1426,7 +1428,7 @@ static bool sam2_load_hparams(std::ifstream& fin, sam3_hparams& hp) {
 }
 
 static void sam2_print_hparams(const sam3_hparams& hp) {
-    fprintf(stderr, "  model_type        = SAM2\n");
+    fprintf(stderr, "  model_type        = SAM2%s\n", hp.is_sam2_1 ? ".1" : ".0");
     fprintf(stderr, "  img_size          = %d\n", hp.img_size);
     fprintf(stderr, "  hiera_embed_dim   = %d\n", hp.hiera_embed_dim);
     fprintf(stderr, "  hiera_num_heads   = %d\n", hp.hiera_num_heads);
@@ -1821,13 +1823,17 @@ static void sam2_register_tensors(sam3_model& model) {
         model.obj_ptr_proj_b[j] = T1f(bp + ".bias", D);
     }
     model.no_obj_ptr = T2f("no_obj_ptr", D, 1);
-    model.obj_ptr_tpos_w = T2("obj_ptr_tpos_proj.weight", D, MD);
-    model.obj_ptr_tpos_b = T1f("obj_ptr_tpos_proj.bias", MD);
+    if (hp.is_sam2_1) {
+        model.obj_ptr_tpos_w = T2("obj_ptr_tpos_proj.weight", D, MD);
+        model.obj_ptr_tpos_b = T1f("obj_ptr_tpos_proj.bias", MD);
+    }
 
     // ── SAM2 top-level tensors ───────────────────────────────────────────
     model.no_mem_embed = T3f("no_mem_embed", D, 1, 1);
     model.no_mem_pos_enc = T3f("no_mem_pos_enc", D, 1, 1);
-    model.no_obj_embed_spatial = T2f("no_obj_embed_spatial", MD, 1);
+    if (hp.is_sam2_1) {
+        model.no_obj_embed_spatial = T2f("no_obj_embed_spatial", MD, 1);
+    }
     T4f("trk_mask_ds.weight", 4, 4, 1, 1);
     T1f("trk_mask_ds.bias", 1);
 }
@@ -2562,17 +2568,10 @@ static bool sam3_load_tensors(std::ifstream& fin, sam3_model& model, int n_tenso
     fprintf(stderr, "%s: loaded %d tensors (registered %zu)\n",
             __func__, n_loaded, model.tensors.size());
 
-    // Check tensor count — allow optional tensors to be missing for SAM2.0 compat
     if (n_loaded != (int)model.tensors.size()) {
-        int n_missing = (int)model.tensors.size() - n_loaded;
-        if (model.hparams.is_sam2() && n_missing > 0 && n_missing <= 5) {
-            fprintf(stderr, "%s: %d optional tensors not in file (SAM2.0 compat, OK)\n",
-                    __func__, n_missing);
-        } else {
-            fprintf(stderr, "%s: tensor count mismatch: file has %d, model registered %zu\n",
-                    __func__, n_loaded, model.tensors.size());
-            return false;
-        }
+        fprintf(stderr, "%s: tensor count mismatch: file has %d, model registered %zu\n",
+                __func__, n_loaded, model.tensors.size());
+        return false;
     }
     return true;
 }
@@ -9416,10 +9415,10 @@ static bool sam3_encode_memory(
     std::vector<float> md(MD * H * H);
     ggml_backend_tensor_get(mo, md.data(), 0, md.size() * sizeof(float));
 
-    // Apply no_obj_embed_spatial if occluded
-    if (obj_score <= 0.0f) {
+    // Apply no_obj_embed_spatial if occluded (SAM2.1 only)
+    if (obj_score <= 0.0f && model.no_obj_embed_spatial) {
         std::vector<float> no_obj_emb(MD);
-        auto* noe = model.tensors.at("no_obj_embed_spatial");
+        auto* noe = model.no_obj_embed_spatial;
         if (noe->type == GGML_TYPE_F16) {
             std::vector<ggml_fp16_t> tmp(MD);
             ggml_backend_tensor_get(noe, tmp.data(), 0, MD * sizeof(ggml_fp16_t));
@@ -11759,9 +11758,9 @@ static bool sam3_test_dump_phase7_mem_slot_current(
     mem_out_data.resize(MD * H * H);
     ggml_backend_tensor_get(mo, mem_out_data.data(), 0, mem_out_data.size() * sizeof(float));
 
-    if (obj_score <= 0.0f) {
+    if (obj_score <= 0.0f && model.no_obj_embed_spatial) {
         std::vector<float> no_obj_emb(MD);
-        auto* noe = model.tensors.at("no_obj_embed_spatial");
+        auto* noe = model.no_obj_embed_spatial;
         if (noe->type == GGML_TYPE_F16) {
             std::vector<ggml_fp16_t> tmp(MD);
             ggml_backend_tensor_get(noe, tmp.data(), 0, MD * sizeof(ggml_fp16_t));

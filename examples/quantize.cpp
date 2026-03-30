@@ -83,10 +83,9 @@ static bool sam3_quantize_model(const std::string & fname_inp,
     };
 
     if (is_sam2) {
-        // SAM2 header: 56 int32 fields (see sam2_load_hparams / write_header)
-        // img_size(1) + backbone_type(1) + hiera(5+4+1+8+1+4+3) + fpn(2+4) + sam(4) + mem(4) + sig(2) + flags(14) = 56 - 2 = wait
-        // Actually: 2 + 3 + 4 + 1 + 8 + 1 + 4 + 3 + 2 + 4 + 4 + 4 + 2 + 14 = 56
-        for (int i = 0; i < 56; ++i) copy_i32();
+        // SAM2 header: 57 int32 fields (see sam2_load_hparams / write_header)
+        // 2 + 3 + 4 + 1 + 8 + 1 + 4 + 3 + 2 + 4 + 4 + 4 + 2 + 15 = 57
+        for (int i = 0; i < 57; ++i) copy_i32();
     } else {
         // SAM3 header
         copy_i32();  // img_size
