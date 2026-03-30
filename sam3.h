@@ -20,6 +20,16 @@ struct sam3_tracker_deleter { void operator()(sam3_tracker * p) const; };
 using sam3_state_ptr   = std::unique_ptr<sam3_state,   sam3_state_deleter>;
 using sam3_tracker_ptr = std::unique_ptr<sam3_tracker,  sam3_tracker_deleter>;
 
+/*
+** ── Model Type ──────────────────────────────────────────────────────────
+*/
+
+enum sam3_model_type {
+    SAM3_MODEL_SAM3        = 0,  // Full SAM3 (ViT + detector + tracker)
+    SAM3_MODEL_SAM3_VISUAL = 1,  // SAM3 visual-only (ViT + tracker, no text)
+    SAM3_MODEL_SAM2        = 2,  // SAM2 (Hiera + tracker, no text/detector)
+};
+
 /*****************************************************************************
 ** Public Data Types
 **
@@ -164,8 +174,12 @@ std::shared_ptr<sam3_model> sam3_load_model(const sam3_params & params);
 /* Free all resources held by a loaded model. */
 void sam3_free_model(sam3_model & model);
 
-/* Returns true if the model was loaded as visual-only (no text/detector path). */
+/* Returns true if the model was loaded as visual-only (no text/detector path).
+** SAM2 models are always considered visual-only. */
 bool sam3_is_visual_only(const sam3_model & model);
+
+/* Returns the model type (SAM2 or SAM3). */
+sam3_model_type sam3_get_model_type(const sam3_model & model);
 
 /*
 ** ── Inference State ──────────────────────────────────────────────────────

@@ -99,6 +99,9 @@ struct app_state {
     char                status[256] = "Ready.";
     bool                busy        = false;
     pending_action      pending     = ACTION_NONE;
+
+    // Model type
+    bool                visual_only = false;  // true for SAM2 / SAM3 visual-only
 };
 
 static GLuint upload_texture(const uint8_t* data, int w, int h, int ch, GLuint existing = 0) {
@@ -183,6 +186,10 @@ static void load_image(app_state& app, const char* path) {
 
 static void run_pcs(app_state& app) {
     if (!app.image_encoded) return;
+    if (app.visual_only) {
+        snprintf(app.status, sizeof(app.status), "PCS not available for this model.");
+        return;
+    }
     snprintf(app.status, sizeof(app.status), "Running PCS...");
     app.busy = true;
 
@@ -380,7 +387,18 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    snprintf(app.status, sizeof(app.status), "Model loaded. Open an image or use --image.");
+    app.visual_only = sam3_is_visual_only(*app.model);
+    if (app.visual_only) {
+        auto mt = sam3_get_model_type(*app.model);
+        fprintf(stderr, "Model: %s — PCS (text) mode disabled\n",
+                mt == SAM3_MODEL_SAM2 ? "SAM2" : "SAM3 visual-only");
+        app.mode = MODE_POINTS;
+        snprintf(app.status, sizeof(app.status),
+                 "%s model loaded (PVS only). Open an image or use --image.",
+                 mt == SAM3_MODEL_SAM2 ? "SAM2" : "SAM3 visual-only");
+    } else {
+        snprintf(app.status, sizeof(app.status), "Model loaded. Open an image or use --image.");
+    }
 
     // Load initial image if provided
     if (image_path) {
@@ -436,19 +454,21 @@ int main(int argc, char** argv) {
 
         // ── Top bar: text prompt + buttons ───────────────────────────────────
 
-        ImGui::Text("Text prompt:");
-        ImGui::SameLine();
-        ImGui::SetNextItemWidth(300);
-        bool enter_pressed = ImGui::InputText("##prompt", app.text_prompt,
-                                               sizeof(app.text_prompt),
-                                               ImGuiInputTextFlags_EnterReturnsTrue);
-        ImGui::SameLine();
-        if ((ImGui::Button("Segment") || enter_pressed) && app.image_encoded) {
-            app.busy = true;
-            app.pending = ACTION_PCS;
-            snprintf(app.status, sizeof(app.status), "Segmenting...");
+        if (!app.visual_only) {
+            ImGui::Text("Text prompt:");
+            ImGui::SameLine();
+            ImGui::SetNextItemWidth(300);
+            bool enter_pressed = ImGui::InputText("##prompt", app.text_prompt,
+                                                   sizeof(app.text_prompt),
+                                                   ImGuiInputTextFlags_EnterReturnsTrue);
+            ImGui::SameLine();
+            if ((ImGui::Button("Segment") || enter_pressed) && app.image_encoded) {
+                app.busy = true;
+                app.pending = ACTION_PCS;
+                snprintf(app.status, sizeof(app.status), "Segmenting...");
+            }
+            ImGui::SameLine();
         }
-        ImGui::SameLine();
         if (ImGui::Button("Clear")) {
             app.result = {};
             app.pos_points.clear();
@@ -472,7 +492,14 @@ int main(int argc, char** argv) {
         ImGui::SameLine();
         if (ImGui::RadioButton("Box (PVS)", app.mode == MODE_BOX_PVS)) app.mode = MODE_BOX_PVS;
         ImGui::SameLine();
-        if (ImGui::RadioButton("Exemplar (PCS)", app.mode == MODE_EXEMPLAR_PCS)) app.mode = MODE_EXEMPLAR_PCS;
+        if (!app.visual_only) {
+            if (ImGui::RadioButton("Exemplar (PCS)", app.mode == MODE_EXEMPLAR_PCS))
+                app.mode = MODE_EXEMPLAR_PCS;
+        } else {
+            ImGui::BeginDisabled();
+            ImGui::RadioButton("Exemplar (PCS)", false);
+            ImGui::EndDisabled();
+        }
 
         // ── Image canvas ─────────────────────────────────────────────────────
 
@@ -665,7 +692,7 @@ int main(int argc, char** argv) {
         else if (app.mode == MODE_BOX_PVS)
             ImGui::TextColored(ImVec4(0.5f, 0.5f, 0.5f, 1.0f),
                 "Drag: bounding box (PVS) | Left-click: +point | Right-click: -point");
-        else
+        else if (!app.visual_only)
             ImGui::TextColored(ImVec4(0.5f, 0.5f, 0.5f, 1.0f),
                 "Drag: exemplar box | Type text and press Segment");
 

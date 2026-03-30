@@ -92,6 +92,10 @@ struct vapp_state {
     // Status
     char                    status[256] = "Ready.";
     bool                    busy = false;
+
+    // Model type
+    bool                    visual_only = false;
+    sam3_visual_track_params visual_track_params;
 };
 
 static GLuint upload_texture(const uint8_t* data, int w, int h, int ch, GLuint existing = 0) {
@@ -151,19 +155,24 @@ static bool screen_to_image(const vapp_state& app, float sx, float sy,
 }
 
 static void create_tracker(vapp_state& app) {
-    if (app.init_mode == VMODE_TEXT) {
-        app.track_params.text_prompt = app.text_prompt;
+    if (app.visual_only) {
+        // SAM2 / visual-only: use visual tracker (no text detection)
+        app.visual_track_params.assoc_iou_threshold = app.track_params.assoc_iou_threshold;
+        app.visual_track_params.max_keep_alive      = app.track_params.max_keep_alive;
+        app.visual_track_params.recondition_every    = app.track_params.recondition_every;
+        app.visual_track_params.fill_hole_area       = app.track_params.fill_hole_area;
+        app.tracker = sam3_create_visual_tracker(*app.model, app.visual_track_params);
     } else {
-        // Box/Points modes: create tracker with empty text (no auto-detection)
-        app.track_params.text_prompt = "";
+        if (app.init_mode == VMODE_TEXT)
+            app.track_params.text_prompt = app.text_prompt;
+        else
+            app.track_params.text_prompt = "";
+        app.tracker = sam3_create_tracker(*app.model, app.track_params);
     }
-    app.tracker = sam3_create_tracker(*app.model, app.track_params);
     app.tracker_created = (app.tracker != nullptr);
-    if (app.tracker_created) {
-        snprintf(app.status, sizeof(app.status), "Tracker created. Press Play or add instances.");
-    } else {
-        snprintf(app.status, sizeof(app.status), "Failed to create tracker.");
-    }
+    snprintf(app.status, sizeof(app.status), app.tracker_created
+             ? "Tracker created. Press Play or add instances."
+             : "Failed to create tracker.");
 }
 
 static void decode_and_track(vapp_state& app, int fi) {
@@ -176,7 +185,10 @@ static void decode_and_track(vapp_state& app, int fi) {
     app.frame_index = fi;
 
     if (app.tracker_created) {
-        app.result = sam3_track_frame(*app.tracker, *app.state, *app.model, app.frame);
+        if (app.visual_only)
+            app.result = sam3_propagate_frame(*app.tracker, *app.state, *app.model, app.frame);
+        else
+            app.result = sam3_track_frame(*app.tracker, *app.state, *app.model, app.frame);
         app.frame_encoded = true;
         snprintf(app.status, sizeof(app.status), "Frame %d/%d — %d objects tracked",
                  fi, app.video_info.n_frames, (int)app.result.detections.size());
@@ -351,6 +363,14 @@ int main(int argc, char** argv) {
     if (!app.state) {
         fprintf(stderr, "Failed to create state.\n");
         return 1;
+    }
+
+    app.visual_only = sam3_is_visual_only(*app.model);
+    if (app.visual_only) {
+        auto mt = sam3_get_model_type(*app.model);
+        fprintf(stderr, "Model: %s — text tracking disabled\n",
+                mt == SAM3_MODEL_SAM2 ? "SAM2" : "SAM3 visual-only");
+        app.init_mode = VMODE_BOX;
     }
 
     // ── Load video info ──────────────────────────────────────────────────────
@@ -534,11 +554,13 @@ int main(int argc, char** argv) {
         // Mode selector
         ImGui::Text("Mode:");
         ImGui::SameLine();
-        if (ImGui::RadioButton("Text", app.init_mode == VMODE_TEXT)) {
-            app.init_mode = VMODE_TEXT;
-            clear_init_prompts(app);
+        if (!app.visual_only) {
+            if (ImGui::RadioButton("Text", app.init_mode == VMODE_TEXT)) {
+                app.init_mode = VMODE_TEXT;
+                clear_init_prompts(app);
+            }
+            ImGui::SameLine();
         }
-        ImGui::SameLine();
         if (ImGui::RadioButton("Box", app.init_mode == VMODE_BOX)) {
             app.init_mode = VMODE_BOX;
             clear_init_prompts(app);
@@ -549,8 +571,8 @@ int main(int argc, char** argv) {
             clear_init_prompts(app);
         }
 
-        // Text prompt (shown in all modes, but only used for VMODE_TEXT tracking)
-        if (app.init_mode == VMODE_TEXT) {
+        // Text prompt (only for VMODE_TEXT on full SAM3 models)
+        if (app.init_mode == VMODE_TEXT && !app.visual_only) {
             ImGui::SameLine();
             ImGui::Text("  Text:");
             ImGui::SameLine();
@@ -592,6 +614,8 @@ int main(int argc, char** argv) {
             app.result = {};
             app.frame_index = 0;
             clear_init_prompts(app);
+            if (app.visual_only && app.init_mode == VMODE_TEXT)
+                app.init_mode = VMODE_BOX;
             if (!app.video_path.empty()) {
                 app.frame = sam3_decode_video_frame(app.video_path, 0);
             }
@@ -742,7 +766,7 @@ int main(int argc, char** argv) {
         }
 
         // Context-sensitive help
-        if (app.init_mode == VMODE_TEXT)
+        if (app.init_mode == VMODE_TEXT && !app.visual_only)
             ImGui::TextColored(ImVec4(0.5f, 0.5f, 0.5f, 1.0f),
                 "Text mode: auto-detect via text prompt | Click on mask to refine");
         else if (app.init_mode == VMODE_BOX)

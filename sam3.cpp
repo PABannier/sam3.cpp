@@ -46,8 +46,10 @@
 *****************************************************************************/
 
 static constexpr uint32_t SAM3_MAGIC     = 0x73616D33;  // "sam3"
+static constexpr uint32_t SAM2_MAGIC     = 0x73616D32;  // "sam2"
 static constexpr uint32_t SAM3_TOK_MAGIC = 0x746F6B00;  // "tok\0"
 static constexpr int      SAM3_VERSION   = 3;
+static constexpr int      SAM2_VERSION   = 1;
 
 
 /*****************************************************************************
@@ -55,6 +57,10 @@ static constexpr int      SAM3_VERSION   = 3;
 *****************************************************************************/
 
 struct sam3_hparams {
+    // ── Model type ───────────────────────────────────────────────────────
+    sam3_model_type model_type = SAM3_MODEL_SAM3;
+
+    // ── SAM3 fields (unchanged) ─────────────────────────────────────────
     int32_t img_size        = 1008;
     int32_t patch_size      = 14;
     int32_t vit_embed_dim   = 1024;
@@ -101,7 +107,41 @@ struct sam3_hparams {
 
     int32_t visual_only     = 0;  // 1 = no text encoder / detector path
 
-    // derived helpers
+    // ── SAM2-specific Hiera backbone fields ─────────────────────────────
+    int32_t hiera_embed_dim      = 144;
+    int32_t hiera_num_heads      = 2;
+    int32_t hiera_num_stages     = 4;
+    int32_t hiera_stages[4]      = {2, 6, 36, 4};
+    int32_t hiera_q_pool         = 3;
+    int32_t hiera_window_spec[4] = {8, 4, 16, 8};
+    int32_t hiera_global_n       = 3;
+    int32_t hiera_global_idx[8]  = {23, 33, 43, 0, 0, 0, 0, 0};
+    int32_t hiera_pos_embed_bkg_h = 7;
+    int32_t hiera_pos_embed_bkg_w = 7;
+
+    int32_t fpn_top_down_n         = 2;
+    int32_t fpn_top_down_levels[4] = {2, 3, 0, 0};
+    int32_t scalp                  = 1;
+
+    // ── SAM2-specific memory/tracking flags ─────────────────────────────
+    int32_t sigmoid_scale_x100                  = 2000;
+    int32_t sigmoid_bias_x100                   = -1000;
+    int32_t use_high_res_features               = 1;
+    int32_t use_obj_ptrs_in_encoder             = 1;
+    int32_t pred_obj_scores                     = 1;
+    int32_t use_multimask_token_for_obj_ptr     = 1;
+    int32_t directly_add_no_mem_embed           = 1;
+    int32_t non_overlap_masks_for_mem_enc       = 1;
+    int32_t binarize_mask_from_pts              = 0;
+    int32_t multimask_output_for_tracking       = 1;
+    int32_t multimask_min_pt_num                = 0;
+    int32_t multimask_max_pt_num                = 1;
+    int32_t fixed_no_obj_ptr                    = 1;
+    int32_t iou_prediction_use_sigmoid          = 1;
+    int32_t use_mask_input_as_output            = 1;
+    int32_t multimask_output_in_sam             = 1;
+
+    // ── SAM3 derived helpers ────────────────────────────────────────────
     int32_t n_img_embd() const { return img_size / patch_size; }            // 72
     int32_t n_img_tokens() const { return n_img_embd() * n_img_embd(); }    // 5184
     int32_t vit_head_dim() const { return vit_embed_dim / vit_num_heads; }  // 64
@@ -109,6 +149,56 @@ struct sam3_hparams {
     bool is_global_attn(int layer) const {
         for (int i = 0; i < n_global_attn; ++i) {
             if (global_attn_idx[i] == layer) return true;
+        }
+        return false;
+    }
+
+    // ── SAM2 derived helpers ────────────────────────────────────────────
+    bool is_sam2() const { return model_type == SAM3_MODEL_SAM2; }
+
+    int32_t hiera_total_blocks() const {
+        int s = 0;
+        for (int i = 0; i < hiera_num_stages; ++i) s += hiera_stages[i];
+        return s;
+    }
+
+    int32_t hiera_feat_size() const {
+        int s = img_size / 4;
+        int n_pools = (hiera_q_pool < hiera_num_stages) ? hiera_q_pool : hiera_num_stages - 1;
+        for (int i = 0; i < n_pools; ++i) s /= 2;
+        for (int i = 0; i < scalp; ++i) s *= 2;
+        return s;
+    }
+
+    int32_t hiera_stage_dim(int stage) const {
+        int d = hiera_embed_dim;
+        for (int i = 0; i < stage; ++i) d *= 2;
+        return d;
+    }
+
+    int32_t hiera_stage_heads(int stage) const {
+        int h = hiera_num_heads;
+        for (int i = 0; i < stage; ++i) h *= 2;
+        return h;
+    }
+
+    int32_t hiera_stage_spatial(int stage) const {
+        int s = img_size / 4;
+        for (int i = 1; i <= stage && i <= hiera_q_pool; ++i) s /= 2;
+        return s;
+    }
+
+    float sigmoid_scale() const { return sigmoid_scale_x100 / 100.0f; }
+    float sigmoid_bias()  const { return sigmoid_bias_x100  / 100.0f; }
+
+    // Feature size for the active backbone
+    int32_t feat_size() const {
+        return is_sam2() ? hiera_feat_size() : n_img_embd();
+    }
+
+    bool is_hiera_global_attn(int block_idx) const {
+        for (int i = 0; i < hiera_global_n; ++i) {
+            if (hiera_global_idx[i] == block_idx) return true;
         }
         return false;
     }
@@ -540,6 +630,54 @@ struct sam3_bpe_tokenizer {
     int eot_token = 49407;
 };
 
+/*
+** ── SAM2 Hiera Backbone ─────────────────────────────────────────────────
+*/
+
+struct sam2_hiera_block {
+    struct ggml_tensor* norm1_w     = nullptr;
+    struct ggml_tensor* norm1_b     = nullptr;
+    struct ggml_tensor* qkv_w       = nullptr;  // [3*dim_out, dim_in]
+    struct ggml_tensor* qkv_b       = nullptr;  // [3*dim_out]
+    struct ggml_tensor* proj_w      = nullptr;  // [dim_out, dim_out]
+    struct ggml_tensor* proj_b      = nullptr;  // [dim_out]
+    struct ggml_tensor* norm2_w     = nullptr;
+    struct ggml_tensor* norm2_b     = nullptr;
+    struct ggml_tensor* mlp_fc1_w   = nullptr;
+    struct ggml_tensor* mlp_fc1_b   = nullptr;
+    struct ggml_tensor* mlp_fc2_w   = nullptr;
+    struct ggml_tensor* mlp_fc2_b   = nullptr;
+    struct ggml_tensor* dim_proj_w  = nullptr;  // stage transition only
+    struct ggml_tensor* dim_proj_b  = nullptr;
+
+    // metadata (set during loading)
+    int stage_idx     = -1;
+    int dim_in        = 0;
+    int dim_out       = 0;
+    int num_heads     = 0;
+    int window_size   = 0;  // 0 = global attention
+    bool has_q_stride = false;
+};
+
+struct sam2_hiera {
+    struct ggml_tensor* patch_embed_w  = nullptr;  // [embed_dim, 3, 7, 7]
+    struct ggml_tensor* patch_embed_b  = nullptr;  // [embed_dim]
+    struct ggml_tensor* pos_embed      = nullptr;  // [1, embed_dim, bkg_H, bkg_W]
+    struct ggml_tensor* pos_embed_window = nullptr; // [1, embed_dim, W0, W0]
+
+    std::vector<sam2_hiera_block> blocks;
+    int stage_ends[4] = {};
+};
+
+struct sam2_fpn_level {
+    struct ggml_tensor* conv_w = nullptr;  // Conv2d(backbone_ch, d_model, k=1)
+    struct ggml_tensor* conv_b = nullptr;
+};
+
+struct sam2_fpn_neck {
+    sam2_fpn_level levels[4];
+};
+
 /*****************************************************************************
 ** Top-Level Opaque Types (defined here, forward-declared in sam3.h)
 *****************************************************************************/
@@ -548,6 +686,7 @@ struct sam3_model {
     sam3_hparams        hparams;
     ggml_type           weight_type = GGML_TYPE_F16;
 
+    // ── SAM3-specific (loaded only when model_type != SAM2) ──────────────
     sam3_vit            vit;
     sam3_neck           neck_det;
     sam3_neck           neck_trk;
@@ -557,6 +696,11 @@ struct sam3_model {
     sam3_geom_encoder   geom_enc;
     sam3_seg_head       seg_head;
 
+    // ── SAM2-specific (loaded only when model_type == SAM2) ──────────────
+    sam2_hiera          hiera;
+    sam2_fpn_neck       fpn_neck;
+
+    // ── Shared (loaded for both SAM2 and SAM3) ──────────────────────────
     sam3_sam_prompt_enc sam_pe;
     sam3_sam_mask_dec   sam_dec;
     sam3_mem_enc        mem_enc;
@@ -569,7 +713,14 @@ struct sam3_model {
     struct ggml_tensor* obj_ptr_tpos_w     = nullptr;
     struct ggml_tensor* obj_ptr_tpos_b     = nullptr;
 
-    // precomputed RoPE frequencies
+    // standalone tracker/SAM2 top-level tensors
+    struct ggml_tensor* no_mem_embed       = nullptr;  // [1, 1, 256]
+    struct ggml_tensor* no_mem_pos_enc     = nullptr;  // [1, 1, 256]
+    struct ggml_tensor* no_obj_embed_spatial = nullptr; // [1, 64]
+    struct ggml_tensor* mem_attn_norm_w    = nullptr;
+    struct ggml_tensor* mem_attn_norm_b    = nullptr;
+
+    // precomputed RoPE frequencies (SAM3 only)
     struct ggml_tensor* rope_freqs         = nullptr;  // [n_img_tokens, head_dim]
 
     // ggml backend
@@ -1216,6 +1367,470 @@ static void sam3_print_hparams(const sam3_hparams& hp) {
     fprintf(stderr, "  visual_only    = %d\n", hp.visual_only);
 }
 
+// ── SAM2-specific loading ─────────────────────────────────────────────────
+
+static bool sam2_load_hparams(std::ifstream& fin, sam3_hparams& hp) {
+    auto rd = [&](int32_t& v) { fin.read(reinterpret_cast<char*>(&v), 4); };
+
+    rd(hp.img_size);
+    int32_t backbone_type;
+    rd(backbone_type);  // 1 = hiera
+
+    rd(hp.hiera_embed_dim);
+    rd(hp.hiera_num_heads);
+    rd(hp.hiera_num_stages);
+    for (int i = 0; i < 4; ++i) rd(hp.hiera_stages[i]);
+    rd(hp.hiera_global_n);
+    for (int i = 0; i < 8; ++i) rd(hp.hiera_global_idx[i]);
+    rd(hp.hiera_q_pool);
+    for (int i = 0; i < 4; ++i) rd(hp.hiera_window_spec[i]);
+    rd(hp.hiera_pos_embed_bkg_h);
+    rd(hp.hiera_pos_embed_bkg_w);
+    rd(hp.scalp);
+
+    rd(hp.neck_dim);
+    rd(hp.fpn_top_down_n);
+    for (int i = 0; i < 4; ++i) rd(hp.fpn_top_down_levels[i]);
+
+    rd(hp.sam_embed_dim);
+    rd(hp.sam_dec_depth);
+    rd(hp.sam_n_multimask);
+    rd(hp.sam_iou_head_depth);
+
+    rd(hp.mem_out_dim);
+    rd(hp.mem_attn_layers);
+    rd(hp.num_maskmem);
+    rd(hp.max_obj_ptrs);
+
+    rd(hp.sigmoid_scale_x100);
+    rd(hp.sigmoid_bias_x100);
+
+    rd(hp.use_high_res_features);
+    rd(hp.use_obj_ptrs_in_encoder);
+    rd(hp.pred_obj_scores);
+    rd(hp.use_multimask_token_for_obj_ptr);
+    rd(hp.directly_add_no_mem_embed);
+    rd(hp.non_overlap_masks_for_mem_enc);
+    rd(hp.binarize_mask_from_pts);
+    rd(hp.multimask_output_for_tracking);
+    rd(hp.multimask_min_pt_num);
+    rd(hp.multimask_max_pt_num);
+    rd(hp.fixed_no_obj_ptr);
+    rd(hp.iou_prediction_use_sigmoid);
+    rd(hp.use_mask_input_as_output);
+    rd(hp.multimask_output_in_sam);
+
+    hp.model_type = SAM3_MODEL_SAM2;
+
+    return !fin.fail();
+}
+
+static void sam2_print_hparams(const sam3_hparams& hp) {
+    fprintf(stderr, "  model_type        = SAM2\n");
+    fprintf(stderr, "  img_size          = %d\n", hp.img_size);
+    fprintf(stderr, "  hiera_embed_dim   = %d\n", hp.hiera_embed_dim);
+    fprintf(stderr, "  hiera_num_heads   = %d\n", hp.hiera_num_heads);
+    fprintf(stderr, "  hiera_stages      = [%d, %d, %d, %d]\n",
+            hp.hiera_stages[0], hp.hiera_stages[1],
+            hp.hiera_stages[2], hp.hiera_stages[3]);
+    fprintf(stderr, "  hiera_total_blks  = %d\n", hp.hiera_total_blocks());
+    fprintf(stderr, "  hiera_q_pool      = %d\n", hp.hiera_q_pool);
+    fprintf(stderr, "  hiera_window_spec = [%d, %d, %d, %d]\n",
+            hp.hiera_window_spec[0], hp.hiera_window_spec[1],
+            hp.hiera_window_spec[2], hp.hiera_window_spec[3]);
+    fprintf(stderr, "  hiera_global_n    = %d\n", hp.hiera_global_n);
+    fprintf(stderr, "  hiera_feat_size   = %d\n", hp.hiera_feat_size());
+    fprintf(stderr, "  scalp             = %d\n", hp.scalp);
+    fprintf(stderr, "  neck_dim          = %d\n", hp.neck_dim);
+    fprintf(stderr, "  sam_embed_dim     = %d\n", hp.sam_embed_dim);
+    fprintf(stderr, "  mem_attn_layers   = %d\n", hp.mem_attn_layers);
+    fprintf(stderr, "  num_maskmem       = %d\n", hp.num_maskmem);
+    fprintf(stderr, "  pred_obj_scores   = %d\n", hp.pred_obj_scores);
+    fprintf(stderr, "  sigmoid_scale     = %.1f\n", hp.sigmoid_scale());
+    fprintf(stderr, "  sigmoid_bias      = %.1f\n", hp.sigmoid_bias());
+}
+
+// Set per-block metadata: stage_idx, dim_in/out, window_size, has_q_stride
+static void sam2_precompute_hiera_metadata(sam3_model& model) {
+    auto& hp = model.hparams;
+    auto& hiera = model.hiera;
+
+    const int total = hp.hiera_total_blocks();
+    hiera.blocks.resize(total);
+
+    // Compute stage end indices (cumulative sum - 1)
+    int cum = 0;
+    for (int s = 0; s < hp.hiera_num_stages; ++s) {
+        cum += hp.hiera_stages[s];
+        hiera.stage_ends[s] = cum - 1;
+    }
+
+    // Compute q_pool block indices: first block of stages 1..q_pool
+    // q_pool_blocks = [stage_ends[i]+1 for i in 0..num_stages-2][:q_pool]
+    std::vector<int> q_pool_blocks;
+    for (int s = 0; s < hp.hiera_num_stages - 1 && (int)q_pool_blocks.size() < hp.hiera_q_pool; ++s) {
+        q_pool_blocks.push_back(hiera.stage_ends[s] + 1);
+    }
+
+    // Assign per-block metadata matching Python's Hiera.__init__ exactly.
+    // Key: window_size "lags by a block" — the first block of a new stage
+    // uses the PREVIOUS stage's window_spec, then cur_stage increments.
+    int cur_stage = 0;  // Python starts at 1, but we use 0-indexed with same logic
+    int embed_dim = hp.hiera_embed_dim;
+    int num_heads_cur = hp.hiera_num_heads;
+
+    for (int i = 0; i < total; ++i) {
+        auto& blk = hiera.blocks[i];
+
+        // Window size lags: uses cur_stage (before increment)
+        int ws = hp.hiera_window_spec[cur_stage];
+        if (hp.is_hiera_global_attn(i)) ws = 0;
+        blk.window_size = ws;
+
+        int dim_out = embed_dim;
+
+        // Stage transition: if previous block was a stage end, update dims
+        if (i > 0 && i - 1 == hiera.stage_ends[cur_stage]) {
+            dim_out = embed_dim * 2;
+            num_heads_cur *= 2;
+            cur_stage++;
+        }
+
+        blk.stage_idx = cur_stage;
+        blk.dim_in = embed_dim;
+        blk.dim_out = dim_out;
+        blk.num_heads = num_heads_cur;
+
+        // Q-pooling at designated blocks
+        blk.has_q_stride = false;
+        for (int qb : q_pool_blocks) {
+            if (i == qb) { blk.has_q_stride = true; break; }
+        }
+
+        embed_dim = dim_out;
+    }
+
+    fprintf(stderr, "%s: block metadata:\n", __func__);
+    for (int i = 0; i < total; ++i) {
+        const auto& b = hiera.blocks[i];
+        fprintf(stderr, "  blk %2d: stage=%d dim=%d→%d heads=%d ws=%d q_stride=%d\n",
+                i, b.stage_idx, b.dim_in, b.dim_out, b.num_heads,
+                b.window_size, b.has_q_stride ? 1 : 0);
+    }
+}
+
+// Register all SAM2 tensors (Hiera backbone + FPN neck + shared)
+static void sam2_register_tensors(sam3_model& model) {
+    const auto& hp = model.hparams;
+    auto& tensors = model.tensors;
+    auto ctx = model.ctx;
+    const ggml_type WTYPE = model.weight_type;
+    const int64_t WBLK = ggml_blck_size(WTYPE);
+
+    auto T1f = [&](const std::string& name, int64_t d0) -> ggml_tensor* {
+        auto* t = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, d0);
+        ggml_set_name(t, name.c_str());
+        tensors[name] = t;
+        return t;
+    };
+    auto T2 = [&](const std::string& name, int64_t d0, int64_t d1) -> ggml_tensor* {
+        const ggml_type type = (d0 % WBLK == 0) ? WTYPE : GGML_TYPE_F32;
+        auto* t = ggml_new_tensor_2d(ctx, type, d0, d1);
+        ggml_set_name(t, name.c_str());
+        tensors[name] = t;
+        return t;
+    };
+    auto T2f = [&](const std::string& name, int64_t d0, int64_t d1) -> ggml_tensor* {
+        auto* t = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, d0, d1);
+        ggml_set_name(t, name.c_str());
+        tensors[name] = t;
+        return t;
+    };
+    auto T3f = [&](const std::string& name, int64_t d0, int64_t d1, int64_t d2) -> ggml_tensor* {
+        auto* t = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, d0, d1, d2);
+        ggml_set_name(t, name.c_str());
+        tensors[name] = t;
+        return t;
+    };
+    auto T4 = [&](const std::string& name, int64_t d0, int64_t d1, int64_t d2, int64_t d3) -> ggml_tensor* {
+        const ggml_type type = (d0 % WBLK == 0) ? WTYPE : GGML_TYPE_F32;
+        auto* t = ggml_new_tensor_4d(ctx, type, d0, d1, d2, d3);
+        ggml_set_name(t, name.c_str());
+        tensors[name] = t;
+        return t;
+    };
+    auto T4f = [&](const std::string& name, int64_t d0, int64_t d1, int64_t d2, int64_t d3) -> ggml_tensor* {
+        auto* t = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, d0, d1, d2, d3);
+        ggml_set_name(t, name.c_str());
+        tensors[name] = t;
+        return t;
+    };
+
+    const int D = hp.neck_dim;        // 256
+    const int MD = hp.mem_out_dim;    // 64
+    const int FFN = 2048;             // SAM/memory MLP hidden dim
+    const int E0 = hp.hiera_embed_dim;
+
+    // ── Hiera backbone ───────────────────────────────────────────────────
+    // PatchEmbed: Conv2d(3, embed_dim, k=7, s=4, p=3)
+    // ggml conv2d kernel: [kW, kH, Cin, Cout]
+    model.hiera.patch_embed_w = T4("hiera.patch_embed.weight", 7, 7, 3, E0);
+    model.hiera.patch_embed_b = T1f("hiera.patch_embed.bias", E0);
+
+    // Positional embeddings
+    model.hiera.pos_embed = T4f("hiera.pos_embed", E0, hp.hiera_pos_embed_bkg_w,
+                                 hp.hiera_pos_embed_bkg_h, 1);
+    model.hiera.pos_embed_window = T4f("hiera.pos_embed_window", E0,
+                                        hp.hiera_window_spec[0],
+                                        hp.hiera_window_spec[0], 1);
+
+    // Hiera blocks
+    const int total_blocks = hp.hiera_total_blocks();
+    for (int i = 0; i < total_blocks; ++i) {
+        auto& blk = model.hiera.blocks[i];
+        auto p = "hiera.blocks." + std::to_string(i);
+        int din = blk.dim_in;
+        int dout = blk.dim_out;
+
+        blk.norm1_w   = T1f(p + ".norm1.weight", din);
+        blk.norm1_b   = T1f(p + ".norm1.bias", din);
+        blk.qkv_w     = T2(p + ".attn.qkv.weight", din, 3 * dout);
+        blk.qkv_b     = T1f(p + ".attn.qkv.bias", 3 * dout);
+        blk.proj_w    = T2(p + ".attn.proj.weight", dout, dout);
+        blk.proj_b    = T1f(p + ".attn.proj.bias", dout);
+        blk.norm2_w   = T1f(p + ".norm2.weight", dout);
+        blk.norm2_b   = T1f(p + ".norm2.bias", dout);
+        blk.mlp_fc1_w = T2(p + ".mlp.fc1.weight", dout, dout * 4);
+        blk.mlp_fc1_b = T1f(p + ".mlp.fc1.bias", dout * 4);
+        blk.mlp_fc2_w = T2(p + ".mlp.fc2.weight", dout * 4, dout);
+        blk.mlp_fc2_b = T1f(p + ".mlp.fc2.bias", dout);
+
+        // Dimension projection at stage transitions
+        if (din != dout) {
+            blk.dim_proj_w = T2(p + ".proj.weight", din, dout);
+            blk.dim_proj_b = T1f(p + ".proj.bias", dout);
+        }
+    }
+
+    // ── FPN neck (4 lateral 1×1 convs) ───────────────────────────────────
+    // backbone_channel_list = [stage3_dim, stage2_dim, stage1_dim, stage0_dim] (reversed)
+    // convs[0] maps the highest-dim (stage 3), convs[3] maps the lowest-dim (stage 0)
+    for (int i = 0; i < 4; ++i) {
+        int stage = hp.hiera_num_stages - 1 - i;
+        int ch = hp.hiera_stage_dim(stage);
+        auto p = "fpn.convs." + std::to_string(i);
+        model.fpn_neck.levels[i].conv_w = T4(p + ".weight", 1, 1, ch, D);
+        model.fpn_neck.levels[i].conv_b = T1f(p + ".bias", D);
+    }
+
+    // ── SAM prompt encoder (shared) ──────────────────────────────────────
+    model.sam_pe.pe_gaussian = T2f("sam_pe.pe_gaussian", 2, 128);
+    for (int i = 0; i < 4; ++i)
+        model.sam_pe.point_embed[i] = T2f("sam_pe.point_embeddings." + std::to_string(i) + ".weight", D, 1);
+    model.sam_pe.not_a_point_embed = T2f("sam_pe.not_a_point_embed.weight", D, 1);
+    model.sam_pe.no_mask_embed = T2f("sam_pe.no_mask_embed.weight", D, 1);
+
+    model.sam_pe.mask_ds_conv_w[0] = T4("sam_pe.mask_ds.0.weight", 2, 2, 1, 4);
+    model.sam_pe.mask_ds_conv_b[0] = T1f("sam_pe.mask_ds.0.bias", 4);
+    model.sam_pe.mask_ds_norm_w[0] = T1f("sam_pe.mask_ds.1.weight", 4);
+    model.sam_pe.mask_ds_norm_b[0] = T1f("sam_pe.mask_ds.1.bias", 4);
+    model.sam_pe.mask_ds_conv_w[1] = T4("sam_pe.mask_ds.3.weight", 2, 2, 4, 16);
+    model.sam_pe.mask_ds_conv_b[1] = T1f("sam_pe.mask_ds.3.bias", 16);
+    model.sam_pe.mask_ds_norm_w[1] = T1f("sam_pe.mask_ds.4.weight", 16);
+    model.sam_pe.mask_ds_norm_b[1] = T1f("sam_pe.mask_ds.4.bias", 16);
+    model.sam_pe.mask_ds_conv_w[2] = T4("sam_pe.mask_ds.6.weight", 1, 1, 16, D);
+    model.sam_pe.mask_ds_conv_b[2] = T1f("sam_pe.mask_ds.6.bias", D);
+
+    // ── SAM mask decoder (shared) ────────────────────────────────────────
+    model.sam_dec.iou_token = T2f("sam_dec.iou_token.weight", D, 1);
+    model.sam_dec.mask_tokens = T2f("sam_dec.mask_tokens.weight", D, 4);
+    if (hp.pred_obj_scores) {
+        model.sam_dec.obj_score_token = T2f("sam_dec.obj_score_token.weight", D, 1);
+    }
+
+    model.sam_dec.twoway_blocks.resize(hp.sam_dec_depth);
+    for (int i = 0; i < hp.sam_dec_depth; ++i) {
+        auto& blk = model.sam_dec.twoway_blocks[i];
+        auto p = "sam_dec.twoway." + std::to_string(i);
+
+        auto reg_attn = [&](sam3_sam_attn& a, const std::string& pfx, int in_dim, int out_dim) {
+            a.q_w = T2(pfx + ".q_proj.weight", in_dim, out_dim);
+            a.q_b = T1f(pfx + ".q_proj.bias", out_dim);
+            a.k_w = T2(pfx + ".k_proj.weight", in_dim, out_dim);
+            a.k_b = T1f(pfx + ".k_proj.bias", out_dim);
+            a.v_w = T2(pfx + ".v_proj.weight", in_dim, out_dim);
+            a.v_b = T1f(pfx + ".v_proj.bias", out_dim);
+            a.out_w = T2(pfx + ".out_proj.weight", out_dim, in_dim);
+            a.out_b = T1f(pfx + ".out_proj.bias", in_dim);
+        };
+
+        reg_attn(blk.self_attn, p + ".sa", D, D);
+        reg_attn(blk.ca_tok2img, p + ".cross_attn_token_to_image", D, 128);
+        reg_attn(blk.ca_img2tok, p + ".cross_attn_image_to_token", D, 128);
+
+        blk.norm1_w = T1f(p + ".norm1.weight", D);
+        blk.norm1_b = T1f(p + ".norm1.bias", D);
+        blk.norm2_w = T1f(p + ".norm2.weight", D);
+        blk.norm2_b = T1f(p + ".norm2.bias", D);
+        blk.norm3_w = T1f(p + ".norm3.weight", D);
+        blk.norm3_b = T1f(p + ".norm3.bias", D);
+        blk.norm4_w = T1f(p + ".norm4.weight", D);
+        blk.norm4_b = T1f(p + ".norm4.bias", D);
+
+        blk.mlp_fc1_w = T2(p + ".mlp.lin1.weight", D, FFN);
+        blk.mlp_fc1_b = T1f(p + ".mlp.lin1.bias", FFN);
+        blk.mlp_fc2_w = T2(p + ".mlp.lin2.weight", FFN, D);
+        blk.mlp_fc2_b = T1f(p + ".mlp.lin2.bias", D);
+    }
+
+    // Final attention
+    {
+        auto reg_attn = [&](sam3_sam_attn& a, const std::string& pfx, int in_dim, int out_dim) {
+            a.q_w = T2(pfx + ".q_proj.weight", in_dim, out_dim);
+            a.q_b = T1f(pfx + ".q_proj.bias", out_dim);
+            a.k_w = T2(pfx + ".k_proj.weight", in_dim, out_dim);
+            a.k_b = T1f(pfx + ".k_proj.bias", out_dim);
+            a.v_w = T2(pfx + ".v_proj.weight", in_dim, out_dim);
+            a.v_b = T1f(pfx + ".v_proj.bias", out_dim);
+            a.out_w = T2(pfx + ".out_proj.weight", out_dim, in_dim);
+            a.out_b = T1f(pfx + ".out_proj.bias", in_dim);
+        };
+        reg_attn(model.sam_dec.final_attn, "sam_dec.final_attn", D, 128);
+    }
+    model.sam_dec.final_norm_w = T1f("sam_dec.final_norm.weight", D);
+    model.sam_dec.final_norm_b = T1f("sam_dec.final_norm.bias", D);
+
+    // Upscaling
+    model.sam_dec.up1_w = T4("sam_dec.upscale.0.weight", 2, 2, 64, D);
+    model.sam_dec.up1_b = T1f("sam_dec.upscale.0.bias", 64);
+    model.sam_dec.up1_norm_w = T1f("sam_dec.upscale.1.weight", 64);
+    model.sam_dec.up1_norm_b = T1f("sam_dec.upscale.1.bias", 64);
+    model.sam_dec.up2_w = T4("sam_dec.upscale.3.weight", 2, 2, 32, 64);
+    model.sam_dec.up2_b = T1f("sam_dec.upscale.3.bias", 32);
+
+    // High-res feature convolutions
+    model.sam_dec.conv_s0_w = T4("sam_dec.conv_s0.weight", 1, 1, D, 32);
+    model.sam_dec.conv_s0_b = T1f("sam_dec.conv_s0.bias", 32);
+    model.sam_dec.conv_s1_w = T4("sam_dec.conv_s1.weight", 1, 1, D, 64);
+    model.sam_dec.conv_s1_b = T1f("sam_dec.conv_s1.bias", 64);
+
+    // Hypernetwork MLPs (4 × 3 layers: 256→256→256→32)
+    for (int m = 0; m < 4; ++m) {
+        for (int j = 0; j < 3; ++j) {
+            int in_d = D, out_d = (j == 2) ? 32 : D;
+            auto bp = "sam_dec.hyper." + std::to_string(m) + ".layers." + std::to_string(j);
+            model.sam_dec.hyper_w[m][j] = T2(bp + ".weight", in_d, out_d);
+            model.sam_dec.hyper_b[m][j] = T1f(bp + ".bias", out_d);
+        }
+    }
+
+    // IoU head (3 layers: 256→256→256→4)
+    for (int j = 0; j < 3; ++j) {
+        int out_d = (j == 2) ? 4 : D;
+        auto bp = "sam_dec.iou_prediction_head.layers." + std::to_string(j);
+        model.sam_dec.iou_head_w[j] = T2(bp + ".weight", D, out_d);
+        model.sam_dec.iou_head_b[j] = T1f(bp + ".bias", out_d);
+    }
+
+    // Object score head
+    if (hp.pred_obj_scores) {
+        for (int j = 0; j < 3; ++j) {
+            int out_d = (j == 2) ? 1 : D;
+            auto bp = "sam_dec.pred_obj_score_head.layers." + std::to_string(j);
+            model.sam_dec.obj_head_w[j] = T2(bp + ".weight", D, out_d);
+            model.sam_dec.obj_head_b[j] = T1f(bp + ".bias", out_d);
+        }
+    }
+
+    // ── Memory encoder (shared) ──────────────────────────────────────────
+    int ds_channels[] = {1, 4, 16, 64, 256};
+    int ds_indices[]  = {0, 3, 6, 9, 12};
+    int norm_indices[] = {1, 4, 7, 10};
+    for (int s = 0; s < 4; ++s) {
+        auto si = std::to_string(ds_indices[s]);
+        model.mem_enc.ds_conv_w[s] = T4("mem_enc.ds." + si + ".weight", 3, 3, ds_channels[s], ds_channels[s + 1]);
+        model.mem_enc.ds_conv_b[s] = T1f("mem_enc.ds." + si + ".bias", ds_channels[s + 1]);
+        auto ni = std::to_string(norm_indices[s]);
+        model.mem_enc.ds_norm_w[s] = T1f("mem_enc.ds." + ni + ".weight", ds_channels[s + 1]);
+        model.mem_enc.ds_norm_b[s] = T1f("mem_enc.ds." + ni + ".bias", ds_channels[s + 1]);
+    }
+    model.mem_enc.ds_conv_w[4] = T4("mem_enc.ds.12.weight", 1, 1, D, D);
+    model.mem_enc.ds_conv_b[4] = T1f("mem_enc.ds.12.bias", D);
+
+    model.mem_enc.pix_proj_w = T4("mem_enc.pix_feat_proj.weight", 1, 1, D, D);
+    model.mem_enc.pix_proj_b = T1f("mem_enc.pix_feat_proj.bias", D);
+
+    for (int i = 0; i < 2; ++i) {
+        auto p = "mem_enc.fuser." + std::to_string(i);
+        model.mem_enc.fuser_dw_w[i] = T4(p + ".dwconv.weight", 7, 7, 1, D);
+        model.mem_enc.fuser_dw_b[i] = T1f(p + ".dwconv.bias", D);
+        model.mem_enc.fuser_norm_w[i] = T1f(p + ".norm.weight", D);
+        model.mem_enc.fuser_norm_b[i] = T1f(p + ".norm.bias", D);
+        model.mem_enc.fuser_fc1_w[i] = T2(p + ".pwconv1.weight", D, 1024);
+        model.mem_enc.fuser_fc1_b[i] = T1f(p + ".pwconv1.bias", 1024);
+        model.mem_enc.fuser_fc2_w[i] = T2(p + ".pwconv2.weight", 1024, D);
+        model.mem_enc.fuser_fc2_b[i] = T1f(p + ".pwconv2.bias", D);
+        model.mem_enc.fuser_gamma[i] = T1f(p + ".gamma", D);
+    }
+
+    model.mem_enc.out_proj_w = T4("mem_enc.out_proj.weight", 1, 1, D, MD);
+    model.mem_enc.out_proj_b = T1f("mem_enc.out_proj.bias", MD);
+    model.mem_enc.tpos[0] = T4f("mem_enc.tpos_enc", MD, 1, 1, hp.num_maskmem);
+
+    // ── Memory attention (shared) ────────────────────────────────────────
+    model.mem_attn.layers.resize(hp.mem_attn_layers);
+    model.mem_attn_norm_w = T1f("mem_attn.norm.weight", D);
+    model.mem_attn_norm_b = T1f("mem_attn.norm.bias", D);
+
+    for (int i = 0; i < hp.mem_attn_layers; ++i) {
+        auto& ly = model.mem_attn.layers[i];
+        auto p = "mem_attn.layers." + std::to_string(i);
+        ly.sa_q_w = T2(p + ".sa.q_proj.weight", D, D);
+        ly.sa_q_b = T1f(p + ".sa.q_proj.bias", D);
+        ly.sa_k_w = T2(p + ".sa.k_proj.weight", D, D);
+        ly.sa_k_b = T1f(p + ".sa.k_proj.bias", D);
+        ly.sa_v_w = T2(p + ".sa.v_proj.weight", D, D);
+        ly.sa_v_b = T1f(p + ".sa.v_proj.bias", D);
+        ly.sa_out_w = T2(p + ".sa.out_proj.weight", D, D);
+        ly.sa_out_b = T1f(p + ".sa.out_proj.bias", D);
+        ly.norm1_w = T1f(p + ".norm1.weight", D);
+        ly.norm1_b = T1f(p + ".norm1.bias", D);
+        ly.ca_q_w = T2(p + ".ca.q_proj.weight", D, D);
+        ly.ca_q_b = T1f(p + ".ca.q_proj.bias", D);
+        ly.ca_k_w = T2(p + ".ca.k_proj.weight", MD, D);
+        ly.ca_k_b = T1f(p + ".ca.k_proj.bias", D);
+        ly.ca_v_w = T2(p + ".ca.v_proj.weight", MD, D);
+        ly.ca_v_b = T1f(p + ".ca.v_proj.bias", D);
+        ly.ca_out_w = T2(p + ".ca.out_proj.weight", D, D);
+        ly.ca_out_b = T1f(p + ".ca.out_proj.bias", D);
+        ly.norm2_w = T1f(p + ".norm2.weight", D);
+        ly.norm2_b = T1f(p + ".norm2.bias", D);
+        ly.ffn_fc1_w = T2(p + ".linear1.weight", D, FFN);
+        ly.ffn_fc1_b = T1f(p + ".linear1.bias", FFN);
+        ly.ffn_fc2_w = T2(p + ".linear2.weight", FFN, D);
+        ly.ffn_fc2_b = T1f(p + ".linear2.bias", D);
+        ly.norm3_w = T1f(p + ".norm3.weight", D);
+        ly.norm3_b = T1f(p + ".norm3.bias", D);
+    }
+
+    // ── Object pointer projection (shared) ───────────────────────────────
+    for (int j = 0; j < 3; ++j) {
+        auto bp = "obj_ptr_proj.layers." + std::to_string(j);
+        model.obj_ptr_proj_w[j] = T2(bp + ".weight", D, D);
+        model.obj_ptr_proj_b[j] = T1f(bp + ".bias", D);
+    }
+    model.no_obj_ptr = T2f("no_obj_ptr", D, 1);
+    model.obj_ptr_tpos_w = T2("obj_ptr_tpos_proj.weight", D, MD);
+    model.obj_ptr_tpos_b = T1f("obj_ptr_tpos_proj.bias", MD);
+
+    // ── SAM2 top-level tensors ───────────────────────────────────────────
+    model.no_mem_embed = T3f("no_mem_embed", D, 1, 1);
+    model.no_mem_pos_enc = T3f("no_mem_pos_enc", D, 1, 1);
+    model.no_obj_embed_spatial = T2f("no_obj_embed_spatial", MD, 1);
+    T4f("trk_mask_ds.weight", 4, 4, 1, 1);
+    T1f("trk_mask_ds.bias", 1);
+}
+
 // Register all tensor names in the model struct so we can look them up by name
 // when loading from the binary file. This creates ggml tensors with no_alloc
 // (metadata only) and populates model.tensors.
@@ -1793,8 +2408,8 @@ static void sam3_register_tensors(sam3_model& model) {
 
     // ── Memory attention ─────────────────────────────────────────────────
     model.mem_attn.layers.resize(hp.mem_attn_layers);
-    reg1("mem_attn.norm.weight", D);
-    reg1("mem_attn.norm.bias", D);
+    model.mem_attn_norm_w = reg1("mem_attn.norm.weight", D);
+    model.mem_attn_norm_b = reg1("mem_attn.norm.bias", D);
 
     for (int i = 0; i < hp.mem_attn_layers; ++i) {
         auto& ly = model.mem_attn.layers[i];
@@ -1840,12 +2455,11 @@ static void sam3_register_tensors(sam3_model& model) {
     model.obj_ptr_tpos_w = T2("obj_ptr_tpos_proj.weight", D, MD);
     model.obj_ptr_tpos_b = T1f("obj_ptr_tpos_proj.bias", MD);
 
-    // standalone tracker params
     // standalone tracker parameters
-    T3f("no_mem_embed", D, 1, 1);           // [1, 1, 256]
-    T3f("no_mem_pos_enc", D, 1, 1);         // [1, 1, 256]
-    T2f("no_obj_embed_spatial", MD, 1);     // [1, 64]
-    T4f("trk_mask_ds.weight", 4, 4, 1, 1);  // nn.Conv2d(1,1,4,4): [1,1,4,4]
+    model.no_mem_embed         = T3f("no_mem_embed", D, 1, 1);
+    model.no_mem_pos_enc       = T3f("no_mem_pos_enc", D, 1, 1);
+    model.no_obj_embed_spatial = T2f("no_obj_embed_spatial", MD, 1);
+    T4f("trk_mask_ds.weight", 4, 4, 1, 1);
     T1f("trk_mask_ds.bias", 1);
 }
 
@@ -1977,18 +2591,27 @@ std::shared_ptr<sam3_model> sam3_load_model(const sam3_params& params) {
     fin.read(reinterpret_cast<char*>(&ftype), 4);
     fin.read(reinterpret_cast<char*>(&n_tensors), 4);
 
-    if (magic != SAM3_MAGIC) {
-        fprintf(stderr, "%s: invalid magic: 0x%08x (expected 0x%08x)\n",
-                __func__, magic, SAM3_MAGIC);
+    bool is_sam2 = false;
+    if (magic == SAM3_MAGIC) {
+        if (version != SAM3_VERSION) {
+            fprintf(stderr, "%s: unsupported SAM3 version: %d (expected %d)\n",
+                    __func__, version, SAM3_VERSION);
+            return nullptr;
+        }
+    } else if (magic == SAM2_MAGIC) {
+        if (version != SAM2_VERSION) {
+            fprintf(stderr, "%s: unsupported SAM2 version: %d (expected %d)\n",
+                    __func__, version, SAM2_VERSION);
+            return nullptr;
+        }
+        is_sam2 = true;
+    } else {
+        fprintf(stderr, "%s: unknown magic: 0x%08x (expected sam3=0x%08x or sam2=0x%08x)\n",
+                __func__, magic, SAM3_MAGIC, SAM2_MAGIC);
         return nullptr;
     }
-    if (version != SAM3_VERSION) {
-        fprintf(stderr, "%s: unsupported version: %d (expected %d)\n",
-                __func__, version, SAM3_VERSION);
-        return nullptr;
-    }
-    fprintf(stderr, "%s: format version %d, ftype %d, %d tensors\n",
-            __func__, version, ftype, n_tensors);
+    fprintf(stderr, "%s: %s format v%d, ftype %d, %d tensors\n",
+            __func__, is_sam2 ? "SAM2" : "SAM3", version, ftype, n_tensors);
 
     auto model = std::make_shared<sam3_model>();
     {
@@ -2007,11 +2630,19 @@ std::shared_ptr<sam3_model> sam3_load_model(const sam3_params& params) {
     }
 
     // ── Read hyperparameters ─────────────────────────────────────────────
-    if (!sam3_load_hparams(fin, model->hparams)) {
-        fprintf(stderr, "%s: failed to read hyperparameters\n", __func__);
-        return nullptr;
+    if (is_sam2) {
+        if (!sam2_load_hparams(fin, model->hparams)) {
+            fprintf(stderr, "%s: failed to read SAM2 hyperparameters\n", __func__);
+            return nullptr;
+        }
+        sam2_print_hparams(model->hparams);
+    } else {
+        if (!sam3_load_hparams(fin, model->hparams)) {
+            fprintf(stderr, "%s: failed to read SAM3 hyperparameters\n", __func__);
+            return nullptr;
+        }
+        sam3_print_hparams(model->hparams);
     }
-    sam3_print_hparams(model->hparams);
 
     // ── Init backend ─────────────────────────────────────────────────────
 #ifdef GGML_USE_METAL
@@ -2044,7 +2675,12 @@ std::shared_ptr<sam3_model> sam3_load_model(const sam3_params& params) {
     }
 
     // ── Register all tensor shapes ───────────────────────────────────────
-    sam3_register_tensors(*model);
+    if (is_sam2) {
+        sam2_precompute_hiera_metadata(*model);
+        sam2_register_tensors(*model);
+    } else {
+        sam3_register_tensors(*model);
+    }
     fprintf(stderr, "%s: registered %zu tensors\n", __func__, model->tensors.size());
 
     // ── Allocate backend buffer for all tensors ──────────────────────────
@@ -2062,12 +2698,14 @@ std::shared_ptr<sam3_model> sam3_load_model(const sam3_params& params) {
         return nullptr;
     }
 
-    // ── Load embedded BPE tokenizer ──────────────────────────────────────
-    if (!model->hparams.visual_only) {
+    // ── Load embedded BPE tokenizer (SAM3 only) ───────────────────────
+    if (!is_sam2 && !model->hparams.visual_only) {
         if (!sam3_load_bpe_vocab_from_stream(fin, model->tokenizer)) {
             fprintf(stderr, "%s: failed to load embedded tokenizer\n", __func__);
             return nullptr;
         }
+    } else if (is_sam2) {
+        fprintf(stderr, "%s: SAM2 model — no tokenizer\n", __func__);
     } else {
         fprintf(stderr, "%s: visual-only model — skipping tokenizer\n", __func__);
     }
@@ -2092,7 +2730,11 @@ void sam3_free_model(sam3_model& model) {
 }
 
 bool sam3_is_visual_only(const sam3_model& model) {
-    return model.hparams.visual_only != 0;
+    return model.hparams.visual_only != 0 || model.hparams.is_sam2();
+}
+
+sam3_model_type sam3_get_model_type(const sam3_model& model) {
+    return model.hparams.model_type;
 }
 
 /*****************************************************************************
@@ -2220,6 +2862,36 @@ static std::vector<float> sam3_preprocess_image(const sam3_image& image, int img
             for (int x = 0; x < img_size; ++x) {
                 float v = pixels[(y * img_size + x) * 3 + c] / 255.0f;
                 result[c * img_size * img_size + y * img_size + x] = (v - 0.5f) / 0.5f;
+            }
+        }
+    }
+
+    return result;
+}
+
+// SAM2 preprocessing: resize + ImageNet normalization.
+// Returns [C, H, W] float, mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225].
+static std::vector<float> sam2_preprocess_image(const sam3_image& image, int img_size) {
+    static const float mean[3] = {0.485f, 0.456f, 0.406f};
+    static const float std_d[3] = {0.229f, 0.224f, 0.225f};
+    const int C = 3;
+    std::vector<float> result(C * img_size * img_size);
+
+    std::vector<uint8_t> resized;
+    const uint8_t* pixels = image.data.data();
+    int w = image.width, h = image.height;
+
+    if (w != img_size || h != img_size) {
+        resized.resize(img_size * img_size * 3);
+        sam3_resize_bilinear(pixels, w, h, resized.data(), img_size, img_size);
+        pixels = resized.data();
+    }
+
+    for (int c = 0; c < C; ++c) {
+        for (int y = 0; y < img_size; ++y) {
+            for (int x = 0; x < img_size; ++x) {
+                float v = pixels[(y * img_size + x) * 3 + c] / 255.0f;
+                result[c * img_size * img_size + y * img_size + x] = (v - mean[c]) / std_d[c];
             }
         }
     }
@@ -2748,12 +3420,682 @@ static struct ggml_tensor* sam3_build_text_encoder_graph(struct ggml_context* ct
 }
 
 /*****************************************************************************
+** SAM2 — Hiera Backbone Graph Building
+*****************************************************************************/
+
+// Bicubic interpolation of a [C, H_in, W_in] tensor on CPU to [C, H_out, W_out].
+// Used for background positional embedding interpolation.
+static void sam2_bicubic_interpolate_cpu(const float* src, int C, int H_in, int W_in,
+                                          float* dst, int H_out, int W_out) {
+    // Cubic weight function (matching PyTorch's bicubic interpolation)
+    auto cubic = [](float x) -> float {
+        x = fabsf(x);
+        if (x < 1.0f) return (1.5f*x - 2.5f)*x*x + 1.0f;
+        if (x < 2.0f) { float t = 2.0f - x; return -0.5f*t*t*t + 2.5f*t*t - 4.0f*t + 2.0f; }
+        return 0.0f;
+    };
+
+    for (int c = 0; c < C; ++c) {
+        for (int y = 0; y < H_out; ++y) {
+            float fy = ((float)y + 0.5f) * (float)H_in / (float)H_out - 0.5f;
+            int iy = (int)floorf(fy);
+            float dy = fy - iy;
+
+            for (int x = 0; x < W_out; ++x) {
+                float fx = ((float)x + 0.5f) * (float)W_in / (float)W_out - 0.5f;
+                int ix = (int)floorf(fx);
+                float dx = fx - ix;
+
+                float val = 0.0f;
+                for (int jj = -1; jj <= 2; ++jj) {
+                    float wy = cubic(dy - jj);
+                    int sy = std::min(std::max(iy + jj, 0), H_in - 1);
+                    for (int ii = -1; ii <= 2; ++ii) {
+                        float wx = cubic(dx - ii);
+                        int sx = std::min(std::max(ix + ii, 0), W_in - 1);
+                        val += wy * wx * src[c * H_in * W_in + sy * W_in + sx];
+                    }
+                }
+                dst[c * H_out * W_out + y * W_out + x] = val;
+            }
+        }
+    }
+}
+
+// Compute Hiera positional embedding on CPU.
+// Returns [E, H, W] in ggml column-major layout: element (e, x, y) at flat index e + x*E + y*E*W.
+// PE = bicubic_interp(pos_embed_bkg, (H, W)) + tile(pos_embed_window, (H/W0, W/W0))
+static std::vector<float> sam2_compute_pos_embed(const sam3_model& model, int H, int W) {
+    const auto& hp = model.hparams;
+    const int E = hp.hiera_embed_dim;
+    const int bkg_h = hp.hiera_pos_embed_bkg_h;
+    const int bkg_w = hp.hiera_pos_embed_bkg_w;
+    const int ws = hp.hiera_window_spec[0];
+
+    // Read background PE from GPU: stored as [E, bkg_w, bkg_h, 1] in ggml layout
+    std::vector<float> bkg_data(E * bkg_h * bkg_w);
+    ggml_backend_tensor_get(model.hiera.pos_embed, bkg_data.data(), 0,
+                            bkg_data.size() * sizeof(float));
+
+    // Rearrange from ggml [E, W, H, 1] to CHW [E, H, W] for interpolation
+    // ggml layout: element (e, x, y) at e + x*E + y*E*W
+    // CHW layout: element (c, y, x) at c*H*W + y*W + x
+    std::vector<float> bkg_chw(E * bkg_h * bkg_w);
+    for (int e = 0; e < E; ++e)
+        for (int y = 0; y < bkg_h; ++y)
+            for (int x = 0; x < bkg_w; ++x)
+                bkg_chw[e * bkg_h * bkg_w + y * bkg_w + x] = bkg_data[e + x * E + y * E * bkg_w];
+
+    // Bicubic interpolate to [E, H, W]
+    std::vector<float> bkg_interp(E * H * W);
+    sam2_bicubic_interpolate_cpu(bkg_chw.data(), E, bkg_h, bkg_w,
+                                  bkg_interp.data(), H, W);
+
+    // Read window PE from GPU: [E, ws, ws, 1]
+    std::vector<float> win_data(E * ws * ws);
+    ggml_backend_tensor_get(model.hiera.pos_embed_window, win_data.data(), 0,
+                            win_data.size() * sizeof(float));
+
+    // Rearrange from ggml to CHW
+    std::vector<float> win_chw(E * ws * ws);
+    for (int e = 0; e < E; ++e)
+        for (int y = 0; y < ws; ++y)
+            for (int x = 0; x < ws; ++x)
+                win_chw[e * ws * ws + y * ws + x] = win_data[e + x * E + y * E * ws];
+
+    // Tile window PE to [E, H, W]
+    std::vector<float> win_tiled(E * H * W);
+    for (int e = 0; e < E; ++e)
+        for (int y = 0; y < H; ++y)
+            for (int x = 0; x < W; ++x)
+                win_tiled[e * H * W + y * W + x] = win_chw[e * ws * ws + (y % ws) * ws + (x % ws)];
+
+    // Sum and convert to ggml layout [E, W, H, 1]
+    std::vector<float> pe(E * H * W);
+    for (int e = 0; e < E; ++e)
+        for (int y = 0; y < H; ++y)
+            for (int x = 0; x < W; ++x)
+                pe[e + x * E + y * E * W] = bkg_interp[e * H * W + y * W + x]
+                                            + win_tiled[e * H * W + y * W + x];
+
+    return pe;
+}
+
+// Window partition: [B, H, W, C] -> [B*nW, ws, ws, C] with padding if needed.
+// In ggml layout: input ne = {C, W, H, B}, output ne = {C, ws, ws, B*nW}.
+// Pad H, W to be divisible by ws.  Returns (padded_H, padded_W) in pad_hw.
+//
+// The algorithm (4D ggml only):
+//   1. Reshape [C, Wp, Hp, B] -> [C*ws, nW_w, Hp, B]    -- group W into windows
+//   2. Permute (0,2,1,3)      -> [C*ws, Hp, nW_w, B]     -- move H before nW_w
+//   3. Cont
+//   4. Reshape                 -> [C*ws, ws, nW_h, nW_w*B] -- split H into windows
+//   5. Permute (0,2,1,3)      -> [C*ws, nW_h, ws, nW_w*B] -- move nW_h before local-H
+//      ... NO!  Step 5 swaps local-H with window-H-index, corrupting the data.
+//      After step 4, ne[1]=ws is already local-H and ne[2]=nW_h is the window index.
+//      Skipping step 5 gives the correct layout where each window contains
+//      contiguous spatial data.  Reshape directly to the final shape.
+//   5. Reshape                 -> [C, ws, ws, nW*B]        -- split C*ws -> (C, ws)
+//
+// Window ordering: n = nw_h + nw_w*nW_h  (H-major, reversed from typical).
+static struct ggml_tensor* sam2_window_partition(struct ggml_context* ctx,
+                                                  struct ggml_tensor* x,
+                                                  int ws, int pad_hw[2]) {
+    // ggml layout: ne = {C, W, H, B}
+    const int64_t C = x->ne[0];
+    const int64_t W = x->ne[1];
+    const int64_t H = x->ne[2];
+    const int64_t B = x->ne[3];
+
+    // Pad to ws-divisible
+    int64_t Hp = ((H + ws - 1) / ws) * ws;
+    int64_t Wp = ((W + ws - 1) / ws) * ws;
+    pad_hw[0] = (int)Hp;
+    pad_hw[1] = (int)Wp;
+
+    if (Hp != H || Wp != W) {
+        x = ggml_pad(ctx, x, 0, (int)(Wp - W), (int)(Hp - H), 0);
+    }
+
+    int64_t nW_w = Wp / ws;
+    int64_t nW_h = Hp / ws;
+    int64_t nW = nW_w * nW_h;
+
+    // Step 1: Reshape [C, Wp, Hp, B] -> [C*ws, nW_w, Hp, B]
+    auto* r1 = ggml_reshape_4d(ctx, x, C * ws, nW_w, Hp, B);
+    // Step 2: Permute to [C*ws, Hp, nW_w, B]
+    auto* p1 = ggml_permute(ctx, r1, 0, 2, 1, 3);
+    // Step 3: Cont
+    auto* c1 = ggml_cont(ctx, p1);
+    // Step 4: Reshape [C*ws, Hp, nW_w, B] -> [C*ws, ws, nW_h, nW_w*B]
+    //   Splits dim 1 (Hp = ws*nW_h) into (ws=local_H, nW_h=window_H_index)
+    auto* r2 = ggml_reshape_4d(ctx, c1, C * ws, ws, nW_h, nW_w * B);
+    // Step 5 (direct reshape, no permute):
+    //   [C*ws, ws, nW_h, nW_w*B] -> [C, ws, ws, nW*B]
+    //   Splits dim 0 (C*ws) into (C, ws=local_W) and merges dims 2,3.
+    auto* out = ggml_reshape_4d(ctx, r2, C, ws, ws, nW * B);
+
+    return out;
+}
+
+// Window unpartition: reverse of sam2_window_partition.
+// Input ne = {C, ws, ws, nW*B}, output ne = {C, orig_W, orig_H, B}.
+//
+// Reverses the partition steps:
+//   1. Reshape [C, ws, ws, nW*B] -> [C*ws, ws, nW_h, nW_w*B]
+//   2. Reshape [C*ws, ws, nW_h, nW_w*B] -> [C*ws, Hp, nW_w, B]  (merge local-H with nW_h)
+//   3. Permute (0,2,1,3) -> [C*ws, nW_w, Hp, B]
+//   4. Cont
+//   5. Reshape [C*ws, nW_w, Hp, B] -> [C, Wp, Hp, B]
+//   6. Crop to (orig_W, orig_H)
+static struct ggml_tensor* sam2_window_unpartition(struct ggml_context* ctx,
+                                                    struct ggml_tensor* x,
+                                                    int ws, int pad_hw[2],
+                                                    int orig_H, int orig_W,
+                                                    int B) {
+    const int64_t C = x->ne[0];
+    int64_t Hp = pad_hw[0];
+    int64_t Wp = pad_hw[1];
+    int64_t nW_h = Hp / ws;
+    int64_t nW_w = Wp / ws;
+
+    // Step 1: Reshape [C, ws, ws, nW*B] -> [C*ws, ws, nW_h, nW_w*B]
+    //   Merges (C, local_W=ws) into C*ws; splits nW into (nW_h, nW_w*B).
+    auto* r1 = ggml_reshape_4d(ctx, x, C * ws, ws, nW_h, nW_w * B);
+
+    // Step 2: Reshape [C*ws, ws, nW_h, nW_w*B] -> [C*ws, Hp, nW_w, B]
+    //   Merges (local_H=ws, nW_h) into Hp=ws*nW_h; splits nW_w*B into (nW_w, B).
+    auto* r2 = ggml_reshape_4d(ctx, r1, C * ws, Hp, nW_w, B);
+
+    // Step 3: Permute to [C*ws, nW_w, Hp, B]
+    auto* p1 = ggml_permute(ctx, r2, 0, 2, 1, 3);
+
+    // Step 4: Cont
+    auto* c1 = ggml_cont(ctx, p1);
+
+    // Step 5: Reshape [C*ws, nW_w, Hp, B] -> [C, Wp, Hp, B]
+    //   Splits (C*ws) with nW_w to recover (C, Wp=ws*nW_w).
+    auto* out = ggml_reshape_4d(ctx, c1, C, Wp, Hp, B);
+
+    // Step 6: Crop if padded
+    if (Hp != orig_H || Wp != orig_W) {
+        out = ggml_view_4d(ctx, out, C, orig_W, orig_H, B,
+                           out->nb[1], out->nb[2], out->nb[3], 0);
+        out = ggml_cont(ctx, out);
+    }
+
+    return out;
+}
+
+// MaxPool2d with kernel=2, stride=2 on spatial dims (ne[1]=W, ne[2]=H).
+// Input: [C, W, H, B] -> output: [C, W/2, H/2, B]
+// ggml_pool_2d operates on ne[0] and ne[1], so we permute to [W, H, C, B],
+// pool, then permute back to [C, W/2, H/2, B].
+static struct ggml_tensor* sam2_maxpool_2d(struct ggml_context* ctx,
+                                            struct ggml_tensor* x) {
+    // [C, W, H, B] -> [W, H, C, B]   (permute(2,0,1,3))
+    auto* perm = ggml_cont(ctx, ggml_permute(ctx, x, 2, 0, 1, 3));
+    // Pool on ne[0]=W, ne[1]=H -> [W/2, H/2, C, B]
+    auto* pooled = ggml_pool_2d(ctx, perm, GGML_OP_POOL_MAX, 2, 2, 2, 2, 0, 0);
+    // [W/2, H/2, C, B] -> [C, W/2, H/2, B]   (permute(1,2,0,3))
+    auto* out = ggml_cont(ctx, ggml_permute(ctx, pooled, 1, 2, 0, 3));
+    return out;
+}
+
+// Single Hiera MultiScaleBlock forward pass.
+static struct ggml_tensor* sam2_hiera_block_forward(struct ggml_context* ctx,
+                                                     struct ggml_tensor* x,
+                                                     const sam2_hiera_block& blk,
+                                                     int spatial_H, int spatial_W) {
+    const int64_t C_in = blk.dim_in;
+    const int64_t C_out = blk.dim_out;
+    const int B = 1;
+
+    // ── 1. Pre-norm ──────────────────────────────────────────────────────
+    // x: [C_in, W, H, B]
+    auto* normed = ggml_norm(ctx, x, 1e-6f);
+    normed = ggml_mul(ctx, normed, ggml_repeat(ctx, ggml_reshape_4d(ctx, blk.norm1_w, C_in, 1, 1, 1), normed));
+    normed = ggml_add(ctx, normed, ggml_repeat(ctx, ggml_reshape_4d(ctx, blk.norm1_b, C_in, 1, 1, 1), normed));
+
+    // ── 2. Shortcut with dimension projection and/or Q-stride pooling ──
+    struct ggml_tensor* shortcut;
+    if (C_in != C_out) {
+        // Linear projection on normed input: [C_in, W, H, B] -> [C_out, W, H, B]
+        auto* flat = ggml_reshape_2d(ctx, normed, C_in, spatial_W * spatial_H * B);
+        auto* proj = ggml_mul_mat(ctx, blk.dim_proj_w, flat);
+        proj = ggml_add(ctx, proj, blk.dim_proj_b);
+        shortcut = ggml_reshape_4d(ctx, proj, C_out, spatial_W, spatial_H, B);
+        // MaxPool on shortcut only when Q-stride is active (spatial dims halve)
+        if (blk.has_q_stride) {
+            shortcut = sam2_maxpool_2d(ctx, shortcut);
+        }
+    } else if (blk.has_q_stride) {
+        // Q-stride without dim change (unusual but possible for q_pool > stages)
+        shortcut = sam2_maxpool_2d(ctx, x);
+    } else {
+        shortcut = x;
+    }
+
+    // ── 3. Window partition (if not global) ──────────────────────────────
+    int pad_hw[2] = {spatial_H, spatial_W};
+    struct ggml_tensor* attn_input = normed;
+    if (blk.window_size > 0) {
+        attn_input = sam2_window_partition(ctx, normed, blk.window_size, pad_hw);
+    }
+
+    // ── 4. Multi-scale attention ─────────────────────────────────────────
+    // Flatten spatial: [C_in, W_win, H_win, B_win] → [C_in, N, B_win]
+    int64_t N_kv = attn_input->ne[1] * attn_input->ne[2];
+    int64_t B_win = attn_input->ne[3];
+    auto* flat = ggml_reshape_3d(ctx, attn_input, C_in, N_kv, B_win);
+
+    // QKV projection: [C_in, N, B_win] → [3*C_out, N, B_win]
+    auto* qkv = ggml_mul_mat(ctx, blk.qkv_w, flat);
+    qkv = ggml_add(ctx, qkv, ggml_reshape_3d(ctx, blk.qkv_b, 3 * C_out, 1, 1));
+
+    // Split Q, K, V
+    int64_t head_dim = C_out / blk.num_heads;
+    auto* q = ggml_view_3d(ctx, qkv, C_out, N_kv, B_win,
+                           qkv->nb[1], qkv->nb[2], 0);
+    auto* k = ggml_view_3d(ctx, qkv, C_out, N_kv, B_win,
+                           qkv->nb[1], qkv->nb[2], C_out * ggml_type_size(qkv->type));
+    auto* v = ggml_view_3d(ctx, qkv, C_out, N_kv, B_win,
+                           qkv->nb[1], qkv->nb[2], 2 * C_out * ggml_type_size(qkv->type));
+    q = ggml_cont(ctx, q);
+    k = ggml_cont(ctx, k);
+    v = ggml_cont(ctx, v);
+
+    // Q-pooling WITHIN each window: reshape Q to spatial, MaxPool, reshape back
+    int64_t N_q = N_kv;
+    int64_t out_W, out_H;
+    if (blk.has_q_stride) {
+        int64_t win_W = attn_input->ne[1];
+        int64_t win_H = attn_input->ne[2];
+        auto* q_spatial = ggml_reshape_4d(ctx, q, C_out, win_W, win_H, B_win);
+        auto* q_pooled = sam2_maxpool_2d(ctx, q_spatial);
+        out_W = q_pooled->ne[1];
+        out_H = q_pooled->ne[2];
+        N_q = out_W * out_H;
+        q = ggml_reshape_3d(ctx, q_pooled, C_out, N_q, B_win);
+    } else {
+        out_W = attn_input->ne[1];
+        out_H = attn_input->ne[2];
+    }
+
+    // Reshape for multi-head attention
+    auto* q_mh = ggml_reshape_3d(ctx, q, head_dim, N_q, blk.num_heads * B_win);
+    auto* k_mh = ggml_reshape_3d(ctx, k, head_dim, N_kv, blk.num_heads * B_win);
+    auto* v_mh = ggml_reshape_3d(ctx, v, head_dim, N_kv, blk.num_heads * B_win);
+
+    auto* q4 = ggml_reshape_4d(ctx, q_mh, head_dim, N_q, blk.num_heads, B_win);
+    auto* k4 = ggml_reshape_4d(ctx, k_mh, head_dim, N_kv, blk.num_heads, B_win);
+    auto* v4 = ggml_reshape_4d(ctx, v_mh, head_dim, N_kv, blk.num_heads, B_win);
+
+    float scale = 1.0f / sqrtf((float)head_dim);
+    auto* attn_out = ggml_flash_attn_ext(ctx, q4, k4, v4, nullptr, scale, 0, 0);
+
+    // Recombine heads: [head_dim, N_q, n_heads, B_win] → [C_out, N_q, B_win]
+    auto* recombined = ggml_reshape_3d(ctx, ggml_cont(ctx, attn_out), C_out, N_q, B_win);
+
+    // Output projection
+    auto* attn_proj = ggml_mul_mat(ctx, blk.proj_w, recombined);
+    attn_proj = ggml_add(ctx, attn_proj, ggml_reshape_3d(ctx, blk.proj_b, C_out, 1, 1));
+
+    // Reshape back to spatial
+    auto* attn_spatial = ggml_reshape_4d(ctx, attn_proj, C_out, out_W, out_H, B_win);
+
+    // ── 5. Window unpartition ────────────────────────────────────────────
+    struct ggml_tensor* attn_result = attn_spatial;
+    if (blk.window_size > 0) {
+        int target_H = blk.has_q_stride ? spatial_H / 2 : spatial_H;
+        int target_W = blk.has_q_stride ? spatial_W / 2 : spatial_W;
+
+        int ws_out;
+        int unpart_pad_hw[2];
+        if (blk.has_q_stride) {
+            // After Q-pool, effective window size changes.
+            // Recompute padding from target dims (matching Python lines 152-157).
+            ws_out = blk.window_size / 2;  // integer division, e.g. 7//2=3
+            int pad_h = (ws_out - target_H % ws_out) % ws_out;
+            int pad_w = (ws_out - target_W % ws_out) % ws_out;
+            unpart_pad_hw[0] = target_H + pad_h;
+            unpart_pad_hw[1] = target_W + pad_w;
+        } else {
+            ws_out = blk.window_size;
+            unpart_pad_hw[0] = pad_hw[0];
+            unpart_pad_hw[1] = pad_hw[1];
+        }
+        attn_result = sam2_window_unpartition(ctx, attn_spatial, ws_out,
+                                               unpart_pad_hw, target_H, target_W, B);
+    }
+
+    // ── 6. Residual ─────────────────────────────────────────────────────
+    auto* res1 = ggml_add(ctx, shortcut, attn_result);
+
+    // ── 7. MLP + residual ───────────────────────────────────────────────
+    int64_t new_H = res1->ne[2];
+    int64_t new_W = res1->ne[1];
+    auto* normed2 = ggml_norm(ctx, res1, 1e-6f);
+    normed2 = ggml_mul(ctx, normed2, ggml_repeat(ctx, ggml_reshape_4d(ctx, blk.norm2_w, C_out, 1, 1, 1), normed2));
+    normed2 = ggml_add(ctx, normed2, ggml_repeat(ctx, ggml_reshape_4d(ctx, blk.norm2_b, C_out, 1, 1, 1), normed2));
+
+    auto* flat_mlp = ggml_reshape_2d(ctx, normed2, C_out, new_W * new_H * B);
+    auto* mlp1 = ggml_mul_mat(ctx, blk.mlp_fc1_w, flat_mlp);
+    mlp1 = ggml_add(ctx, mlp1, blk.mlp_fc1_b);
+    mlp1 = ggml_gelu(ctx, mlp1);
+    auto* mlp2 = ggml_mul_mat(ctx, blk.mlp_fc2_w, mlp1);
+    mlp2 = ggml_add(ctx, mlp2, blk.mlp_fc2_b);
+    auto* mlp_out = ggml_reshape_4d(ctx, mlp2, C_out, new_W, new_H, B);
+
+    auto* res2 = ggml_add(ctx, res1, mlp_out);
+
+    return res2;
+}
+
+// Build full Hiera backbone graph.
+// Input: [img_size, img_size, 3, 1] preprocessed image
+// Output: 4 stage outputs in stage_outs[] as [stage_dim, W, H, 1]
+static void sam2_build_hiera_graph(struct ggml_context* ctx,
+                                    struct ggml_tensor* input,
+                                    const sam3_model& model,
+                                    struct ggml_tensor* stage_outs[4]) {
+    const auto& hp = model.hparams;
+    const auto& hiera = model.hiera;
+
+    // ── PatchEmbed: Conv2d(3->E, k=7, s=4, p=3) ──────────────────────────
+    auto* x = ggml_conv_2d(ctx, hiera.patch_embed_w, input, 4, 4, 3, 3, 1, 1);
+    // Conv2d output is [OW, OH, E, 1] in ggml layout.
+    // Add bias: reshape bias to [1, 1, E, 1] for conv2d output layout.
+    x = ggml_add(ctx, x, ggml_reshape_4d(ctx, hiera.patch_embed_b, 1, 1,
+                                           hp.hiera_embed_dim, 1));
+    // Permute from [OW, OH, E, 1] to [E, OW, OH, 1] (channel-first convention)
+    x = ggml_cont(ctx, ggml_permute(ctx, x, 1, 2, 0, 3));
+    // x: [E, 256, 256, 1] in ggml layout (assuming 1024 input)
+
+    // ── Add positional embedding (precomputed on CPU, uploaded as input) ─
+    // PE is set externally as a named input tensor; added here.
+    auto* pe = ggml_new_tensor_4d(ctx, GGML_TYPE_F32,
+                                   hp.hiera_embed_dim,
+                                   hp.img_size / 4, hp.img_size / 4, 1);
+    ggml_set_name(pe, "hiera_pos_embed");
+    ggml_set_input(pe);
+    x = ggml_add(ctx, x, pe);
+
+    // ── Process all blocks ───────────────────────────────────────────────
+    int spatial_H = hp.img_size / 4;
+    int spatial_W = hp.img_size / 4;
+    int stage_idx = 0;
+
+    for (int i = 0; i < hp.hiera_total_blocks(); ++i) {
+        const auto& blk = hiera.blocks[i];
+
+        x = sam2_hiera_block_forward(ctx, x, blk, spatial_H, spatial_W);
+
+        // Update spatial dims if Q-pooling happened
+        if (blk.has_q_stride) {
+            spatial_H /= 2;
+            spatial_W /= 2;
+        }
+
+        // Collect stage output at stage end
+        if (i == hiera.stage_ends[stage_idx]) {
+            // Store as BCHW: permute [C, W, H, 1] → [C, W, H, 1] (already in this format)
+            char name[64];
+            snprintf(name, sizeof(name), "hiera_stage_%d", stage_idx);
+            ggml_set_name(x, name);
+            ggml_set_output(x);
+            stage_outs[stage_idx] = x;
+            stage_idx++;
+        }
+    }
+}
+
+// Build FPN neck graph for SAM2.
+// Input: 4 stage outputs from Hiera backbone
+// Output: 3 FPN levels (after scalp=1) in fpn_outs[] as [D, W, H, 1]
+static void sam2_build_fpn_neck_graph(struct ggml_context* ctx,
+                                       struct ggml_tensor* stage_outs[4],
+                                       const sam3_model& model,
+                                       struct ggml_tensor* fpn_outs[4]) {
+    const auto& hp = model.hparams;
+    const int D = hp.neck_dim;
+
+    // Lateral 1x1 convolutions: convs[n-i] maps stage i
+    // convs[0] -> stage 3 (highest dim), convs[3] -> stage 0 (lowest dim)
+    // ggml_conv_2d expects input [W, H, C, B], so we permute from [C, W, H, B].
+    struct ggml_tensor* laterals[4];
+    for (int i = 0; i < 4; ++i) {
+        int conv_idx = 3 - i;  // stage 0 uses convs[3], stage 3 uses convs[0]
+        // Permute [C, W, H, 1] -> [W, H, C, 1] for conv2d
+        auto* inp = ggml_cont(ctx, ggml_permute(ctx, stage_outs[i], 2, 0, 1, 3));
+        auto* conv_out = ggml_conv_2d(ctx, model.fpn_neck.levels[conv_idx].conv_w,
+                                       inp, 1, 1, 0, 0, 1, 1);
+        // conv_out: [OW, OH, D, 1]  (1x1 conv preserves spatial)
+        conv_out = ggml_add(ctx, conv_out,
+                             ggml_reshape_4d(ctx, model.fpn_neck.levels[conv_idx].conv_b, 1, 1, D, 1));
+        // Permute back to [D, W, H, 1]
+        laterals[i] = ggml_cont(ctx, ggml_permute(ctx, conv_out, 1, 2, 0, 3));
+    }
+
+    // Top-down fusion: process in reverse order (high to low resolution)
+    // fpn_top_down_levels specifies which levels get top-down fusion
+    // ggml_upscale operates on ne[0] and ne[1], so we permute around it.
+    struct ggml_tensor* fpn_raw[4];
+    struct ggml_tensor* prev = nullptr;
+
+    for (int ri = 0; ri < 4; ++ri) {
+        int i = 3 - ri;  // Process from stage 3 down to stage 0
+
+        // Check if this level gets top-down fusion
+        bool is_top_down = false;
+        for (int j = 0; j < hp.fpn_top_down_n; ++j) {
+            if (hp.fpn_top_down_levels[j] == i) { is_top_down = true; break; }
+        }
+
+        if (is_top_down && prev != nullptr) {
+            // Nearest 2x upsample prev and add to lateral.
+            // ggml_upscale scales ne[0],ne[1]; we need to scale W,H (ne[1],ne[2]).
+            // Permute [D, W, H, 1] -> [W, H, D, 1], upscale, permute back.
+            auto* prev_whcb = ggml_cont(ctx, ggml_permute(ctx, prev, 2, 0, 1, 3));
+            auto* upsampled = ggml_upscale(ctx, prev_whcb, 2, GGML_SCALE_MODE_NEAREST);
+            auto* upsampled_cwh = ggml_cont(ctx, ggml_permute(ctx, upsampled, 1, 2, 0, 3));
+            fpn_raw[i] = ggml_add(ctx, laterals[i], upsampled_cwh);
+            prev = fpn_raw[i];
+        } else {
+            fpn_raw[i] = laterals[i];
+            if (is_top_down || prev == nullptr) {
+                prev = fpn_raw[i];
+            }
+        }
+    }
+
+    // Apply scalp: discard the last `scalp` levels (lowest resolution)
+    int n_out = 4 - hp.scalp;
+    for (int i = 0; i < 4; ++i) {
+        if (i < n_out) {
+            fpn_outs[i] = fpn_raw[i];
+        } else {
+            fpn_outs[i] = nullptr;
+        }
+    }
+}
+
+// Full SAM2 image encoding: preprocess → Hiera → FPN → state
+static bool sam2_encode_image_hiera(sam3_state& state,
+                                     const sam3_model& model,
+                                     const sam3_image& image) {
+    auto t_start = std::chrono::high_resolution_clock::now();
+    const auto& hp = model.hparams;
+    const int img_size = hp.img_size;
+
+    fprintf(stderr, "%s: encoding %dx%d image (SAM2 Hiera)\n", __func__,
+            image.width, image.height);
+
+    state.orig_width = image.width;
+    state.orig_height = image.height;
+
+    // ── Preprocess ───────────────────────────────────────────────────────
+    auto img_data = sam2_preprocess_image(image, img_size);
+
+    // ── Build graph ──────────────────────────────────────────────────────
+    const size_t buf_size = ggml_tensor_overhead() * 16384 + ggml_graph_overhead() * 2;
+    struct ggml_init_params gparams = {
+        /*.mem_size   =*/buf_size,
+        /*.mem_buffer =*/nullptr,
+        /*.no_alloc   =*/true,
+    };
+    auto* ctx0 = ggml_init(gparams);
+
+    auto* inp = ggml_new_tensor_4d(ctx0, GGML_TYPE_F32, img_size, img_size, 3, 1);
+    ggml_set_name(inp, "input_image");
+    ggml_set_input(inp);
+
+    // Build Hiera backbone
+    struct ggml_tensor* stage_outs[4] = {};
+    sam2_build_hiera_graph(ctx0, inp, model, stage_outs);
+
+    // Build FPN neck
+    struct ggml_tensor* fpn_outs[4] = {};
+    sam2_build_fpn_neck_graph(ctx0, stage_outs, model, fpn_outs);
+
+    // Mark FPN outputs
+    int n_fpn = 4 - hp.scalp;
+    for (int i = 0; i < n_fpn; ++i) {
+        char name[64];
+        snprintf(name, sizeof(name), "fpn_out_%d", i);
+        ggml_set_name(fpn_outs[i], name);
+        ggml_set_output(fpn_outs[i]);
+    }
+
+    // Build computation graph
+    auto* graph = ggml_new_graph_custom(ctx0, 32768, false);
+    for (int i = 0; i < n_fpn; ++i) {
+        ggml_build_forward_expand(graph, fpn_outs[i]);
+    }
+
+    // ── Allocate + compute ───────────────────────────────────────────────
+    auto* galloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(model.backend));
+    if (!ggml_gallocr_reserve(galloc, graph)) {
+        fprintf(stderr, "%s: failed to reserve graph memory\n", __func__);
+        ggml_gallocr_free(galloc);
+        ggml_free(ctx0);
+        return false;
+    }
+    if (!ggml_gallocr_alloc_graph(galloc, graph)) {
+        fprintf(stderr, "%s: failed to alloc graph\n", __func__);
+        ggml_gallocr_free(galloc);
+        ggml_free(ctx0);
+        return false;
+    }
+
+    // Set input image
+    ggml_backend_tensor_set(inp, img_data.data(), 0, img_data.size() * sizeof(float));
+
+    // Set positional embedding (precomputed on CPU)
+    {
+        int pe_H = img_size / 4;
+        int pe_W = img_size / 4;
+        auto pe_data = sam2_compute_pos_embed(model, pe_H, pe_W);
+        auto* pe_tensor = ggml_graph_get_tensor(graph, "hiera_pos_embed");
+        ggml_backend_tensor_set(pe_tensor, pe_data.data(), 0, pe_data.size() * sizeof(float));
+    }
+
+    // Compute
+    if (ggml_backend_is_cpu(model.backend)) {
+        ggml_backend_cpu_set_n_threads(model.backend, state.n_threads);
+    }
+    if (ggml_backend_graph_compute(model.backend, graph) != GGML_STATUS_SUCCESS) {
+        fprintf(stderr, "%s: graph compute failed\n", __func__);
+        ggml_gallocr_free(galloc);
+        ggml_free(ctx0);
+        return false;
+    }
+
+    // ── Copy results to state ────────────────────────────────────────────
+    // Free old state buffers
+    if (state.buffer) { ggml_backend_buffer_free(state.buffer); state.buffer = nullptr; }
+    if (state.pe_buf) { ggml_backend_buffer_free(state.pe_buf); state.pe_buf = nullptr; }
+    if (state.pe_ctx) { ggml_free(state.pe_ctx); state.pe_ctx = nullptr; }
+    if (state.ctx) { ggml_free(state.ctx); state.ctx = nullptr; }
+
+    // Create state context for persistent tensors
+    size_t state_ctx_size = ggml_tensor_overhead() * 32;
+    struct ggml_init_params sparams = {state_ctx_size, nullptr, true};
+    state.ctx = ggml_init(sparams);
+
+    for (int i = 0; i < n_fpn; ++i) {
+        auto* src = fpn_outs[i];
+        state.neck_trk[i] = ggml_new_tensor_4d(state.ctx, GGML_TYPE_F32,
+                                                 src->ne[0], src->ne[1], src->ne[2], src->ne[3]);
+        char name[64];
+        snprintf(name, sizeof(name), "neck_trk_%d", i);
+        ggml_set_name(state.neck_trk[i], name);
+    }
+    for (int i = n_fpn; i < 4; ++i) {
+        state.neck_trk[i] = nullptr;
+    }
+
+    // Allocate state buffer
+    state.buffer = ggml_backend_alloc_ctx_tensors(state.ctx, model.backend);
+
+    // Copy FPN outputs to state
+    for (int i = 0; i < n_fpn; ++i) {
+        int64_t n_bytes = ggml_nbytes(state.neck_trk[i]);
+        std::vector<char> buf(n_bytes);
+        ggml_backend_tensor_get(fpn_outs[i], buf.data(), 0, n_bytes);
+        ggml_backend_tensor_set(state.neck_trk[i], buf.data(), 0, n_bytes);
+    }
+
+    // Compute sinusoidal PE for each FPN level
+    size_t pe_ctx_size = ggml_tensor_overhead() * 16;
+    struct ggml_init_params pe_params = {pe_ctx_size, nullptr, true};
+    state.pe_ctx = ggml_init(pe_params);
+
+    for (int i = 0; i < n_fpn; ++i) {
+        int H = (int)state.neck_trk[i]->ne[2];
+        int W = (int)state.neck_trk[i]->ne[1];
+        auto pe = sam3_sinusoidal_pe_2d(H, W, hp.neck_dim);
+        state.neck_trk_pe[i] = ggml_new_tensor_4d(state.pe_ctx, GGML_TYPE_F32,
+                                                    hp.neck_dim, W, H, 1);
+        char name[64];
+        snprintf(name, sizeof(name), "neck_trk_pe_%d", i);
+        ggml_set_name(state.neck_trk_pe[i], name);
+    }
+    state.pe_buf = ggml_backend_alloc_ctx_tensors(state.pe_ctx, model.backend);
+    for (int i = 0; i < n_fpn; ++i) {
+        int H = (int)state.neck_trk[i]->ne[2];
+        int W = (int)state.neck_trk[i]->ne[1];
+        auto pe = sam3_sinusoidal_pe_2d(H, W, hp.neck_dim);
+        ggml_backend_tensor_set(state.neck_trk_pe[i], pe.data(), 0, pe.size() * sizeof(float));
+    }
+
+    ggml_gallocr_free(galloc);
+    ggml_free(ctx0);
+
+    auto t_end = std::chrono::high_resolution_clock::now();
+    auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(t_end - t_start).count();
+    fprintf(stderr, "%s: SAM2 image encoded in %lld ms\n", __func__, ms);
+    for (int i = 0; i < n_fpn; ++i) {
+        fprintf(stderr, "  neck_trk[%d]: [%lld, %lld, %lld, %lld]\n", i,
+                (long long)state.neck_trk[i]->ne[0], (long long)state.neck_trk[i]->ne[1],
+                (long long)state.neck_trk[i]->ne[2], (long long)state.neck_trk[i]->ne[3]);
+    }
+
+    return true;
+}
+
+/*****************************************************************************
 ** Image backbone — public API
 *****************************************************************************/
 
 bool sam3_encode_image(sam3_state& state,
                        const sam3_model& model,
                        const sam3_image& image) {
+    // ── SAM2 dispatch ────────────────────────────────────────────────────
+    if (model.hparams.is_sam2()) {
+        return sam2_encode_image_hiera(state, model, image);
+    }
+
 #if SAM3_LOG_LEVEL >= 1
     auto t_start = std::chrono::high_resolution_clock::now();
 #endif
@@ -5575,8 +6917,8 @@ static sam3_prompt_data sam3_build_prompt_and_pos(
     const auto& hp = model.hparams;
     const int MD = hp.mem_out_dim;  // 64
     const int D = hp.neck_dim;      // 256
-    const int H = hp.n_img_embd();  // 72
-    const int HH = H * H;           // 5184
+    const int H = hp.feat_size();   // 72 (SAM3) or 64 (SAM2)
+    const int HH = H * H;
 
     sam3_prompt_data pd;
     pd.num_obj_ptr_tokens = 0;
@@ -5788,10 +7130,44 @@ static void sam3_extract_obj_ptr_cpu(
     float obj_score,
     float* out_ptr)  // [D]
 {
-    const int D = model.hparams.neck_dim;
-    const float occlusion_threshold = 0.0f;
+    const auto& hp = model.hparams;
+    const int D = hp.neck_dim;
 
-    if (obj_score <= occlusion_threshold) {
+    // SAM2 with fixed_no_obj_ptr: blend projected ptr with no_obj_ptr
+    // based on presence score λ.
+    // SAM3 / SAM2 without fixed_no_obj_ptr: binary threshold.
+    if (hp.is_sam2() && hp.fixed_no_obj_ptr) {
+        // λ = (obj_score > 0) ? 1.0 : 0.0  (hard threshold, not sigmoid)
+        float lambda = (obj_score > 0.0f) ? 1.0f : 0.0f;
+
+        // Project token through MLP
+        std::vector<float> h(D), tmp(D);
+        std::copy(sam_token_data, sam_token_data + D, h.data());
+        for (int j = 0; j < 3; ++j) {
+            auto* w = model.obj_ptr_proj_w[j];
+            auto* b = model.obj_ptr_proj_b[j];
+            int nel_w = (int)(w->ne[0] * w->ne[1]);
+            std::vector<float> w_data(nel_w), b_data(D);
+            sam3_read_f32(w, w_data.data(), nel_w);
+            sam3_read_f32(b, b_data.data(), D);
+            for (int o = 0; o < D; ++o) {
+                float sum = b_data[o];
+                for (int i = 0; i < D; ++i) sum += w_data[o * D + i] * h[i];
+                tmp[o] = (j < 2) ? std::max(0.0f, sum) : sum;
+            }
+            std::swap(h, tmp);
+        }
+
+        // Blend: obj_ptr = λ * projected + (1-λ) * no_obj_ptr
+        std::vector<float> no_ptr(D);
+        ggml_backend_tensor_get(model.no_obj_ptr, no_ptr.data(), 0, D * sizeof(float));
+        for (int i = 0; i < D; ++i)
+            out_ptr[i] = lambda * h[i] + (1.0f - lambda) * no_ptr[i];
+        return;
+    }
+
+    // SAM3 / default path: binary threshold
+    if (obj_score <= 0.0f) {
         ggml_backend_tensor_get(model.no_obj_ptr, out_ptr, 0, D * sizeof(float));
         return;
     }
@@ -6068,8 +7444,9 @@ static sam3_box sam3_cxcywh_to_xyxy(float cx, float cy, float w, float h,
 sam3_result sam3_segment_pcs(sam3_state& state,
                              const sam3_model& model,
                              const sam3_pcs_params& params) {
-    if (model.hparams.visual_only) {
-        fprintf(stderr, "%s: ERROR: PCS not available on visual-only model\n", __func__);
+    if (model.hparams.visual_only || model.hparams.is_sam2()) {
+        fprintf(stderr, "%s: ERROR: PCS not available on %s model\n",
+                __func__, model.hparams.is_sam2() ? "SAM2" : "visual-only");
         return sam3_result{};
     }
 
@@ -6423,7 +7800,7 @@ sam3_result sam3_segment_pcs(sam3_state& state,
     /*
     ** ── SUB-GRAPH 5: Segmentation Head ───────────────────────────────
     */
-    const int mask_hw = 288;
+    const int mask_hw = H * 4;  // 288 for SAM3
     std::vector<float> all_masks(NQ * mask_hw * mask_hw);
     {
         const size_t sz = ggml_tensor_overhead() * 16384 + ggml_graph_overhead() * 2;
@@ -6890,16 +8267,25 @@ static sam3_dec_result sam3_build_sam_dec_graph(
     const auto& dec = model.sam_dec;
     const auto& hp = model.hparams;
     const int D = hp.sam_embed_dim;  // 256
-    const int H = hp.n_img_embd();   // 72
+    const int H = hp.feat_size();    // 72 (SAM3) or 64 (SAM2)
     const int N_pts = (int)sparse_emb->ne[1];
     const int n_heads = 8;                               // SAM uses 8 heads
     const int num_mask_tokens = hp.sam_n_multimask + 1;  // 4
 
-    // Output tokens: [obj_score(1), iou(1), masks(4)] + sparse prompt → [D, 6+N_pts, 1]
-    auto* output_tokens = ggml_concat(ctx, dec.obj_score_token, dec.iou_token, 1);
-    output_tokens = ggml_concat(ctx, output_tokens, dec.mask_tokens, 1);
-    output_tokens = ggml_reshape_3d(ctx, output_tokens, D, 6, 1);
+    // ── Concatenate output tokens ────────────────────────────────────────
+    // When pred_obj_scores=True:  [obj_score(1,D), iou(1,D), masks(4,D)] = 6 tokens
+    // When pred_obj_scores=False: [iou(1,D), masks(4,D)] = 5 tokens (older SAM2)
+    const bool has_obj_score = (dec.obj_score_token != nullptr);
+    const int n_special = (has_obj_score ? 6 : 5);
 
+    struct ggml_tensor* output_tokens;
+    if (has_obj_score) {
+        output_tokens = ggml_concat(ctx, dec.obj_score_token, dec.iou_token, 1);
+    } else {
+        output_tokens = ggml_reshape_2d(ctx, dec.iou_token, D, 1);
+    }
+    output_tokens = ggml_concat(ctx, output_tokens, dec.mask_tokens, 1);
+    output_tokens = ggml_reshape_3d(ctx, output_tokens, D, n_special, 1);
     auto* tokens = ggml_concat(ctx, output_tokens, sparse_emb, 1);
     ggml_set_name(tokens, "sam_dec_tokens_initial");
 
@@ -6932,25 +8318,31 @@ static sam3_dec_result sam3_build_sam_dec_graph(
         ggml_set_name(queries, "sam_dec_final_queries");
     }
 
-    // Extract output tokens: [0]=obj_score, [1]=iou, [2:6]=masks
+    // ── Extract output tokens ────────────────────────────────────────────
+    // With pred_obj_scores=True (6 tokens):  obj(0), iou(1), masks(2..5)
+    // With pred_obj_scores=False (5 tokens): iou(0), masks(1..4)
+    const int s = has_obj_score ? 1 : 0;
     auto* iou_token_out = ggml_view_3d(ctx, queries, D, 1, 1,
                                        queries->nb[1], queries->nb[2],
-                                       1 * queries->nb[1]);
+                                       s * queries->nb[1]);
     iou_token_out = ggml_cont(ctx, iou_token_out);  // [D, 1, 1]
 
     auto* mask_tokens_out = ggml_view_3d(ctx, queries, D, num_mask_tokens, 1,
                                          queries->nb[1], queries->nb[2],
-                                         2 * queries->nb[1]);
+                                         (s + 1) * queries->nb[1]);
     mask_tokens_out = ggml_cont(ctx, mask_tokens_out);  // [D, 4, 1]
     ggml_set_name(mask_tokens_out, "sam_dec_mask_tokens");
 
-    auto* obj_in = ggml_view_3d(ctx, queries, D, 1, 1,
-                                queries->nb[1], queries->nb[2], 0);
-    obj_in = ggml_cont(ctx, obj_in);  // [D, 1, 1]
+    struct ggml_tensor* obj_in = nullptr;
+    if (has_obj_score) {
+        obj_in = ggml_view_3d(ctx, queries, D, 1, 1,
+                              queries->nb[1], queries->nb[2], 0);
+        obj_in = ggml_cont(ctx, obj_in);  // [D, 1, 1]
+    }
 
-    // Also extract SAM output token (index 2 = first mask token, used for object pointer)
+    // SAM output token = first mask token, used for object pointer
     auto* sam_token = ggml_view_2d(ctx, queries, D, 1,
-                                   queries->nb[1], 2 * queries->nb[1]);
+                                   queries->nb[1], (s + 1) * queries->nb[1]);
     sam_token = ggml_cont(ctx, sam_token);  // [D, 1]
     ggml_set_name(sam_token, "sam_dec_sam_token");
 
@@ -7000,9 +8392,9 @@ static sam3_dec_result sam3_build_sam_dec_graph(
 
     // ── Hypernetwork: predict masks ──────────────────────────────────────
     // For each mask token i, pass through 3-layer MLP to get [32] vector
-    // Then dot product with upscaled_embedding [32, 288*288] to get mask
-    // Flatten upscaled: [32, 288*288, 1]
-    auto* up_flat = ggml_reshape_3d(ctx, up2, 32, 288 * 288, 1);  // [32, 288*288, 1]
+    // Then dot product with upscaled_embedding [32, (H*4)^2] to get mask
+    const int H4 = H * 4;
+    auto* up_flat = ggml_reshape_3d(ctx, up2, 32, H4 * H4, 1);
 
     // Process each mask token through its hypernetwork MLP
     // mask_tokens_out: [D, 4, 1]
@@ -7042,12 +8434,19 @@ static sam3_dec_result sam3_build_sam_dec_graph(
     ggml_set_name(iou_pred, "sam_dec_iou");
 
     // ── Object score ─────────────────────────────────────────────────────
-    // obj_in: [D, 1, 1]
-    auto* obj_score = sam3_mlp_forward(ctx, obj_in,
-                                       dec.obj_head_w, dec.obj_head_b, 3);
-    // obj_score: [1, 1, 1] → reshape to [1, 1]
-    obj_score = ggml_reshape_2d(ctx, obj_score, 1, 1);
-    ggml_set_name(obj_score, "sam_dec_obj_score");
+    struct ggml_tensor* obj_score;
+    if (has_obj_score) {
+        // obj_in: [D, 1, 1] → MLP → [1, 1, 1]
+        obj_score = sam3_mlp_forward(ctx, obj_in,
+                                     dec.obj_head_w, dec.obj_head_b, 3);
+        obj_score = ggml_reshape_2d(ctx, obj_score, 1, 1);
+    } else {
+        // No obj_score prediction — return raw logit 10.0 (sigmoid ≈ 1.0, object always present)
+        obj_score = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 1, 1);
+        ggml_set_name(obj_score, "sam_dec_obj_score");
+        ggml_set_input(obj_score);
+        // Mark that callers must set this to 10.0f before compute
+    }
 
     sam3_dec_result res;
     res.masks = masks;
@@ -7070,7 +8469,7 @@ sam3_result sam3_segment_pvs(sam3_state& state,
 #endif
     const auto& hp = model.hparams;
     const int D = hp.sam_embed_dim;                      // 256
-    const int H = hp.n_img_embd();                       // 72
+    const int H = hp.feat_size();                        // 72 (SAM3) or 64 (SAM2)
     const int num_mask_tokens = hp.sam_n_multimask + 1;  // 4
     sam3_result result;
 
@@ -7163,6 +8562,12 @@ sam3_result sam3_segment_pvs(sam3_state& state,
 
     SAM3_LOG(2, "%s: graph allocated, %d nodes\n", __func__, ggml_graph_n_nodes(graph));
 
+    // Set default obj_score when pred_obj_scores=False (older SAM2 models)
+    if (!model.sam_dec.obj_score_token) {
+        auto* t = ggml_graph_get_tensor(graph, "sam_dec_obj_score");
+        if (t) { float v = 10.0f; ggml_backend_tensor_set(t, &v, 0, sizeof(float)); }
+    }
+
     // ── Upload input data (using cached embeddings) ────────────────────
     // Populate PE cache on first call (reads model weights from GPU once)
     sam3_populate_pe_cache(state, model);
@@ -7246,8 +8651,8 @@ sam3_result sam3_segment_pvs(sam3_state& state,
     }
 
     // ── Read outputs ─────────────────────────────────────────────────────
-    // masks: [288*288, 4, 1]
-    const int mask_hw = 288;
+    // masks: [H*4×H*4, 4, 1]
+    const int mask_hw = H * 4;
     std::vector<float> masks_data(mask_hw * mask_hw * num_mask_tokens);
     ggml_backend_tensor_get(dec_out.masks, masks_data.data(), 0, masks_data.size() * sizeof(float));
 
@@ -7350,8 +8755,8 @@ static void sam3_ensure_tracker_pe_caches(sam3_tracker& tracker, const sam3_hpar
 
     const int D = hp.neck_dim;       // 256
     const int MD = hp.mem_out_dim;   // 64
-    const int H = hp.n_img_embd();   // 72
-    const int N = H * H;             // 5184
+    const int H = hp.feat_size();    // 72 (SAM3) or 64 (SAM2)
+    const int N = H * H;
     const int half_d = D / 2;        // 128
 
     tracker.cached_sinpe_256 = sam3_sinusoidal_pe_2d(H, H, D);
@@ -7380,8 +8785,8 @@ static sam3_prop_output sam3_propagate_single(
     const std::vector<std::pair<int, struct ggml_tensor*>>& ptr_bank) {
     sam3_prop_output output = {};
     const auto& hp = model.hparams;
-    const int D = hp.neck_dim, MD = hp.mem_out_dim, H = hp.n_img_embd();
-    const int N = H * H;  // 5184
+    const int D = hp.neck_dim, MD = hp.mem_out_dim, H = hp.feat_size();
+    const int N = H * H;
 
     auto sel = sam3_select_memory_frames(mem_bank, hp.num_maskmem);
     if (sel.empty()) return output;
@@ -7498,12 +8903,14 @@ static sam3_prop_output sam3_propagate_single(
     ggml_set_output(dec.iou_pred);
     ggml_set_output(dec.obj_score);
     ggml_set_output(dec.sam_token);
+    if (dec.mask_tokens) ggml_set_output(dec.mask_tokens);
 
     auto* graph = ggml_new_graph_custom(ctx0, 32768, false);
     ggml_build_forward_expand(graph, dec.masks);
     ggml_build_forward_expand(graph, dec.iou_pred);
     ggml_build_forward_expand(graph, dec.obj_score);
     ggml_build_forward_expand(graph, dec.sam_token);
+    if (dec.mask_tokens) ggml_build_forward_expand(graph, dec.mask_tokens);
 
     auto* galloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(model.backend));
     if (!ggml_gallocr_reserve(galloc, graph) || !ggml_gallocr_alloc_graph(galloc, graph)) {
@@ -7519,7 +8926,13 @@ static sam3_prop_output sam3_propagate_single(
     if (rope_k_t && !rope_k_data.empty())
         ggml_backend_tensor_set(rope_k_t, rope_k_data.data(), 0, rope_k_data.size() * sizeof(float));
 
-    // Upload src_pos (sinusoidal PE 256-dim for 72×72)
+    // Set default obj_score when pred_obj_scores=False (older SAM2 models)
+    if (!model.sam_dec.obj_score_token) {
+        auto* t = ggml_graph_get_tensor(graph, "sam_dec_obj_score");
+        if (t) { float v = 10.0f; ggml_backend_tensor_set(t, &v, 0, sizeof(float)); }
+    }
+
+    // Upload src_pos (sinusoidal PE 256-dim)
     ggml_backend_tensor_set(src_pos_t, tracker.cached_sinpe_256.data(), 0,
                             tracker.cached_sinpe_256.size() * sizeof(float));
 
@@ -7552,17 +8965,56 @@ static sam3_prop_output sam3_propagate_single(
         return output;
     }
 
-    const int mhw = 288;
-    output.n_masks = 1;
-    output.mask_h = mhw;
-    output.mask_w = mhw;
-    output.mask_logits.resize(mhw * mhw);
-    ggml_backend_tensor_get(dec.masks, output.mask_logits.data(), 0, mhw * mhw * sizeof(float));
-    output.iou_scores.resize(1);
-    ggml_backend_tensor_get(dec.iou_pred, output.iou_scores.data(), 0, sizeof(float));
-    ggml_backend_tensor_get(dec.obj_score, &output.obj_score, 0, sizeof(float));
-    output.sam_token.resize(D);
-    ggml_backend_tensor_get(dec.sam_token, output.sam_token.data(), 0, D * sizeof(float));
+    const int mhw = H * 4;
+    const int num_mask_tokens = hp.sam_n_multimask + 1;  // 4
+
+    // SAM2 with multimask_output_in_sam: read all masks, select best by IoU.
+    // SAM3 / SAM2 without multimask: use first mask only.
+    bool use_multimask = hp.is_sam2() && hp.multimask_output_in_sam;
+
+    if (use_multimask) {
+        // Read all 4 IoU predictions
+        std::vector<float> all_ious(num_mask_tokens);
+        ggml_backend_tensor_get(dec.iou_pred, all_ious.data(), 0, num_mask_tokens * sizeof(float));
+
+        // Multimask uses mask tokens 1-3 (skip token 0 which is the single-mask output)
+        int best_idx = 1;
+        float best_iou = all_ious[1];
+        for (int m = 2; m < num_mask_tokens; ++m) {
+            if (all_ious[m] > best_iou) { best_iou = all_ious[m]; best_idx = m; }
+        }
+
+        output.n_masks = 1;
+        output.mask_h = mhw;
+        output.mask_w = mhw;
+        output.mask_logits.resize(mhw * mhw);
+        // Read best mask (offset by best_idx * mhw * mhw)
+        ggml_backend_tensor_get(dec.masks, output.mask_logits.data(),
+                                best_idx * mhw * mhw * sizeof(float), mhw * mhw * sizeof(float));
+        output.iou_scores.resize(1);
+        output.iou_scores[0] = best_iou;
+        ggml_backend_tensor_get(dec.obj_score, &output.obj_score, 0, sizeof(float));
+
+        // Object pointer token: use best multimask token if use_multimask_token_for_obj_ptr
+        output.sam_token.resize(D);
+        if (hp.use_multimask_token_for_obj_ptr && dec.mask_tokens) {
+            ggml_backend_tensor_get(dec.mask_tokens, output.sam_token.data(),
+                                    best_idx * D * sizeof(float), D * sizeof(float));
+        } else {
+            ggml_backend_tensor_get(dec.sam_token, output.sam_token.data(), 0, D * sizeof(float));
+        }
+    } else {
+        output.n_masks = 1;
+        output.mask_h = mhw;
+        output.mask_w = mhw;
+        output.mask_logits.resize(mhw * mhw);
+        ggml_backend_tensor_get(dec.masks, output.mask_logits.data(), 0, mhw * mhw * sizeof(float));
+        output.iou_scores.resize(1);
+        ggml_backend_tensor_get(dec.iou_pred, output.iou_scores.data(), 0, sizeof(float));
+        ggml_backend_tensor_get(dec.obj_score, &output.obj_score, 0, sizeof(float));
+        output.sam_token.resize(D);
+        ggml_backend_tensor_get(dec.sam_token, output.sam_token.data(), 0, D * sizeof(float));
+    }
 
     ggml_gallocr_free(galloc);
     ggml_free(ctx0);
@@ -7625,12 +9077,13 @@ static bool sam3_encode_memory(
     int inst_id, const float* mask_logits, int mask_h, int mask_w,
     int frame_idx, bool is_cond, float obj_score) {
     const auto& hp = model.hparams;
-    const int D = hp.neck_dim, MD = hp.mem_out_dim, H = hp.n_img_embd();
-    const int HIGH_RES = 1008, INTERPOL = H * 16;  // 1152
+    const int D = hp.neck_dim, MD = hp.mem_out_dim, H = hp.feat_size();
+    const int HIGH_RES = hp.img_size, INTERPOL = H * 16;
 
-    // Mask preprocessing: 288→1008→sigmoid→scale→bias→1152
+    // Mask preprocessing: mask_logits → HIGH_RES → sigmoid → scale/bias → INTERPOL
     auto m_hires = sam3_bilinear_interpolate(mask_logits, mask_w, mask_h, HIGH_RES, HIGH_RES);
-    for (auto& v : m_hires) { float s = 1.0f / (1.0f + expf(-v)); v = s * 20.0f - 10.0f; }
+    const float sig_scale = hp.sigmoid_scale(), sig_bias = hp.sigmoid_bias();
+    for (auto& v : m_hires) { float s = 1.0f / (1.0f + expf(-v)); v = s * sig_scale + sig_bias; }
     auto m_interp = sam3_bilinear_interpolate(m_hires.data(), HIGH_RES, HIGH_RES, INTERPOL, INTERPOL);
 
     const size_t bs = ggml_tensor_overhead() * 16384 + ggml_graph_overhead();
@@ -7789,6 +9242,11 @@ static void sam3_store_obj_ptr(
 
 sam3_tracker_ptr sam3_create_tracker(const sam3_model& model,
                                      const sam3_video_params& params) {
+    if (model.hparams.is_sam2()) {
+        fprintf(stderr, "%s: ERROR: text-prompted tracker not available for SAM2 "
+                "(use sam3_create_visual_tracker instead)\n", __func__);
+        return nullptr;
+    }
     sam3_tracker_ptr tracker(new sam3_tracker());
     tracker->params = params;
     fprintf(stderr, "%s: tracker created (hotstart=%d, max_keep_alive=%d)\n",
@@ -7917,8 +9375,8 @@ sam3_result sam3_track_frame(sam3_tracker& tracker, sam3_state& state,
         const auto& det = nd.detections[j];
         if (!det.mask.data.empty()) {
             // Build mask logits from the PCS detection's binary mask.
-            const int mh = 288, mw = 288;
-            // Resize to 288×288 logit space: inside mask → +5.0, outside → -5.0.
+            const int mh = model.hparams.feat_size() * 4, mw = mh;
+            // Resize to mh×mw logit space: inside mask → +5.0, outside → -5.0.
             std::vector<float> det_logits(mh * mw);
             for (int r = 0; r < mh; ++r) {
                 for (int c = 0; c < mw; ++c) {
@@ -8061,7 +9519,7 @@ int sam3_tracker_add_instance(sam3_tracker& tracker, sam3_state& state,
                               const sam3_model& model,
                               const sam3_pvs_params& pvs_params) {
     const int D = model.hparams.neck_dim;
-    const int mask_hw = 288;
+    const int mask_hw = model.hparams.feat_size() * 4;
 
     // Run PVS to get the segmentation mask
     auto r = sam3_segment_pvs(state, model, pvs_params);
@@ -9932,14 +11390,15 @@ static bool sam3_test_dump_phase7_mem_slot_current(
     const auto& hp = model.hparams;
     const int D = hp.neck_dim;
     const int MD = hp.mem_out_dim;
-    const int H = hp.n_img_embd();
-    const int MASK_HW = 288;
-    const int HIGH_RES = 1008;
-    const int INTERPOL = H * 16;  // 1152
+    const int H = hp.feat_size();
+    const int MASK_HW = H * 4;
+    const int HIGH_RES = hp.img_size;
+    const int INTERPOL = H * 16;
 
-    // Mask preprocessing: 288→1008 sigmoid scale bias → 1152
+    // Mask preprocessing: MASK_HW → HIGH_RES → sigmoid+scale+bias → INTERPOL
     auto m_hires = sam3_bilinear_interpolate(low_res_mask_logits.data(), MASK_HW, MASK_HW, HIGH_RES, HIGH_RES);
-    for (auto& v : m_hires) { float s = 1.0f / (1.0f + expf(-v)); v = s * 20.0f - 10.0f; }
+    const float sig_s = hp.sigmoid_scale(), sig_b = hp.sigmoid_bias();
+    for (auto& v : m_hires) { float s = 1.0f / (1.0f + expf(-v)); v = s * sig_s + sig_b; }
     auto m_interp = sam3_bilinear_interpolate(m_hires.data(), HIGH_RES, HIGH_RES, INTERPOL, INTERPOL);
 
     const size_t buf_size = ggml_tensor_overhead() * 16384 + ggml_graph_overhead();
@@ -10095,11 +11554,11 @@ bool sam3_test_dump_phase7_from_ref_inputs(const sam3_model& model,
     const auto& hp = model.hparams;
     const int D = hp.neck_dim;
     const int MD = hp.mem_out_dim;
-    const int H = hp.n_img_embd();
+    const int H = hp.feat_size();
     const int N = H * H;
     const int H1 = H * 2;
     const int H0 = H * 4;
-    const int MASK_HW = 288;
+    const int MASK_HW = H * 4;
     const int half_d = D / 2;  // 128
 
     std::map<std::string, std::string> meta;
