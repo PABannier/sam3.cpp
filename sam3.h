@@ -79,6 +79,38 @@ struct sam3_params {
     int         seed      = 42;
 };
 
+struct sam3_tensor_info {
+    int64_t ne[4] = {0, 0, 0, 0};
+    uint64_t nb[4] = {0, 0, 0, 0};
+    int type = 0;
+    int op = 0;
+    bool is_contiguous = false;
+};
+
+enum sam3_vit_block_stage {
+    SAM3_VIT_BLOCK_STAGE_NORM1 = 0,
+    SAM3_VIT_BLOCK_STAGE_WINDOW_PART,
+    SAM3_VIT_BLOCK_STAGE_QKV_PROJ,
+    SAM3_VIT_BLOCK_STAGE_ATTN_CORE,
+    SAM3_VIT_BLOCK_STAGE_ATTN_PROJ,
+    SAM3_VIT_BLOCK_STAGE_WINDOW_UNPART,
+    SAM3_VIT_BLOCK_STAGE_NORM2,
+    SAM3_VIT_BLOCK_STAGE_MLP_FC1,
+    SAM3_VIT_BLOCK_STAGE_MLP_GELU,
+    SAM3_VIT_BLOCK_STAGE_MLP_FC2,
+    SAM3_VIT_BLOCK_STAGE_MLP,
+};
+
+enum sam3_vit_prefix_stage {
+    SAM3_VIT_PREFIX_STAGE_PATCH_EMBED = 0,
+    SAM3_VIT_PREFIX_STAGE_PATCH_IM2COL,
+    SAM3_VIT_PREFIX_STAGE_PATCH_MULMAT_RAW,
+    SAM3_VIT_PREFIX_STAGE_PATCH_MULMAT,
+    SAM3_VIT_PREFIX_STAGE_POS_ADD,
+    SAM3_VIT_PREFIX_STAGE_LN_PRE_NORM,
+    SAM3_VIT_PREFIX_STAGE_LN_PRE,
+};
+
 struct sam3_pcs_params {
     std::string            text_prompt;
     std::vector<sam3_box>  pos_exemplars;
@@ -350,6 +382,21 @@ bool sam3_dump_state_tensor(const sam3_state & state,
                              const std::string & tensor_name,
                              const std::string & output_path);
 
+/* Query metadata for a named state tensor without dumping its payload. */
+bool sam3_get_state_tensor_info(const sam3_state & state,
+                                const std::string & tensor_name,
+                                sam3_tensor_info  & info);
+
+/* Dump a named model tensor (weights/constants) to a binary file. */
+bool sam3_dump_model_tensor(const sam3_model   & model,
+                            const std::string  & tensor_name,
+                            const std::string  & output_path);
+
+/* Query metadata for a named model tensor. */
+bool sam3_get_model_tensor_info(const sam3_model  & model,
+                                const std::string & tensor_name,
+                                sam3_tensor_info  & info);
+
 /*
 ** Encode an image from pre-preprocessed float data (CHW layout, already
 ** resized and normalized).  Bypasses C++ preprocessing so that numerical
@@ -360,3 +407,64 @@ bool sam3_encode_image_from_preprocessed(sam3_state       & state,
                                           const sam3_model & model,
                                           const float      * chw_data,
                                           int                img_size);
+
+/*
+** Test-only: run ONLY the ViT encoder from preprocessed float data and keep
+** only the requested intermediate tensors alive for dumping/comparison.
+*/
+bool sam3_encode_vit_from_preprocessed_selective(sam3_state                    & state,
+                                                 const sam3_model              & model,
+                                                 const float                   * chw_data,
+                                                 int                             img_size,
+                                                 const std::vector<std::string> & output_tensors);
+
+/*
+** Test-only: run the exact ViT prefix up to the tensor entering block 0
+** (patch embed + pos embed + ln_pre).
+*/
+bool sam3_test_run_vit_block0_input(const sam3_model   & model,
+                                    const float        * chw_data,
+                                    int                  img_size,
+                                    std::vector<float> & output_data,
+                                    int64_t              output_ne[4],
+                                    int                  n_threads = 4);
+
+/*
+** Test-only: run an exact ViT prefix sub-stage on the real model tensors using
+** the model's backend. PATCH_EMBED expects image input [W,H,3,1]. Later stages
+** expect feature input [E,W,H,1] in ggml 4D layout.
+*/
+bool sam3_test_run_vit_prefix_stage(const sam3_model         & model,
+                                    sam3_vit_prefix_stage      stage,
+                                    const float              * input_data,
+                                    const int64_t              input_ne[4],
+                                    std::vector<float>       & output_data,
+                                    int64_t                    output_ne[4],
+                                    int                        n_threads = 4);
+bool sam3_test_run_patch_mulmat_host_ref(const sam3_model         & model,
+                                         const float              * input_data,
+                                         const int64_t              input_ne[4],
+                                         bool                       use_double_accum,
+                                         std::vector<float>       & output_data,
+                                         int64_t                    output_ne[4]);
+bool sam3_test_run_vit_block_linear_host_ref(const sam3_model         & model,
+                                             int                        block_idx,
+                                             sam3_vit_block_stage       stage,
+                                             const float              * input_data,
+                                             const int64_t              input_ne[4],
+                                             bool                       use_double_accum,
+                                             std::vector<float>       & output_data,
+                                             int64_t                    output_ne[4]);
+
+/*
+** Test-only: run an exact ViT block sub-stage on the real model tensors using
+** the model's backend. The input is always provided as F32 in ggml 4D layout.
+*/
+bool sam3_test_run_vit_block_stage(const sam3_model        & model,
+                                   int                       block_idx,
+                                   sam3_vit_block_stage      stage,
+                                   const float             * input_data,
+                                   const int64_t             input_ne[4],
+                                   std::vector<float>      & output_data,
+                                   int64_t                   output_ne[4],
+                                   int                       n_threads = 4);
