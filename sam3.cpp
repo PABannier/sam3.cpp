@@ -8182,6 +8182,16 @@ static struct ggml_tensor* sam3_sam_attention(
     auto* K = ggml_add(ctx, ggml_mul_mat(ctx, attn.k_w, k_in), attn.k_b);
     auto* V = ggml_add(ctx, ggml_mul_mat(ctx, attn.v_w, v_in), attn.v_b);
 
+    // Debug: mark projections for the first SA call (N_q=8 tokens, block 0)
+    static int _sa_call_count = 0;
+    if (_sa_call_count == 0 && N_q <= 16) {
+        ggml_set_name(Q, "dbg_sa0_Q_proj");
+        ggml_set_output(Q);
+        ggml_set_name(V, "dbg_sa0_V_proj");
+        ggml_set_output(V);
+    }
+    _sa_call_count++;
+
     // internal_dim = out_proj cols = attn.q_w->ne[1]
     const int64_t ID = attn.q_w->ne[1];
     const int64_t HD = ID / n_heads;
@@ -8194,17 +8204,60 @@ static struct ggml_tensor* sam3_sam_attention(
     K = ggml_cont(ctx, ggml_permute(ctx, K, 0, 2, 1, 3));  // [HD, N_kv, NH, B]
 
     V = ggml_reshape_4d(ctx, V, HD, n_heads, N_kv, B);
-    V = ggml_permute(ctx, V, 0, 2, 1, 3);  // [HD, N_kv, NH, B] non-contiguous; flash_attn uses strides
+    V = ggml_cont(ctx, ggml_permute(ctx, V, 0, 2, 1, 3));  // [HD, N_kv, NH, B] contiguous
 
-    // Attention
+    // Attention — manual SDPA (flash_attn_ext produced wrong results for SAM decoder)
     float scale = 1.0f / sqrtf((float)HD);
-    auto* out = ggml_flash_attn_ext(ctx, Q, K, V, nullptr, scale, 0.0f, 0.0f);
 
-    // Merge heads: [ID, N_q, B]
-    out = ggml_reshape_3d(ctx, out, ID, N_q, B);
+    // Q [HD, N_q, NH, B], K [HD, N_kv, NH, B], V [HD, N_kv, NH, B]
+    // Merge NH and B for batched matmul
+    auto* Q3 = ggml_reshape_3d(ctx, Q, HD, N_q, n_heads * B);
+    auto* K3 = ggml_reshape_3d(ctx, K, HD, N_kv, n_heads * B);
+    auto* V3 = ggml_reshape_3d(ctx, V, HD, N_kv, n_heads * B);
+
+    // QK^T: ggml_mul_mat(K, Q) → K^T @ Q → [N_kv, N_q, NH*B]
+    auto* attn_scores = ggml_mul_mat(ctx, K3, Q3);
+    attn_scores = ggml_scale(ctx, attn_scores, scale);
+    attn_scores = ggml_soft_max(ctx, attn_scores);
+
+    // attn @ V: need attn^T [N_q, N_kv] and V^T [HD, N_kv]
+    // ggml_mul_mat(attn^T, V) = (attn^T)^T @ V = attn @ V = [N_q, HD]... no.
+    // ggml_mul_mat(A, B) = A^T @ B where A=[K, M], B=[K, N] → [M, N]
+    // Want: output[q, d] = sum_k attn[q, k] * V[k, d]
+    // = (V^T @ attn^T)^T... let me think differently.
+    // attn_scores is [N_kv, N_q, NH*B]. For each head:
+    //   attn[k, q] = attn_scores[k, q]  (col q has the weights for query q)
+    // V3 is [HD, N_kv, NH*B].
+    // Want: out[d, q] = sum_k V[d, k] * attn[k, q] = V @ attn
+    // = ggml_mul_mat? mul_mat(A, B) = A^T B with A=[K, M], B=[K, N] → [M, N]
+    // V has ne=[HD, N_kv, ...]. attn has ne=[N_kv, N_q, ...].
+    // If A=V3 (ne0=HD, ne1=N_kv) and B=attn_scores (ne0=N_kv, ne1=N_q):
+    // Shared dim ne0: V3 ne0=HD ≠ attn ne0=N_kv. Mismatch!
+    //
+    // Need to transpose V: V^T is [N_kv, HD]. Then A=V^T, B=attn_scores.
+    // A ne0=N_kv, B ne0=N_kv → shared. A^T B = V @ attn → [HD, N_q]. ✓
+    auto* VT = ggml_permute(ctx, V3, 1, 0, 2, 3);  // [N_kv, HD, NH*B]
+    VT = ggml_cont(ctx, VT);
+    auto* out3 = ggml_mul_mat(ctx, VT, attn_scores);  // [HD, N_q, NH*B]
+
+    // Reshape back to 4D: [HD, N_q, NH, B]
+    auto* out = ggml_reshape_4d(ctx, out3, HD, N_q, n_heads, B);
+    // Permute to [HD, NH, N_q, B] to match flash_attn_ext output convention
+    out = ggml_cont(ctx, ggml_permute(ctx, out, 0, 2, 1, 3));
+
+    // Merge heads: [ID=HD*NH, N_q, B]
+    auto* merged = ggml_reshape_3d(ctx, out, ID, N_q, B);
+
+    // Debug: mark merged attention output for first SA call
+    static int _sa_merge_count = 0;
+    if (_sa_merge_count == 0 && N_q <= 16) {
+        ggml_set_name(merged, "dbg_sa0_merged");
+        ggml_set_output(merged);
+    }
+    _sa_merge_count++;
 
     // Output projection
-    out = ggml_mul_mat(ctx, attn.out_w, out);
+    out = ggml_mul_mat(ctx, attn.out_w, merged);
     out = ggml_add(ctx, out, attn.out_b);
 
     return out;
@@ -8406,6 +8459,10 @@ static void sam3_twoway_block_forward(
         queries = ggml_add(ctx, queries, attn_out);
     }
     queries = sam3_layer_norm(ctx, queries, blk.norm1_w, blk.norm1_b);
+    if (skip_first_layer_pe) {
+        ggml_set_name(queries, "dbg_twoway_skip_sa_norm");
+        ggml_set_output(queries);
+    }
 
     // 2. Cross-attention: tokens attending to image
     {
@@ -8414,6 +8471,10 @@ static void sam3_twoway_block_forward(
         auto* attn_out = sam3_sam_attention(ctx, q, k, keys, blk.ca_tok2img, n_heads);
         queries = ggml_add(ctx, queries, attn_out);
         queries = sam3_layer_norm(ctx, queries, blk.norm2_w, blk.norm2_b);
+    }
+    if (skip_first_layer_pe) {
+        ggml_set_name(queries, "dbg_twoway_skip_ca_tok2img");
+        ggml_set_output(queries);
     }
 
     // 3. MLP on queries (ReLU activation)
@@ -8426,6 +8487,10 @@ static void sam3_twoway_block_forward(
         queries = ggml_add(ctx, queries, mlp);
         queries = sam3_layer_norm(ctx, queries, blk.norm3_w, blk.norm3_b);
     }
+    if (skip_first_layer_pe) {
+        ggml_set_name(queries, "dbg_twoway_skip_mlp");
+        ggml_set_output(queries);
+    }
 
     // 4. Cross-attention: image attending to tokens
     {
@@ -8435,6 +8500,10 @@ static void sam3_twoway_block_forward(
         auto* attn_out = sam3_sam_attention(ctx, k, q, queries, blk.ca_img2tok, n_heads);
         keys = ggml_add(ctx, keys, attn_out);
         keys = sam3_layer_norm(ctx, keys, blk.norm4_w, blk.norm4_b);
+    }
+    if (skip_first_layer_pe) {
+        ggml_set_name(keys, "dbg_twoway_skip_img2tok");
+        ggml_set_output(keys);
     }
 }
 
@@ -8510,6 +8579,7 @@ static sam3_dec_result sam3_build_sam_dec_graph(
     output_tokens = ggml_reshape_3d(ctx, output_tokens, D, n_special, 1);
     auto* tokens = ggml_concat(ctx, output_tokens, sparse_emb, 1);
     ggml_set_name(tokens, "sam_dec_tokens_initial");
+    ggml_set_output(tokens);
 
     const int N_tok = 6 + N_pts;
 
@@ -8527,7 +8597,9 @@ static sam3_dec_result sam3_build_sam_dec_graph(
                                   dec.twoway_blocks[i], n_heads,
                                   /*skip_first_layer_pe=*/(i == 0));
         sam3_name_tensorf(queries, "sam_dec_block%d_queries", i);
+        ggml_set_output(queries);
         sam3_name_tensorf(keys, "sam_dec_block%d_keys", i);
+        ggml_set_output(keys);
     }
 
     // Final attention: tokens → image
@@ -8539,6 +8611,12 @@ static sam3_dec_result sam3_build_sam_dec_graph(
         queries = sam3_layer_norm(ctx, queries, dec.final_norm_w, dec.final_norm_b);
         ggml_set_name(queries, "sam_dec_final_queries");
     }
+
+    // Debug: mark transformer outputs
+    ggml_set_name(queries, "dbg_dec_queries_out");
+    ggml_set_output(queries);
+    ggml_set_name(keys, "dbg_dec_keys_out");
+    ggml_set_output(keys);
 
     // ── Extract output tokens ────────────────────────────────────────────
     // With pred_obj_scores=True (6 tokens):  obj(0), iou(1), masks(2..5)
@@ -8824,6 +8902,17 @@ sam3_result sam3_segment_pvs(sam3_state& state,
         }
         ggml_backend_tensor_set(pe_out.sparse, sparse_data.data(), 0, N_pts * D * sizeof(float));
 
+        // Dump sparse embeddings if requested
+        {
+            const char* dd = getenv("SAM2_DUMP_DIR");
+            if (dd) {
+                char p[512]; snprintf(p, sizeof(p), "%s/cpp_sparse_emb.bin", dd);
+                FILE* f = fopen(p, "wb");
+                if (f) { fwrite(sparse_data.data(), sizeof(float), N_pts * D, f); fclose(f); }
+                fprintf(stderr, "  [DUMP] cpp_sparse_emb: %d tokens x %d dims\n", N_pts, D);
+            }
+        }
+
         // Dense PE grid and no-mask embedding — use pre-computed caches
         ggml_backend_tensor_set(pe_out.image_pe, state.dense_pe_cache.data(),
                                 0, D * H * H * sizeof(float));
@@ -8843,6 +8932,17 @@ sam3_result sam3_segment_pvs(sam3_state& state,
             for (int d = 0; d < D; ++d)
                 trk2[d + s * D] += no_mem_data[d];
         ggml_backend_tensor_set(image_feats, trk2.data(), 0, n2 * sizeof(float));
+
+        // Dump image_feats (with no_mem_embed) if requested
+        {
+            const char* dd = getenv("SAM2_DUMP_DIR");
+            if (dd) {
+                char p[512]; snprintf(p, sizeof(p), "%s/cpp_image_feats.bin", dd);
+                FILE* f = fopen(p, "wb");
+                if (f) { fwrite(trk2.data(), sizeof(float), n2, f); fclose(f); }
+                fprintf(stderr, "  [DUMP] cpp_image_feats: [%d, %d, %d]\n", D, H, H);
+            }
+        }
 
         // feat_s0 = neck_trk[0], feat_s1 = neck_trk[1]
         const int n0 = D * H0 * H0;
@@ -8900,6 +9000,23 @@ sam3_result sam3_segment_pvs(sam3_state& state,
             dump_t("cpp_pvs_masks", dec_out.masks);
             dump_t("cpp_pvs_iou", dec_out.iou_pred);
             dump_t("cpp_pvs_obj_score", dec_out.obj_score);
+            // Decoder transformer intermediates
+            dump_t("cpp_dec_queries", ggml_graph_get_tensor(graph, "dbg_dec_queries_out"));
+            dump_t("cpp_dec_keys", ggml_graph_get_tensor(graph, "dbg_dec_keys_out"));
+            // Block 0 internals
+            const char* b0_names[] = {"sam_dec_tokens_initial",
+                                       "dbg_twoway_skip_sa_norm", "dbg_twoway_skip_ca_tok2img",
+                                       "dbg_twoway_skip_mlp", "dbg_twoway_skip_img2tok",
+                                       "dbg_sa0_Q_proj", "dbg_sa0_merged"};
+            for (auto* bn : b0_names) dump_t(bn, ggml_graph_get_tensor(graph, bn));
+            // Per-block outputs
+            for (int bi = 0; bi < 2; bi++) {
+                char bn[64];
+                snprintf(bn, sizeof(bn), "sam_dec_block%d_queries", bi);
+                dump_t(bn, ggml_graph_get_tensor(graph, bn));
+                snprintf(bn, sizeof(bn), "sam_dec_block%d_keys", bi);
+                dump_t(bn, ggml_graph_get_tensor(graph, bn));
+            }
         }
     }
 
