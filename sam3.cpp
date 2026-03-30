@@ -2767,6 +2767,11 @@ sam3_state_ptr sam3_create_state(const sam3_model& model,
     return state;
 }
 
+void sam3_state_set_orig_dims(sam3_state& state, int w, int h) {
+    state.orig_width = w;
+    state.orig_height = h;
+}
+
 void sam3_free_state(sam3_state& state) {
     if (state.galloc) {
         ggml_gallocr_free(state.galloc);
