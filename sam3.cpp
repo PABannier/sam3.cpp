@@ -8206,15 +8206,15 @@ static struct ggml_tensor* sam3_sam_attention(
     V = ggml_reshape_4d(ctx, V, HD, n_heads, N_kv, B);
     V = ggml_cont(ctx, ggml_permute(ctx, V, 0, 2, 1, 3));  // [HD, N_kv, NH, B] contiguous
 
-    // Attention — manual SDPA (flash_attn_ext produced wrong results for SAM decoder)
+    // Attention
     float scale = 1.0f / sqrtf((float)HD);
+    auto* out = ggml_flash_attn_ext(ctx, Q, K, V, nullptr, scale, 0.0f, 0.0f);
+    // out: [HD, NH, N_q, B] (flash_attn_ext swaps dims 1,2 vs input)
 
-    // Q [HD, N_q, NH, B], K [HD, N_kv, NH, B], V [HD, N_kv, NH, B]
-    // Merge NH and B for batched matmul
+#if 0  // Manual SDPA (for debugging only)
     auto* Q3 = ggml_reshape_3d(ctx, Q, HD, N_q, n_heads * B);
     auto* K3 = ggml_reshape_3d(ctx, K, HD, N_kv, n_heads * B);
     auto* V3 = ggml_reshape_3d(ctx, V, HD, N_kv, n_heads * B);
-
     // QK^T: ggml_mul_mat(K, Q) → K^T @ Q → [N_kv, N_q, NH*B]
     auto* attn_scores = ggml_mul_mat(ctx, K3, Q3);
     attn_scores = ggml_scale(ctx, attn_scores, scale);
@@ -8244,6 +8244,7 @@ static struct ggml_tensor* sam3_sam_attention(
     auto* out = ggml_reshape_4d(ctx, out3, HD, N_q, n_heads, B);
     // Permute to [HD, NH, N_q, B] to match flash_attn_ext output convention
     out = ggml_cont(ctx, ggml_permute(ctx, out, 0, 2, 1, 3));
+#endif
 
     // Merge heads: [ID=HD*NH, N_q, B]
     auto* merged = ggml_reshape_3d(ctx, out, ID, N_q, B);
@@ -8292,7 +8293,7 @@ static void sam3_populate_pe_cache(sam3_state& state, const sam3_model& model) {
     if (state.pe_cache_valid) return;
 
     const int D = model.hparams.sam_embed_dim;  // 256
-    const int H = model.hparams.n_img_embd();   // 72
+    const int H = model.hparams.feat_size();    // 72 (SAM3) or 64 (SAM2)
     const int num_pos_feats = D / 2;            // 128
     const int pe_nel = 2 * num_pos_feats;       // 256
     const auto& pe = model.sam_pe;
