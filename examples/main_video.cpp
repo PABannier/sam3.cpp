@@ -669,10 +669,14 @@ int main(int argc, char** argv) {
             app.canvas_h = dh;
 
             ImGui::SetCursorScreenPos(pos);
-            ImGui::Image((ImTextureID)(intptr_t)app.tex_frame, ImVec2(dw, dh));
+            // Use InvisibleButton so ImGui doesn't capture mouse over the canvas
+            ImGui::InvisibleButton("canvas", ImVec2(dw, dh));
 
-            // Draw instance labels + boxes on canvas
+            // Draw the frame via DrawList (not ImGui::Image which eats mouse)
             ImDrawList* dl = ImGui::GetWindowDrawList();
+            dl->AddImage((ImTextureID)(intptr_t)app.tex_frame,
+                         ImVec2(pos.x, pos.y),
+                         ImVec2(pos.x + dw, pos.y + dh));
             for (size_t d = 0; d < app.result.detections.size(); ++d) {
                 const auto& det = app.result.detections[d];
                 int ci = det.instance_id > 0 ? (det.instance_id - 1) % N_COLORS : (int)(d % N_COLORS);
