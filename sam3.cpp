@@ -4183,7 +4183,7 @@ bool sam3_encode_image(sam3_state& state,
     auto t_start = std::chrono::high_resolution_clock::now();
 #endif
     const auto& hp = model.hparams;
-    const int img_size = hp.img_size;
+    const int img_size = sam3_eff_img_size(state, hp);
 
     SAM3_LOG(2, "%s: encoding %dx%d image → %dx%d\n", __func__,
              image.width, image.height, img_size, img_size);
