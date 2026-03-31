@@ -407,91 +407,6 @@ int main(int argc, char** argv) {
             if (event.type == SDL_WINDOWEVENT &&
                 event.window.event == SDL_WINDOWEVENT_CLOSE) running = false;
 
-            // Mouse on canvas
-            if (!io.WantCaptureMouse && !app.frame.data.empty()) {
-                float mx = io.MousePos.x, my = io.MousePos.y;
-                float ix, iy;
-
-                if (event.type == SDL_MOUSEBUTTONDOWN && event.button.button == SDL_BUTTON_LEFT) {
-                    if (screen_to_image(app, mx, my, ix, iy)) {
-                        // Check if clicking on an existing tracked instance (refine)
-                        int hit_id = find_instance_at(app, ix, iy);
-                        if (hit_id >= 0 && app.tracker_created && app.frame_encoded) {
-                            std::vector<sam3_point> pos = {{ix, iy}};
-                            std::vector<sam3_point> neg;
-                            bool ok = sam3_refine_instance(*app.tracker, *app.state, *app.model,
-                                                           hit_id, pos, neg);
-                            snprintf(app.status, sizeof(app.status),
-                                     ok ? "Refined instance #%d with positive point"
-                                        : "Failed to refine instance #%d", hit_id);
-                        } else if (app.init_mode == VMODE_BOX) {
-                            // Start box drag
-                            app.dragging = true;
-                            app.drag_x0 = ix;
-                            app.drag_y0 = iy;
-                        } else if (app.init_mode == VMODE_POINTS) {
-                            // Add positive init point
-                            app.init_pos_points.push_back({ix, iy});
-                        }
-                    }
-                }
-                if (event.type == SDL_MOUSEBUTTONUP && event.button.button == SDL_BUTTON_LEFT) {
-                    if (app.dragging && screen_to_image(app, mx, my, ix, iy)) {
-                        float dx = ix - app.drag_x0;
-                        float dy = iy - app.drag_y0;
-                        if (dx*dx + dy*dy > 25.0f) {
-                            // Completed box drag
-                            app.init_box.x0 = std::min(app.drag_x0, ix);
-                            app.init_box.y0 = std::min(app.drag_y0, iy);
-                            app.init_box.x1 = std::max(app.drag_x0, ix);
-                            app.init_box.y1 = std::max(app.drag_y0, iy);
-                            app.has_init_box = true;
-
-                            // Auto-add instance if tracker exists and frame is encoded
-                            if (app.tracker_created && app.frame_encoded) {
-                                add_instance_from_prompts(app);
-                            }
-                        }
-                    }
-                    app.dragging = false;
-                }
-                if (event.type == SDL_MOUSEBUTTONDOWN && event.button.button == SDL_BUTTON_RIGHT) {
-                    if (screen_to_image(app, mx, my, ix, iy)) {
-                        // Check if clicking on tracked instance (refine with neg point)
-                        int hit_id = find_instance_at(app, ix, iy);
-                        if (hit_id >= 0 && app.tracker_created && app.frame_encoded) {
-                            // sam3_segment_pvs requires at least one positive
-                            // point.  Use the mask centroid as the implicit
-                            // positive seed so negative-only refinement works.
-                            std::vector<sam3_point> pos;
-                            for (const auto& det : app.result.detections) {
-                                if (det.instance_id != hit_id || det.mask.data.empty()) continue;
-                                float cx = 0, cy = 0; int n = 0;
-                                int mw = det.mask.width;
-                                for (int p = 0; p < (int)det.mask.data.size(); ++p) {
-                                    if (det.mask.data[p] > 127) {
-                                        cx += static_cast<float>(p % mw);
-                                        cy += static_cast<float>(p / mw);  // NOLINT: integer row index is intentional
-                                        ++n;
-                                    }
-                                }
-                                if (n > 0) pos.push_back({cx / n, cy / n});
-                                break;
-                            }
-                            std::vector<sam3_point> neg = {{ix, iy}};
-                            bool ok = sam3_refine_instance(*app.tracker, *app.state, *app.model,
-                                                           hit_id, pos, neg);
-                            snprintf(app.status, sizeof(app.status),
-                                     ok ? "Refined instance #%d with negative point"
-                                        : "Failed to refine instance #%d", hit_id);
-                        } else if (app.init_mode == VMODE_POINTS) {
-                            // Add negative init point
-                            app.init_neg_points.push_back({ix, iy});
-                        }
-                    }
-                }
-            }
-
             // Keyboard shortcuts
             if (event.type == SDL_KEYDOWN && !io.WantCaptureKeyboard) {
                 if (event.key.keysym.sym == SDLK_SPACE) {
@@ -671,6 +586,88 @@ int main(int argc, char** argv) {
             ImGui::SetCursorScreenPos(pos);
             // Use InvisibleButton so ImGui doesn't capture mouse over the canvas
             ImGui::InvisibleButton("canvas", ImVec2(dw, dh));
+            bool canvas_hovered = ImGui::IsItemHovered();
+
+            // ── Mouse interaction on canvas (ImGui API, not SDL) ────────────
+            if (canvas_hovered) {
+                float mx = io.MousePos.x, my = io.MousePos.y;
+                float ix, iy;
+
+                // Left click → start drag (box mode) or add positive point
+                if (ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
+                    if (screen_to_image(app, mx, my, ix, iy)) {
+                        int hit_id = find_instance_at(app, ix, iy);
+                        if (hit_id >= 0 && app.tracker_created && app.frame_encoded) {
+                            std::vector<sam3_point> p = {{ix, iy}};
+                            std::vector<sam3_point> neg;
+                            bool ok = sam3_refine_instance(*app.tracker, *app.state, *app.model,
+                                                           hit_id, p, neg);
+                            snprintf(app.status, sizeof(app.status),
+                                     ok ? "Refined instance #%d with positive point"
+                                        : "Failed to refine instance #%d", hit_id);
+                        } else if (app.init_mode == VMODE_BOX) {
+                            app.dragging = true;
+                            app.drag_x0 = ix;
+                            app.drag_y0 = iy;
+                        } else if (app.init_mode == VMODE_POINTS) {
+                            app.init_pos_points.push_back({ix, iy});
+                        }
+                    }
+                }
+
+                // Right click → negative point or refine with negative
+                if (ImGui::IsMouseClicked(ImGuiMouseButton_Right)) {
+                    if (screen_to_image(app, mx, my, ix, iy)) {
+                        int hit_id = find_instance_at(app, ix, iy);
+                        if (hit_id >= 0 && app.tracker_created && app.frame_encoded) {
+                            std::vector<sam3_point> p;
+                            for (const auto& det : app.result.detections) {
+                                if (det.instance_id != hit_id || det.mask.data.empty()) continue;
+                                float cx = 0, cy = 0; int n = 0;
+                                int mw = det.mask.width;
+                                for (int pi = 0; pi < (int)det.mask.data.size(); ++pi) {
+                                    if (det.mask.data[pi] > 127) {
+                                        cx += static_cast<float>(pi % mw);
+                                        cy += static_cast<float>(pi / mw);  // NOLINT: integer row index
+                                        ++n;
+                                    }
+                                }
+                                if (n > 0) p.push_back({cx / n, cy / n});
+                                break;
+                            }
+                            std::vector<sam3_point> neg = {{ix, iy}};
+                            bool ok = sam3_refine_instance(*app.tracker, *app.state, *app.model,
+                                                           hit_id, p, neg);
+                            snprintf(app.status, sizeof(app.status),
+                                     ok ? "Refined instance #%d with negative point"
+                                        : "Failed to refine instance #%d", hit_id);
+                        } else if (app.init_mode == VMODE_POINTS) {
+                            app.init_neg_points.push_back({ix, iy});
+                        }
+                    }
+                }
+            }
+
+            // Left button release → finish box drag
+            if (app.dragging && ImGui::IsMouseReleased(ImGuiMouseButton_Left)) {
+                float mx = io.MousePos.x, my = io.MousePos.y;
+                float ix, iy;
+                if (screen_to_image(app, mx, my, ix, iy)) {
+                    float dx = ix - app.drag_x0;
+                    float dy = iy - app.drag_y0;
+                    if (dx*dx + dy*dy > 25.0f) {
+                        app.init_box.x0 = std::min(app.drag_x0, ix);
+                        app.init_box.y0 = std::min(app.drag_y0, iy);
+                        app.init_box.x1 = std::max(app.drag_x0, ix);
+                        app.init_box.y1 = std::max(app.drag_y0, iy);
+                        app.has_init_box = true;
+                        if (app.tracker_created && app.frame_encoded) {
+                            add_instance_from_prompts(app);
+                        }
+                    }
+                }
+                app.dragging = false;
+            }
 
             // Draw the frame via DrawList (not ImGui::Image which eats mouse)
             ImDrawList* dl = ImGui::GetWindowDrawList();
