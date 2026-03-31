@@ -85,9 +85,10 @@ struct sam3_result {
 
 struct sam3_params {
     std::string model_path;
-    int         n_threads = 4;
-    bool        use_gpu   = true;
-    int         seed      = 42;
+    int         n_threads       = 4;
+    bool        use_gpu         = true;
+    int         seed            = 42;
+    int         encode_img_size = 0;  // 0 = model default; override input resolution
 };
 
 struct sam3_tensor_info {

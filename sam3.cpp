@@ -205,6 +205,19 @@ struct sam3_hparams {
     }
 };
 
+// Compute feat_size for an arbitrary img_size.
+static int sam3_effective_feat_size(const sam3_hparams& hp, int img_size) {
+    if (hp.is_sam2()) {
+        int s = img_size / 4;
+        int n_pools = std::min(hp.hiera_q_pool, hp.hiera_num_stages - 1);
+        for (int i = 0; i < n_pools; ++i) s /= 2;
+        for (int i = 0; i < hp.scalp; ++i) s *= 2;
+        return s;
+    }
+    return img_size / hp.patch_size;
+}
+
+
 /*****************************************************************************
 ** Internal Data Types -- Layer Weight Structs
 *****************************************************************************/
@@ -748,6 +761,9 @@ struct sam3_state {
     int orig_height = 0;
     int n_threads   = 4;
 
+    int encode_img_size  = 0;  // effective img_size for encoding (0 = hp.img_size)
+    int encode_feat_size = 0;  // effective feat_size for the active backbone
+
     struct ggml_context*  ctx     = nullptr;
     ggml_backend_t        backend = nullptr;
     ggml_backend_buffer_t buffer  = nullptr;
@@ -815,6 +831,14 @@ struct sam3_tracker {
     std::vector<float> cached_sinpe_64;        // sam3_sinusoidal_pe_2d(72, 72, 64)
     std::vector<float> cached_axial_cis_reord; // reordered axial CIS for RoPE Q
 };
+
+// Resolve effective img_size / feat_size from state (which may override hp defaults).
+static int sam3_eff_img_size(const sam3_state& s, const sam3_hparams& hp) {
+    return (s.encode_img_size > 0) ? s.encode_img_size : hp.img_size;
+}
+static int sam3_eff_feat_size(const sam3_state& s, const sam3_hparams& hp) {
+    return (s.encode_feat_size > 0) ? s.encode_feat_size : hp.feat_size();
+}
 
 /*****************************************************************************
 ** Internal Helper Declarations
@@ -2769,6 +2793,16 @@ sam3_state_ptr sam3_create_state(const sam3_model& model,
     state->n_threads = (params.n_threads > 0)
                            ? params.n_threads
                            : std::max(1u, std::thread::hardware_concurrency());
+
+    const auto& hp = model.hparams;
+    int eis = (params.encode_img_size > 0) ? params.encode_img_size : hp.img_size;
+    state->encode_img_size  = eis;
+    state->encode_feat_size = sam3_effective_feat_size(hp, eis);
+    if (eis != hp.img_size) {
+        fprintf(stderr, "%s: encode_img_size=%d (model native=%d), feat_size=%d (native=%d)\n",
+                __func__, eis, hp.img_size, state->encode_feat_size, hp.feat_size());
+    }
+
     return state;
 }
 
@@ -3845,10 +3879,11 @@ static void sam2_build_hiera_graph(struct ggml_context* ctx,
     ggml_set_output(x);
 
     // ── Add positional embedding (precomputed on CPU, uploaded as input) ─
-    // PE is set externally as a named input tensor; added here.
+    // PE spatial dims match patch embed output (input_size / 4).
+    int pe_spatial = (int)x->ne[1];  // derive from actual patch embed output
     auto* pe = ggml_new_tensor_4d(ctx, GGML_TYPE_F32,
                                    hp.hiera_embed_dim,
-                                   hp.img_size / 4, hp.img_size / 4, 1);
+                                   pe_spatial, pe_spatial, 1);
     ggml_set_name(pe, "hiera_pos_embed");
     ggml_set_input(pe);
     x = ggml_add(ctx, x, pe);
@@ -3856,8 +3891,8 @@ static void sam2_build_hiera_graph(struct ggml_context* ctx,
     ggml_set_output(x);
 
     // ── Process all blocks ───────────────────────────────────────────────
-    int spatial_H = hp.img_size / 4;
-    int spatial_W = hp.img_size / 4;
+    int spatial_H = pe_spatial;
+    int spatial_W = pe_spatial;
     int stage_idx = 0;
 
     for (int i = 0; i < hp.hiera_total_blocks(); ++i) {
@@ -3974,7 +4009,7 @@ static bool sam2_encode_image_hiera(sam3_state& state,
                                      const sam3_image& image) {
     auto t_start = std::chrono::high_resolution_clock::now();
     const auto& hp = model.hparams;
-    const int img_size = hp.img_size;
+    const int img_size = sam3_eff_img_size(state, hp);
 
     fprintf(stderr, "%s: encoding %dx%d image (SAM2 Hiera)\n", __func__,
             image.width, image.height);
@@ -7135,11 +7170,12 @@ static sam3_prompt_data sam3_build_prompt_and_pos(
     const std::vector<std::vector<float>>& mem_slot_pes,
     const std::vector<int>& spatial_tpos,
     const std::vector<std::vector<float>>& obj_ptrs,
-    const std::vector<int>& ptr_tpos) {
+    const std::vector<int>& ptr_tpos,
+    int eff_feat_size = 0) {
     const auto& hp = model.hparams;
     const int MD = hp.mem_out_dim;  // 64
     const int D = hp.neck_dim;      // 256
-    const int H = hp.feat_size();   // 72 (SAM3) or 64 (SAM2)
+    const int H = (eff_feat_size > 0) ? eff_feat_size : hp.feat_size();
     const int HH = H * H;
 
     sam3_prompt_data pd;
@@ -8293,7 +8329,7 @@ static void sam3_populate_pe_cache(sam3_state& state, const sam3_model& model) {
     if (state.pe_cache_valid) return;
 
     const int D = model.hparams.sam_embed_dim;  // 256
-    const int H = model.hparams.feat_size();    // 72 (SAM3) or 64 (SAM2)
+    const int H = sam3_eff_feat_size(state, model.hparams);
     const int num_pos_feats = D / 2;            // 128
     const int pe_nel = 2 * num_pos_feats;       // 256
     const auto& pe = model.sam_pe;
@@ -8553,13 +8589,14 @@ static sam3_dec_result sam3_build_sam_dec_graph(
     struct ggml_tensor* image_pe,     // [D, H, H, 1]
     struct ggml_tensor* sparse_emb,   // [D, N_pts, 1]
     struct ggml_tensor* dense_emb,    // [D, H, H, 1]
-    struct ggml_tensor* feat_s0,      // [D, 288, 288, 1] high-res
-    struct ggml_tensor* feat_s1)      // [D, 144, 144, 1] mid-res
+    struct ggml_tensor* feat_s0,      // [D, H*4, H*4, 1] high-res
+    struct ggml_tensor* feat_s1,     // [D, H*2, H*2, 1] mid-res
+    int eff_feat_size = 0)
 {
     const auto& dec = model.sam_dec;
     const auto& hp = model.hparams;
     const int D = hp.sam_embed_dim;  // 256
-    const int H = hp.feat_size();    // 72 (SAM3) or 64 (SAM2)
+    const int H = (eff_feat_size > 0) ? eff_feat_size : hp.feat_size();
     const int N_pts = (int)sparse_emb->ne[1];
     const int n_heads = 8;                               // SAM uses 8 heads
     const int num_mask_tokens = hp.sam_n_multimask + 1;  // 4
@@ -8770,8 +8807,9 @@ sam3_result sam3_segment_pvs(sam3_state& state,
 #endif
     const auto& hp = model.hparams;
     const int D = hp.sam_embed_dim;                      // 256
-    const int H = hp.feat_size();                        // 72 (SAM3) or 64 (SAM2)
+    const int H = sam3_eff_feat_size(state, hp);
     const int num_mask_tokens = hp.sam_n_multimask + 1;  // 4
+    const int eff_img_size = sam3_eff_img_size(state, hp);
     sam3_result result;
 
     // ── Validate ─────────────────────────────────────────────────────────
@@ -8832,7 +8870,7 @@ sam3_result sam3_segment_pvs(sam3_state& state,
                                             pe_out.sparse,
                                             pe_out.dense,
                                             feat_s0,
-                                            feat_s1);
+                                            feat_s1, H);
 
     // Mark outputs
     ggml_set_output(dec_out.masks);
@@ -8885,10 +8923,10 @@ sam3_result sam3_segment_pvs(sam3_state& state,
         std::vector<float> sparse_data(N_pts * D, 0.0f);
         for (int p = 0; p < N_pts; ++p) {
             // Scale from original image space to model input space, then shift to pixel center
-            float px = all_coords[p * 2 + 0] / (float)state.orig_width * (float)hp.img_size + 0.5f;
-            float py = all_coords[p * 2 + 1] / (float)state.orig_height * (float)hp.img_size + 0.5f;
-            float x_norm = px / (float)hp.img_size;
-            float y_norm = py / (float)hp.img_size;
+            float px = all_coords[p * 2 + 0] / (float)state.orig_width * (float)eff_img_size + 0.5f;
+            float py = all_coords[p * 2 + 1] / (float)state.orig_height * (float)eff_img_size + 0.5f;
+            float x_norm = px / (float)eff_img_size;
+            float y_norm = py / (float)eff_img_size;
             float pe_vec[256];
             sam3_pe_encode_coord(pe_vec, x_norm, y_norm,
                                  state.pe_gauss_cache.data(), num_pos_feats);
@@ -9126,12 +9164,13 @@ struct sam3_prop_output {
 };
 
 // Lazily compute and cache PE/RoPE data that is identical across all propagation calls.
-static void sam3_ensure_tracker_pe_caches(sam3_tracker& tracker, const sam3_hparams& hp) {
+static void sam3_ensure_tracker_pe_caches(sam3_tracker& tracker, const sam3_hparams& hp,
+                                          int eff_feat_size = 0) {
+    const int H = (eff_feat_size > 0) ? eff_feat_size : hp.feat_size();
     if (tracker.pe_caches_valid) return;
 
     const int D = hp.neck_dim;       // 256
     const int MD = hp.mem_out_dim;   // 64
-    const int H = hp.feat_size();    // 72 (SAM3) or 64 (SAM2)
     const int N = H * H;
     const int half_d = D / 2;        // 128
 
@@ -9161,7 +9200,8 @@ static sam3_prop_output sam3_propagate_single(
     const std::vector<std::pair<int, struct ggml_tensor*>>& ptr_bank) {
     sam3_prop_output output = {};
     const auto& hp = model.hparams;
-    const int D = hp.neck_dim, MD = hp.mem_out_dim, H = hp.feat_size();
+    const int D = hp.neck_dim, MD = hp.mem_out_dim;
+    const int H = sam3_eff_feat_size(state, hp);
     const int N = H * H;
 
     auto sel = sam3_select_memory_frames(mem_bank, hp.num_maskmem);
@@ -9180,7 +9220,7 @@ static sam3_prop_output sam3_propagate_single(
             ggml_backend_tensor_get(mem_bank[sel[s]].spatial_pe,
                                     slot_pes[s].data(), 0, MD * N * sizeof(float));
         } else {
-            sam3_ensure_tracker_pe_caches(tracker, hp);
+            sam3_ensure_tracker_pe_caches(tracker, hp, H);
             slot_pes[s] = tracker.cached_sinpe_64;
         }
         spatial_tpos[s] = mem_bank[sel[s]].is_cond_frame ? 0 : (n_sel - s);
@@ -9198,10 +9238,10 @@ static sam3_prop_output sam3_propagate_single(
         if (ptr_tpos[p] < 1) ptr_tpos[p] = 1;  // minimum distance of 1
     }
 
-    auto pd = sam3_build_prompt_and_pos(model, slot_feats, slot_pes, spatial_tpos, obj_ptrs, ptr_tpos);
+    auto pd = sam3_build_prompt_and_pos(model, slot_feats, slot_pes, spatial_tpos, obj_ptrs, ptr_tpos, H);
 
     // ── RoPE frequencies (cached) ──────────────────────────────────────
-    sam3_ensure_tracker_pe_caches(tracker, hp);
+    sam3_ensure_tracker_pe_caches(tracker, hp, H);
     const int half_d = D / 2;  // 128
     const auto& rope_q_reord = tracker.cached_axial_cis_reord;
     // For cross-attn K: repeat cached Q pattern for M_spatial tokens
@@ -9277,7 +9317,7 @@ static sam3_prop_output sam3_propagate_single(
 
     auto dec = sam3_build_sam_dec_graph(ctx0, model, cond_spatial, image_pe,
                                         sparse_in, dense_emb,
-                                        trk_s0, trk_s1);
+                                        trk_s0, trk_s1, H);
     ggml_set_output(dec.masks);
     ggml_set_output(dec.iou_pred);
     ggml_set_output(dec.obj_score);
@@ -9456,8 +9496,10 @@ static bool sam3_encode_memory(
     int inst_id, const float* mask_logits, int mask_h, int mask_w,
     int frame_idx, bool is_cond, float obj_score) {
     const auto& hp = model.hparams;
-    const int D = hp.neck_dim, MD = hp.mem_out_dim, H = hp.feat_size();
-    const int HIGH_RES = hp.img_size, INTERPOL = H * 16;
+    const int D = hp.neck_dim, MD = hp.mem_out_dim;
+    const int H = sam3_eff_feat_size(state, hp);
+    const int HIGH_RES = sam3_eff_img_size(state, hp);
+    const int INTERPOL = H * 16;
 
     // Mask preprocessing: mask_logits → HIGH_RES → sigmoid → scale/bias → INTERPOL
     auto m_hires = sam3_bilinear_interpolate(mask_logits, mask_w, mask_h, HIGH_RES, HIGH_RES);
@@ -9569,7 +9611,7 @@ static bool sam3_encode_memory(
     ggml_backend_tensor_set(st, md.data(), 0, md.size() * sizeof(float));
 
     // Compute and store sinusoidal spatial PE
-    sam3_ensure_tracker_pe_caches(tracker, hp);
+    sam3_ensure_tracker_pe_caches(tracker, hp, H);
     const auto& pe_data = tracker.cached_sinpe_64;
     auto* spe = ggml_new_tensor_4d(tracker.ctx, GGML_TYPE_F32, MD, H, H, 1);
     auto* speb = ggml_backend_alloc_buffer(model.backend, MD * H * H * sizeof(float));
@@ -9754,7 +9796,7 @@ sam3_result sam3_track_frame(sam3_tracker& tracker, sam3_state& state,
         const auto& det = nd.detections[j];
         if (!det.mask.data.empty()) {
             // Build mask logits from the PCS detection's binary mask.
-            const int mh = model.hparams.feat_size() * 4, mw = mh;
+            const int mh = sam3_eff_feat_size(state, model.hparams) * 4, mw = mh;
             // Resize to mh×mw logit space: inside mask → +5.0, outside → -5.0.
             std::vector<float> det_logits(mh * mw);
             for (int r = 0; r < mh; ++r) {
@@ -9904,7 +9946,7 @@ int sam3_tracker_add_instance(sam3_tracker& tracker, sam3_state& state,
                               const sam3_model& model,
                               const sam3_pvs_params& pvs_params) {
     const int D = model.hparams.neck_dim;
-    const int mask_hw = model.hparams.feat_size() * 4;
+    const int mask_hw = sam3_eff_feat_size(state, model.hparams) * 4;
 
     // Run PVS to get the segmentation mask
     auto r = sam3_segment_pvs(state, model, pvs_params);
