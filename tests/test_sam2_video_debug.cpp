@@ -63,12 +63,14 @@ int main(int argc, char** argv) {
     mkdir(dump_dir, 0755);
 
     const int N_FRAMES = argc > 5 ? atoi(argv[5]) : 5;
+    int encode_img_size = (argc > 6) ? atoi(argv[6]) : 0;
 
     // Load model
     fprintf(stderr, "Loading model: %s\n", model_path);
     sam3_params params;
     params.model_path = model_path;
     params.use_gpu = false;  // CPU for reproducibility
+    params.encode_img_size = encode_img_size;
     auto model = sam3_load_model(params);
     if (!model) {
         fprintf(stderr, "Failed to load model\n");
