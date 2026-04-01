@@ -830,6 +830,15 @@ struct sam3_tracker {
     std::vector<float> cached_sinpe_256;       // sam3_sinusoidal_pe_2d(72, 72, 256)
     std::vector<float> cached_sinpe_64;        // sam3_sinusoidal_pe_2d(72, 72, 64)
     std::vector<float> cached_axial_cis_reord; // reordered axial CIS for RoPE Q
+
+    // ── Optical flow state ──────────────────────────────────────────────
+    int  last_keyframe = -1;
+    bool flow_enabled  = false;
+    int  flow_mask_hw  = 0;              // mask_hw for flow resolution, set on first keyframe
+
+    std::vector<float> prev_gray;        // [mask_hw * mask_hw] grayscale of previous frame
+    std::map<int, std::vector<float>> prev_mask_logits; // instance_id → [mask_hw * mask_hw]
+    std::map<int, int>                prev_mask_area;   // instance_id → positive pixel count
 };
 
 // Resolve effective img_size / feat_size from state (which may override hp defaults).
@@ -7650,6 +7659,252 @@ static std::vector<int> sam3_nms(const std::vector<sam3_detection>& dets, float 
     return keep;
 }
 
+/*****************************************************************************
+** Optical Flow — keyframe skip optimization
+**
+** Pure C++14 dense optical flow for mask warping on non-keyframe frames.
+** 2-level pyramid with SAD block matching.
+*****************************************************************************/
+
+// Minimum resolution for flow computation and cached logits. When mask_hw is
+// smaller (e.g. 64 at encode-img-size=256), flow is still computed at this
+// resolution to avoid sub-pixel blindness in block matching.
+static const int SAM3_FLOW_MIN_RES = 128;
+
+// Convert RGB sam3_image to single-channel grayscale float at target resolution.
+// Fuses grayscale conversion (0.299R + 0.587G + 0.114B) with bilinear resize.
+// Output is [dst_w * dst_h] floats in range [0, 255].
+static void sam3_rgb_to_gray_resized(
+        const sam3_image & img, int dst_w, int dst_h,
+        std::vector<float> & out) {
+    out.resize(dst_w * dst_h);
+    const int sw = img.width, sh = img.height;
+    const double sx = (double)sw / dst_w;
+    const double sy = (double)sh / dst_h;
+    const uint8_t * src = img.data.data();
+
+    for (int y = 0; y < dst_h; ++y) {
+        double fy = (y + 0.5) * sy - 0.5;
+        if (fy < 0.0) fy = 0.0;
+        const int y0 = (int)fy;
+        const int y1 = (y0 < sh - 1) ? y0 + 1 : y0;
+        const float wy = (float)(fy - y0);
+
+        for (int x = 0; x < dst_w; ++x) {
+            double fx = (x + 0.5) * sx - 0.5;
+            if (fx < 0.0) fx = 0.0;
+            const int x0 = (int)fx;
+            const int x1 = (x0 < sw - 1) ? x0 + 1 : x0;
+            const float wx = (float)(fx - x0);
+
+            // Sample 4 source pixels, convert each to grayscale, bilinear blend
+            auto gray = [&](int px, int py) -> float {
+                const uint8_t * p = src + (py * sw + px) * 3;
+                return 0.299f * p[0] + 0.587f * p[1] + 0.114f * p[2];
+            };
+            float g00 = gray(x0, y0), g10 = gray(x1, y0);
+            float g01 = gray(x0, y1), g11 = gray(x1, y1);
+            float v = (1 - wy) * ((1 - wx) * g00 + wx * g10)
+                    +      wy  * ((1 - wx) * g01 + wx * g11);
+            out[y * dst_w + x] = v;
+        }
+    }
+}
+
+// Downsample a grayscale image by 2x using box filter.
+static void sam3_downsample_2x(const float * src, int sw, int sh,
+                               float * dst, int dw, int dh) {
+    for (int y = 0; y < dh; ++y) {
+        const int sy0 = y * 2, sy1 = std::min(sy0 + 1, sh - 1);
+        for (int x = 0; x < dw; ++x) {
+            const int sx0 = x * 2, sx1 = std::min(sx0 + 1, sw - 1);
+            dst[y * dw + x] = 0.25f * (src[sy0 * sw + sx0] + src[sy0 * sw + sx1]
+                                      + src[sy1 * sw + sx0] + src[sy1 * sw + sx1]);
+        }
+    }
+}
+
+// Compute dense optical flow between two grayscale frames using 2-level
+// pyramidal SAD block matching. Returns mean flow magnitude.
+// Flow convention: backward — (flow_x[i], flow_y[i]) points from curr back to prev,
+// i.e. prev[y + flow_y, x + flow_x] ≈ curr[y, x].
+static float sam3_compute_dense_flow(
+        const float * prev, const float * curr,
+        int w, int h,
+        float * flow_x, float * flow_y) {
+    const int BH = 3;  // half block size (full block = 2*BH+1 = 7)
+    const int hw = w / 2, hh = h / 2;
+
+    // Build level-1 (half-res) images
+    std::vector<float> prev1(hw * hh), curr1(hw * hh);
+    sam3_downsample_2x(prev, w, h, prev1.data(), hw, hh);
+    sam3_downsample_2x(curr, w, h, curr1.data(), hw, hh);
+
+    // Level 1 flow at half resolution
+    const int R1 = 4;
+    std::vector<float> fx1(hw * hh, 0.0f), fy1(hw * hh, 0.0f);
+
+    for (int cy = 0; cy < hh; ++cy) {
+        for (int cx = 0; cx < hw; ++cx) {
+            float best_sad = 1e30f;
+            int best_dx = 0, best_dy = 0;
+            for (int dy = -R1; dy <= R1; ++dy) {
+                for (int dx = -R1; dx <= R1; ++dx) {
+                    float sad = 0.0f;
+                    for (int by = -BH; by <= BH; ++by) {
+                        const int py_c = cy + by;
+                        const int py_p = cy + by + dy;
+                        if (py_c < 0 || py_c >= hh || py_p < 0 || py_p >= hh) {
+                            sad += 30.0f * (2 * BH + 1); // penalty for OOB
+                            continue;
+                        }
+                        for (int bx = -BH; bx <= BH; ++bx) {
+                            const int px_c = cx + bx;
+                            const int px_p = cx + bx + dx;
+                            if (px_c < 0 || px_c >= hw || px_p < 0 || px_p >= hw) {
+                                sad += 30.0f;
+                                continue;
+                            }
+                            float d = curr1[py_c * hw + px_c] - prev1[py_p * hw + px_p];
+                            sad += (d < 0) ? -d : d;
+                        }
+                    }
+                    if (sad < best_sad) {
+                        best_sad = sad;
+                        best_dx = dx;
+                        best_dy = dy;
+                    }
+                }
+            }
+            fx1[cy * hw + cx] = (float)best_dx;
+            fy1[cy * hw + cx] = (float)best_dy;
+        }
+    }
+
+    // Upsample level-1 flow to full resolution (bilinear, scale displacements by 2)
+    {
+        const float sxr = (float)hw / w, syr = (float)hh / h;
+        for (int y = 0; y < h; ++y) {
+            float fy = (y + 0.5f) * syr - 0.5f;
+            if (fy < 0.0f) fy = 0.0f;
+            if (fy > hh - 1.001f) fy = hh - 1.001f;
+            const int y0 = (int)fy, y1 = std::min(y0 + 1, hh - 1);
+            const float wy = fy - y0;
+            for (int x = 0; x < w; ++x) {
+                float fx = (x + 0.5f) * sxr - 0.5f;
+                if (fx < 0.0f) fx = 0.0f;
+                if (fx > hw - 1.001f) fx = hw - 1.001f;
+                const int x0 = (int)fx, x1 = std::min(x0 + 1, hw - 1);
+                const float wx = fx - x0;
+
+                float vx = (1-wy)*((1-wx)*fx1[y0*hw+x0] + wx*fx1[y0*hw+x1])
+                         +    wy *((1-wx)*fx1[y1*hw+x0] + wx*fx1[y1*hw+x1]);
+                float vy = (1-wy)*((1-wx)*fy1[y0*hw+x0] + wx*fy1[y0*hw+x1])
+                         +    wy *((1-wx)*fy1[y1*hw+x0] + wx*fy1[y1*hw+x1]);
+                flow_x[y * w + x] = vx * 2.0f;
+                flow_y[y * w + x] = vy * 2.0f;
+            }
+        }
+    }
+
+    // Level 0: refine at full resolution
+    const int R0 = 2;
+    // Work on a copy so refinement reads the upsampled flow, not partially-updated values
+    std::vector<float> fx0(flow_x, flow_x + w * h);
+    std::vector<float> fy0(flow_y, flow_y + w * h);
+
+    float mag_sum = 0.0f;
+    for (int cy = 0; cy < h; ++cy) {
+        for (int cx = 0; cx < w; ++cx) {
+            const int base_dx = (int)std::round(fx0[cy * w + cx]);
+            const int base_dy = (int)std::round(fy0[cy * w + cx]);
+
+            float best_sad = 1e30f;
+            int best_dx = base_dx, best_dy = base_dy;
+            for (int dy = -R0; dy <= R0; ++dy) {
+                for (int dx = -R0; dx <= R0; ++dx) {
+                    const int tdx = base_dx + dx, tdy = base_dy + dy;
+                    float sad = 0.0f;
+                    for (int by = -BH; by <= BH; ++by) {
+                        const int py_c = cy + by;
+                        const int py_p = cy + by + tdy;
+                        if (py_c < 0 || py_c >= h || py_p < 0 || py_p >= h) {
+                            sad += 30.0f * (2 * BH + 1);
+                            continue;
+                        }
+                        for (int bx = -BH; bx <= BH; ++bx) {
+                            const int px_c = cx + bx;
+                            const int px_p = cx + bx + tdx;
+                            if (px_c < 0 || px_c >= w || px_p < 0 || px_p >= w) {
+                                sad += 30.0f;
+                                continue;
+                            }
+                            float d = curr[py_c * w + px_c] - prev[py_p * w + px_p];
+                            sad += (d < 0) ? -d : d;
+                        }
+                    }
+                    if (sad < best_sad) {
+                        best_sad = sad;
+                        best_dx = tdx;
+                        best_dy = tdy;
+                    }
+                }
+            }
+            flow_x[cy * w + cx] = (float)best_dx;
+            flow_y[cy * w + cx] = (float)best_dy;
+            float fdx = (float)best_dx, fdy = (float)best_dy;
+            mag_sum += std::sqrt(fdx * fdx + fdy * fdy);
+        }
+    }
+    return mag_sum / (w * h);
+}
+
+// Warp float mask logits using a backward flow field.
+// For each destination pixel (x,y), samples src at (x + flow_x, y + flow_y).
+// Out-of-bounds source pixels produce logit = -6.0 (strong background).
+// Returns number of foreground pixels (logit > 0) in the warped mask.
+static int sam3_warp_mask_logits(
+        const float * src, const float * flow_x, const float * flow_y,
+        int w, int h, float * dst) {
+    int fg = 0;
+    for (int y = 0; y < h; ++y) {
+        for (int x = 0; x < w; ++x) {
+            const int i = y * w + x;
+            const float sx = x + flow_x[i];
+            const float sy = y + flow_y[i];
+
+            if (sx < -0.5f || sx > w - 0.5f || sy < -0.5f || sy > h - 0.5f) {
+                dst[i] = -6.0f;
+                continue;
+            }
+            // Bilinear interpolation with clamping
+            const float csx = std::max(0.0f, std::min(sx, (float)(w - 1)));
+            const float csy = std::max(0.0f, std::min(sy, (float)(h - 1)));
+            const int x0 = std::min((int)csx, w - 2);
+            const int y0 = std::min((int)csy, h - 2);
+            const int x1 = x0 + 1, y1 = y0 + 1;
+            const float wx = csx - x0, wy = csy - y0;
+            float v = (1-wy) * ((1-wx) * src[y0*w+x0] + wx * src[y0*w+x1])
+                    +    wy  * ((1-wx) * src[y1*w+x0] + wx * src[y1*w+x1]);
+            dst[i] = v;
+            if (v > 0.0f) fg++;
+        }
+    }
+    return fg;
+}
+
+// Check whether a warped mask quality has degraded enough to force a keyframe.
+static bool sam3_check_flow_quality(
+        int warped_area, int prev_area,
+        float mean_flow_mag,
+        float area_thresh, float flow_mag_thresh) {
+    if (prev_area <= 0) return true;
+    float area_ratio = std::abs((float)warped_area / prev_area - 1.0f);
+    if (area_ratio > area_thresh) return true;
+    if (mean_flow_mag > flow_mag_thresh) return true;
+    return false;
+}
+
 // Bilinear interpolation of a flat mask [H_in * W_in] to [H_out * W_out].
 // Uses double for coordinate math to match PyTorch F.interpolate precision.
 static std::vector<float> sam3_bilinear_interpolate(const float* src, int src_w, int src_h,
@@ -9477,6 +9732,10 @@ static void sam3_update_tracker(sam3_tracker& tracker, int frame_idx) {
             tracker.masklets.push_back(std::move(*it));
             it = tracker.pending.erase(it);
         } else if (age >= tracker.params.hotstart_delay) {
+            tracker.mem_banks.erase(it->instance_id);
+            tracker.ptr_banks.erase(it->instance_id);
+            tracker.prev_mask_logits.erase(it->instance_id);
+            tracker.prev_mask_area.erase(it->instance_id);
             it = tracker.pending.erase(it);
         } else
             ++it;
@@ -9485,6 +9744,8 @@ static void sam3_update_tracker(sam3_tracker& tracker, int frame_idx) {
         if (frame_idx - it->last_seen > tracker.params.max_keep_alive) {
             tracker.mem_banks.erase(it->instance_id);
             tracker.ptr_banks.erase(it->instance_id);
+            tracker.prev_mask_logits.erase(it->instance_id);
+            tracker.prev_mask_area.erase(it->instance_id);
             it = tracker.masklets.erase(it);
         } else
             ++it;
@@ -9670,8 +9931,10 @@ sam3_tracker_ptr sam3_create_tracker(const sam3_model& model,
     }
     sam3_tracker_ptr tracker(new sam3_tracker());
     tracker->params = params;
-    fprintf(stderr, "%s: tracker created (hotstart=%d, max_keep_alive=%d)\n",
-            __func__, params.hotstart_delay, params.max_keep_alive);
+    tracker->flow_enabled = (params.keyframe_interval > 0);
+    tracker->last_keyframe = -1;
+    fprintf(stderr, "%s: tracker created (hotstart=%d, max_keep_alive=%d, keyframe_interval=%d)\n",
+            __func__, params.hotstart_delay, params.max_keep_alive, params.keyframe_interval);
     return tracker;
 }
 
@@ -10011,6 +10274,22 @@ int sam3_tracker_add_instance(sam3_tracker& tracker, sam3_state& state,
     ml.mds_sum = 1;
     tracker.masklets.push_back(std::move(ml));
 
+    // Cache mask logits for optical flow warping on subsequent non-keyframe frames.
+    // Logits are stored at flow resolution max(mask_hw, 256), not mask_hw.
+    if (tracker.flow_enabled && tracker.flow_mask_hw > 0) {
+        int fhw = std::max(tracker.flow_mask_hw, SAM3_FLOW_MIN_RES);
+        if (mask_hw == fhw) {
+            tracker.prev_mask_logits[inst_id] = synth_logits;
+        } else {
+            tracker.prev_mask_logits[inst_id] = sam3_bilinear_interpolate(
+                synth_logits.data(), mask_hw, mask_hw, fhw, fhw);
+        }
+        int area = 0;
+        for (float v : tracker.prev_mask_logits[inst_id])
+            if (v > 0.0f) area++;
+        tracker.prev_mask_area[inst_id] = area;
+    }
+
     SAM3_LOG(2, "%s: added instance #%d (score=%.3f)\n", __func__, inst_id, det.score);
     return inst_id;
 }
@@ -10035,6 +10314,12 @@ void sam3_tracker_reset(sam3_tracker& tracker) {
         ggml_backend_buffer_free(tracker.buffer);
         tracker.buffer = nullptr;
     }
+    // Clear optical flow state
+    tracker.last_keyframe = -1;
+    tracker.flow_mask_hw = 0;
+    tracker.prev_gray.clear();
+    tracker.prev_mask_logits.clear();
+    tracker.prev_mask_area.clear();
 }
 
 /*****************************************************************************
@@ -10050,11 +10335,119 @@ sam3_tracker_ptr sam3_create_visual_tracker(
     vp.max_keep_alive       = params.max_keep_alive;
     vp.recondition_every    = params.recondition_every;
     vp.fill_hole_area       = params.fill_hole_area;
+    vp.keyframe_interval    = params.keyframe_interval;
+    vp.flow_quality_thresh  = params.flow_quality_thresh;
+    vp.flow_area_thresh     = params.flow_area_thresh;
     sam3_tracker_ptr tracker(new sam3_tracker());
     tracker->params = vp;
-    fprintf(stderr, "%s: visual-only tracker created (max_keep_alive=%d)\n",
-            __func__, params.max_keep_alive);
+    tracker->flow_enabled = (params.keyframe_interval > 0);
+    tracker->last_keyframe = -1;
+    fprintf(stderr, "%s: visual-only tracker created (max_keep_alive=%d, keyframe_interval=%d)\n",
+            __func__, params.max_keep_alive, params.keyframe_interval);
     return tracker;
+}
+
+// Lightweight non-keyframe propagation: compute optical flow, warp masks.
+// Returns false if a keyframe should be forced (quality degradation detected).
+static bool sam3_propagate_flow(
+        sam3_tracker & tracker, const sam3_image & frame,
+        int mask_hw,
+        sam3_result & result, int orig_w, int orig_h) {
+    if (mask_hw <= 0 || tracker.prev_gray.empty()) return false; // force keyframe
+    const float area_thresh = tracker.params.flow_area_thresh;
+    const float flow_thresh = tracker.params.flow_quality_thresh;
+
+    // Use a minimum resolution for flow to avoid sub-pixel blindness at low mask_hw.
+    // When encode-img-size is small, mask_hw can be as low as 64 — too coarse for
+    // block matching to detect inter-frame motion. We compute flow at flow_hw and
+    // upsample/downsample cached logits as needed.
+    const int flow_hw = std::max(mask_hw, SAM3_FLOW_MIN_RES);
+    const int fn = flow_hw * flow_hw;
+
+    // Convert current frame to grayscale at flow resolution
+    std::vector<float> curr_gray;
+    sam3_rgb_to_gray_resized(frame, flow_hw, flow_hw, curr_gray);
+
+    // Compute dense flow between previous and current grayscale frames
+    std::vector<float> flow_x(fn), flow_y(fn);
+    float mean_mag = sam3_compute_dense_flow(
+        tracker.prev_gray.data(), curr_gray.data(),
+        flow_hw, flow_hw, flow_x.data(), flow_y.data());
+
+    // Warp each instance's mask logits and check quality.
+    // Cached logits are stored at flow_hw resolution (may differ from mask_hw).
+    std::vector<float> warped(fn);
+    auto warp_instance = [&](sam3_masklet & ml) -> bool {
+        int id = ml.instance_id;
+        auto it = tracker.prev_mask_logits.find(id);
+        if (it == tracker.prev_mask_logits.end()) return true; // no cached logits — skip (ok)
+        int fg = sam3_warp_mask_logits(it->second.data(), flow_x.data(), flow_y.data(),
+                                       flow_hw, flow_hw, warped.data());
+        int prev_area = tracker.prev_mask_area.count(id) ? tracker.prev_mask_area[id] : 0;
+        if (sam3_check_flow_quality(fg, prev_area, mean_mag, area_thresh, flow_thresh))
+            return false; // force keyframe
+
+        // Bilinear interpolate warped logits to original resolution
+        auto rs = sam3_bilinear_interpolate(warped.data(), flow_hw, flow_hw, orig_w, orig_h);
+
+        // Build binary mask and detection
+        sam3_mask mask;
+        mask.width = orig_w;
+        mask.height = orig_h;
+        mask.data.resize(orig_w * orig_h);
+        mask.instance_id = id;
+        mask.iou_score = ml.last_score;
+        for (int p = 0; p < (int)rs.size(); ++p)
+            mask.data[p] = rs[p] > 0.0f ? 255 : 0;
+
+        sam3_detection det;
+        det.instance_id = id;
+        det.score = ml.last_score;
+        det.mask = std::move(mask);
+        float x0 = 1e9f, y0 = 1e9f, x1 = -1e9f, y1 = -1e9f;
+        for (int p = 0; p < (int)det.mask.data.size(); ++p)
+            if (det.mask.data[p] > 127) {
+                int px = p % orig_w, py = p / orig_w;
+                x0 = std::min(x0, (float)px); y0 = std::min(y0, (float)py);
+                x1 = std::max(x1, (float)px); y1 = std::max(y1, (float)py);
+            }
+        if (x0 <= x1) det.box = {x0, y0, x1, y1};
+        result.detections.push_back(std::move(det));
+
+        // Update cached state for next frame
+        tracker.prev_mask_logits[id].assign(warped.begin(), warped.end());
+        tracker.prev_mask_area[id] = fg;
+        ml.last_seen = tracker.frame_index;
+        return true;
+    };
+
+    for (auto & ml : tracker.masklets)
+        if (!warp_instance(ml)) return false;
+    for (auto & ml : tracker.pending)
+        if (!warp_instance(ml)) return false;
+
+    // Post-process
+    sam3_resolve_overlaps(result.detections);
+    for (auto & d : result.detections) {
+        if (d.mask.data.empty()) continue;
+        sam3_fill_holes(d.mask.data.data(), d.mask.width, d.mask.height,
+                        tracker.params.fill_hole_area);
+        sam3_remove_sprinkles(d.mask.data.data(), d.mask.width, d.mask.height,
+                              tracker.params.fill_hole_area);
+    }
+
+    // Update previous gray frame for next flow computation
+    tracker.prev_gray.swap(curr_gray);
+    tracker.frame_index++;
+    // Count non-zero flow pixels for diagnostics
+    int nz = 0;
+    for (int i = 0; i < fn; i++)
+        if (flow_x[i] != 0.0f || flow_y[i] != 0.0f) nz++;
+    fprintf(stderr, "%s: frame %d (flow) — %zu tracked, mean_mag=%.2f, "
+            "nonzero_flow=%d/%d (%.1f%%), flow_hw=%d, mask_hw=%d\n",
+            __func__, tracker.frame_index - 1, result.detections.size(),
+            mean_mag, nz, fn, 100.0f * nz / std::max(fn, 1), flow_hw, mask_hw);
+    return true;
 }
 
 sam3_result sam3_propagate_frame(
@@ -10062,9 +10455,28 @@ sam3_result sam3_propagate_frame(
         const sam3_model& model, const sam3_image& frame) {
     sam3_result result;
     const int D = model.hparams.neck_dim;
-    if (!sam3_encode_image(state, model, frame)) return result;
     int fi = tracker.frame_index;
-    fprintf(stderr, "%s: frame %d (%zu active + %zu pending)\n",
+
+    // ── Keyframe decision ────────────────────────────────────────────────
+    bool is_keyframe = !tracker.flow_enabled
+                     || tracker.last_keyframe < 0
+                     || (tracker.masklets.empty() && tracker.pending.empty())
+                     || (fi - tracker.last_keyframe >= tracker.params.keyframe_interval);
+
+    if (!is_keyframe) {
+        // Try lightweight flow path
+        sam3_result flow_result;
+        bool ok = sam3_propagate_flow(tracker, frame, tracker.flow_mask_hw,
+                                       flow_result, state.orig_width, state.orig_height);
+        if (ok) return flow_result;
+        // Flow quality degraded — fall through to full keyframe pipeline
+        fprintf(stderr, "%s: frame %d flow quality degraded, forcing keyframe\n",
+                __func__, fi);
+    }
+
+    // ── Full keyframe pipeline ───────────────────────────────────────────
+    if (!sam3_encode_image(state, model, frame)) return result;
+    fprintf(stderr, "%s: frame %d (keyframe) (%zu active + %zu pending)\n",
             __func__, fi, tracker.masklets.size(), tracker.pending.size());
 
     // ── Propagate active masklets ────────────────────────────────────────
@@ -10099,28 +10511,28 @@ sam3_result sam3_propagate_frame(
         int id = ml.instance_id;
         auto im = tracker.mem_banks.find(id);
         if (im == tracker.mem_banks.end() || im->second.empty()) continue;
-        auto p2 = sam3_propagate_single(tracker, state, model, ml, im->second, tracker.ptr_banks[id]);
-        if (!p2.mask_logits.empty()) {
-            ml.last_score = p2.iou_scores[0];
+        po[id] = sam3_propagate_single(tracker, state, model, ml, im->second, tracker.ptr_banks[id]);
+        if (!po[id].mask_logits.empty()) {
+            ml.last_score = po[id].iou_scores[0];
             ml.last_seen = fi;
-            auto r2 = sam3_bilinear_interpolate(p2.mask_logits.data(),
-                                                p2.mask_w, p2.mask_h,
+            auto r2 = sam3_bilinear_interpolate(po[id].mask_logits.data(),
+                                                po[id].mask_w, po[id].mask_h,
                                                 state.orig_width, state.orig_height);
             int fg2 = 0;
             for (auto v : r2)
                 if (v > 0.0f) fg2++;
             float c2 = (float)fg2 / (state.orig_width * state.orig_height);
-            ml.mds_sum += (c2 > 0.001f && p2.obj_score > 0.0f) ? 1 : -1;
+            ml.mds_sum += (c2 > 0.001f && po[id].obj_score > 0.0f) ? 1 : -1;
             pm[id].width = state.orig_width;
             pm[id].height = state.orig_height;
             pm[id].data.resize(state.orig_width * state.orig_height);
             for (int p = 0; p < (int)r2.size(); ++p)
                 pm[id].data[p] = r2[p] > 0.0f ? 255 : 0;
             sam3_encode_memory(tracker, state, model, id,
-                               p2.mask_logits.data(), p2.mask_h, p2.mask_w,
-                               fi, false, p2.obj_score);
+                               po[id].mask_logits.data(), po[id].mask_h, po[id].mask_w,
+                               fi, false, po[id].obj_score);
             std::vector<float> op(D);
-            sam3_extract_obj_ptr_cpu(model, p2.sam_token.data(), p2.obj_score, op.data());
+            sam3_extract_obj_ptr_cpu(model, po[id].sam_token.data(), po[id].obj_score, op.data());
             sam3_store_obj_ptr(tracker, model, id, op.data(), fi);
         }
     }
@@ -10181,6 +10593,42 @@ sam3_result sam3_propagate_frame(
         sam3_remove_sprinkles(d.mask.data.data(), d.mask.width, d.mask.height,
                               tracker.params.fill_hole_area);
     }
+
+    // ── Cache state for subsequent flow frames ───────────────────────────
+    if (tracker.flow_enabled) {
+        tracker.last_keyframe = fi;
+        int mhw = sam3_eff_feat_size(state, model.hparams) * 4;
+        tracker.flow_mask_hw = mhw;
+        // Flow operates at max(mask_hw, 256) to avoid sub-pixel blindness
+        int fhw = std::max(mhw, SAM3_FLOW_MIN_RES);
+        sam3_rgb_to_gray_resized(frame, fhw, fhw, tracker.prev_gray);
+        // Cache mask logits at flow resolution (may need upsampling)
+        auto cache_logits = [&](int inst_id, const std::vector<float> & logits, int lw, int lh) {
+            if (lw == fhw && lh == fhw) {
+                tracker.prev_mask_logits[inst_id] = logits;
+            } else {
+                tracker.prev_mask_logits[inst_id] =
+                    sam3_bilinear_interpolate(logits.data(), lw, lh, fhw, fhw);
+            }
+            int area = 0;
+            for (float v : tracker.prev_mask_logits[inst_id])
+                if (v > 0.0f) area++;
+            tracker.prev_mask_area[inst_id] = area;
+        };
+        for (auto & ml : tracker.masklets) {
+            auto it = po.find(ml.instance_id);
+            if (it != po.end() && !it->second.mask_logits.empty())
+                cache_logits(ml.instance_id, it->second.mask_logits,
+                             it->second.mask_w, it->second.mask_h);
+        }
+        for (auto & ml : tracker.pending) {
+            auto it = po.find(ml.instance_id);
+            if (it != po.end() && !it->second.mask_logits.empty())
+                cache_logits(ml.instance_id, it->second.mask_logits,
+                             it->second.mask_w, it->second.mask_h);
+        }
+    }
+
     tracker.frame_index++;
     SAM3_LOG(2, "%s: frame %d done — %zu tracked\n",
              __func__, fi, result.detections.size());

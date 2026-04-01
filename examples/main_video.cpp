@@ -169,6 +169,9 @@ static void create_tracker(vapp_state& app) {
         app.visual_track_params.max_keep_alive      = app.track_params.max_keep_alive;
         app.visual_track_params.recondition_every    = app.track_params.recondition_every;
         app.visual_track_params.fill_hole_area       = app.track_params.fill_hole_area;
+        app.visual_track_params.keyframe_interval    = app.track_params.keyframe_interval;
+        app.visual_track_params.flow_quality_thresh  = app.track_params.flow_quality_thresh;
+        app.visual_track_params.flow_area_thresh     = app.track_params.flow_area_thresh;
         app.tracker = sam3_create_visual_tracker(*app.model, app.visual_track_params);
     } else {
         if (app.init_mode == VMODE_TEXT)
@@ -320,10 +323,13 @@ int main(int argc, char** argv) {
             app.params.use_gpu = false;
         } else if (strcmp(argv[i], "--encode-img-size") == 0 && i+1 < argc) {
             app.params.encode_img_size = atoi(argv[++i]);
+        } else if (strcmp(argv[i], "--keyframe-interval") == 0 && i+1 < argc) {
+            app.track_params.keyframe_interval = atoi(argv[++i]);
         } else if (strcmp(argv[i], "--help") == 0) {
             fprintf(stderr,
                 "Usage: %s --model <path.ggml> --video <path>\n"
-                "          [--threads N] [--no-gpu] [--encode-img-size N]\n", argv[0]);
+                "          [--threads N] [--no-gpu] [--encode-img-size N]\n"
+                "          [--keyframe-interval N]\n", argv[0]);
             return 0;
         }
     }

@@ -148,6 +148,9 @@ struct sam3_video_params {
     int         max_keep_alive      = 30;
     int         recondition_every   = 16;
     int         fill_hole_area      = 16;
+    int         keyframe_interval   = 15;    // run full backbone every N frames (0 = disable flow)
+    float       flow_quality_thresh = 16.0f; // mean flow magnitude → force keyframe
+    float       flow_area_thresh    = 0.4f;  // fractional area change → force keyframe
 };
 
 struct sam3_video_info {
@@ -268,6 +271,9 @@ struct sam3_visual_track_params {
     int   max_keep_alive      = 30;
     int   recondition_every   = 16;
     int   fill_hole_area      = 16;
+    int   keyframe_interval   = 15;    // run full backbone every N frames (0 = disable flow)
+    float flow_quality_thresh = 16.0f; // mean flow magnitude → force keyframe
+    float flow_area_thresh    = 0.4f;  // fractional area change → force keyframe
 };
 
 /*

@@ -167,6 +167,7 @@ static void child_benchmark(const std::string & model_path,
                              int n_frames,
                              float px, float py,
                              int n_threads,
+                             int keyframe_interval,
                              int write_fd) {
     BenchWire wire = {};
 
@@ -208,13 +209,15 @@ static void child_benchmark(const std::string & model_path,
 
     if (visual_only) {
         sam3_visual_track_params vtp;
-        vtp.max_keep_alive    = 100;
-        vtp.recondition_every = 16;
+        vtp.max_keep_alive     = 100;
+        vtp.recondition_every  = 16;
+        vtp.keyframe_interval  = keyframe_interval;
         tracker = sam3_create_visual_tracker(*model, vtp);
     } else {
         sam3_video_params vp;
-        vp.hotstart_delay = 0;
-        vp.max_keep_alive = 100;
+        vp.hotstart_delay      = 0;
+        vp.max_keep_alive      = 100;
+        vp.keyframe_interval   = keyframe_interval;
         tracker = sam3_create_tracker(*model, vp);
     }
     if (!tracker) { fail("tracker failed"); return; }
@@ -275,7 +278,8 @@ static BenchResult run_benchmark_isolated(const ModelEntry & entry,
                                            const std::string & video_path,
                                            int n_frames,
                                            float px, float py,
-                                           int n_threads) {
+                                           int n_threads,
+                                           int keyframe_interval) {
     BenchResult res;
     res.model_name = entry.name;
     res.backend    = use_gpu ? "Metal" : "CPU";
@@ -299,7 +303,7 @@ static BenchResult run_benchmark_isolated(const ModelEntry & entry,
         // Child
         close(pipefd[0]);
         child_benchmark(entry.path, use_gpu, video_path,
-                        n_frames, px, py, n_threads, pipefd[1]);
+                        n_frames, px, py, n_threads, keyframe_interval, pipefd[1]);
         _exit(1);
     }
 
@@ -337,10 +341,12 @@ static BenchResult run_benchmark_isolated(const ModelEntry & entry,
 
 static void print_table(const std::vector<BenchResult> & results,
                          const std::string & video_path,
-                         float px, float py, int n_frames, int n_threads) {
+                         float px, float py, int n_frames, int n_threads,
+                         int keyframe_interval) {
     printf("\n");
     printf("=========================================================================================================\n");
-    printf("SAM3.CPP BENCHMARK  —  %d frames, point=(%.1f, %.1f), threads=%d\n", n_frames, px, py, n_threads);
+    printf("SAM3.CPP BENCHMARK  —  %d frames, point=(%.1f, %.1f), threads=%d, keyframe_interval=%d\n",
+           n_frames, px, py, n_threads, keyframe_interval);
     printf("video: %s\n", video_path.c_str());
     printf("=========================================================================================================\n\n");
 
@@ -389,6 +395,7 @@ int main(int argc, char ** argv) {
     float       py         = 250.0f;
     int         n_frames   = 10;
     int         n_threads  = 4;
+    int         keyframe_interval = 15;
     bool        cpu_only   = false;
     bool        gpu_only   = false;
     std::string filter;
@@ -404,18 +411,20 @@ int main(int argc, char ** argv) {
         else if (arg == "--cpu-only")  { cpu_only = true; }
         else if (arg == "--gpu-only")  { gpu_only = true; }
         else if (arg == "--filter"     && i + 1 < argc) { filter = argv[++i]; }
+        else if (arg == "--keyframe-interval" && i + 1 < argc) { keyframe_interval = atoi(argv[++i]); }
         else if (arg == "--help" || arg == "-h") {
             fprintf(stderr,
                 "Usage: %s [options]\n"
-                "  --models-dir <path>   Models directory       (default: models/)\n"
-                "  --video <path>        Video file             (default: data/test_video.mp4)\n"
-                "  --point-x <f>         Click X                (default: 315.0)\n"
-                "  --point-y <f>         Click Y                (default: 250.0)\n"
-                "  --n-frames <n>        Frames to track        (default: 10)\n"
-                "  --n-threads <n>       CPU threads            (default: 4)\n"
-                "  --cpu-only            Skip Metal runs\n"
-                "  --gpu-only            Skip CPU runs\n"
-                "  --filter <substr>     Filter model filenames\n",
+                "  --models-dir <path>       Models directory       (default: models/)\n"
+                "  --video <path>            Video file             (default: data/test_video.mp4)\n"
+                "  --point-x <f>             Click X                (default: 315.0)\n"
+                "  --point-y <f>             Click Y                (default: 250.0)\n"
+                "  --n-frames <n>            Frames to track        (default: 10)\n"
+                "  --n-threads <n>           CPU threads            (default: 4)\n"
+                "  --keyframe-interval <n>   Flow keyframe interval (default: 15, 0=disable)\n"
+                "  --cpu-only                Skip Metal runs\n"
+                "  --gpu-only                Skip CPU runs\n"
+                "  --filter <substr>         Filter model filenames\n",
                 argv[0]);
             return 0;
         } else {
@@ -489,7 +498,7 @@ int main(int argc, char ** argv) {
                 i + 1, runs.size(), run.entry->name.c_str(), backend_str);
 
         auto res = run_benchmark_isolated(*run.entry, run.use_gpu, video_path,
-                                           n_frames, px, py, n_threads);
+                                           n_frames, px, py, n_threads, keyframe_interval);
         results.push_back(res);
 
         if (res.success) {
@@ -503,7 +512,7 @@ int main(int argc, char ** argv) {
     double t_wall_ms = (ggml_time_us() - t_wall_start) / 1000.0;
 
     // Print table
-    print_table(results, video_path, px, py, n_frames, n_threads);
+    print_table(results, video_path, px, py, n_frames, n_threads, keyframe_interval);
 
     double t_wall_s = t_wall_ms / 1000.0;
     int mins = (int)(t_wall_s / 60.0);
