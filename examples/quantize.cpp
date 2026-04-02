@@ -83,9 +83,19 @@ static bool sam3_quantize_model(const std::string & fname_inp,
     };
 
     if (is_sam2) {
-        // SAM2 header: 57 int32 fields (see sam2_load_hparams / write_header)
-        // 2 + 3 + 4 + 1 + 8 + 1 + 4 + 3 + 2 + 4 + 4 + 4 + 2 + 15 = 57
-        for (int i = 0; i < 57; ++i) copy_i32();
+        // SAM2 standard header: 57 int32 fields total
+        // Fields 1-2: img_size, backbone_type
+        copy_i32();                           // img_size
+        int32_t backbone_type = copy_i32();   // backbone_type (1=hiera, 2=repvit)
+        // Fields 3-57: remaining standard SAM2 fields
+        for (int i = 0; i < 55; ++i) copy_i32();
+        // EdgeTAM extension: 19 additional fields when backbone_type == 2
+        // (repvit_num_stages + stages[4] + channels[4] + se_ratio + has_perceiver +
+        //  perceiver_depth + perceiver_dim + n_latents_1d + n_latents_2d + ff_mult +
+        //  mem_attn_ca_type + ca_q_size + ca_k_size)
+        if (backbone_type == 2) {
+            for (int i = 0; i < 19; ++i) copy_i32();
+        }
     } else {
         // SAM3 header
         copy_i32();  // img_size
@@ -206,7 +216,7 @@ static bool sam3_quantize_model(const std::string & fname_inp,
          || name_contains("pe_gaussian")   || name_contains("freqs_cis")
          || name_contains("gamma")         || name_contains("tpos_enc")
          || name_contains("no_obj_ptr")    || name_contains("no_mem_pos_enc")
-         || name_contains("trk_mask_ds");
+         || name_contains("trk_mask_ds")   || name_contains("latents");
         const bool quantize = (n_dims >= 2) &&
                               (ne[0] % blk_size == 0) &&
                               !ggml_is_quantized(file_type) &&

@@ -167,6 +167,7 @@ static void child_benchmark(const std::string & model_path,
                              int n_frames,
                              float px, float py,
                              int n_threads,
+                             int encode_img_size,
                              int write_fd) {
     BenchWire wire = {};
 
@@ -193,9 +194,10 @@ static void child_benchmark(const std::string & model_path,
     int64_t t0 = ggml_time_us();
 
     sam3_params params;
-    params.model_path = model_path;
-    params.use_gpu    = use_gpu;
-    params.n_threads  = n_threads;
+    params.model_path    = model_path;
+    params.use_gpu       = use_gpu;
+    params.n_threads     = n_threads;
+    params.encode_img_size = encode_img_size;
 
     auto model = sam3_load_model(params);
     if (!model) { fail("load failed"); return; }
@@ -275,7 +277,8 @@ static BenchResult run_benchmark_isolated(const ModelEntry & entry,
                                            const std::string & video_path,
                                            int n_frames,
                                            float px, float py,
-                                           int n_threads) {
+                                           int n_threads,
+                                           int encode_img_size = 0) {
     BenchResult res;
     res.model_name = entry.name;
     res.backend    = use_gpu ? "Metal" : "CPU";
@@ -299,7 +302,7 @@ static BenchResult run_benchmark_isolated(const ModelEntry & entry,
         // Child
         close(pipefd[0]);
         child_benchmark(entry.path, use_gpu, video_path,
-                        n_frames, px, py, n_threads, pipefd[1]);
+                        n_frames, px, py, n_threads, encode_img_size, pipefd[1]);
         _exit(1);
     }
 
@@ -387,10 +390,11 @@ int main(int argc, char ** argv) {
     std::string video_path = "data/test_video.mp4";
     float       px         = 315.0f;
     float       py         = 250.0f;
-    int         n_frames   = 10;
-    int         n_threads  = 4;
-    bool        cpu_only   = false;
-    bool        gpu_only   = false;
+    int         n_frames        = 10;
+    int         n_threads       = 4;
+    int         encode_img_size = 0;
+    bool        cpu_only        = false;
+    bool        gpu_only        = false;
     std::string filter;
 
     for (int i = 1; i < argc; i++) {
@@ -401,6 +405,7 @@ int main(int argc, char ** argv) {
         else if (arg == "--point-y"    && i + 1 < argc) { py = (float)atof(argv[++i]); }
         else if (arg == "--n-frames"   && i + 1 < argc) { n_frames = atoi(argv[++i]); }
         else if (arg == "--n-threads"  && i + 1 < argc) { n_threads = atoi(argv[++i]); }
+        else if (arg == "--encode-img-size" && i + 1 < argc) { encode_img_size = atoi(argv[++i]); }
         else if (arg == "--cpu-only")  { cpu_only = true; }
         else if (arg == "--gpu-only")  { gpu_only = true; }
         else if (arg == "--filter"     && i + 1 < argc) { filter = argv[++i]; }
@@ -489,7 +494,7 @@ int main(int argc, char ** argv) {
                 i + 1, runs.size(), run.entry->name.c_str(), backend_str);
 
         auto res = run_benchmark_isolated(*run.entry, run.use_gpu, video_path,
-                                           n_frames, px, py, n_threads);
+                                           n_frames, px, py, n_threads, encode_img_size);
         results.push_back(res);
 
         if (res.success) {

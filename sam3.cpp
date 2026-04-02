@@ -142,6 +142,24 @@ struct sam3_hparams {
     int32_t multimask_output_in_sam             = 1;
     int32_t is_sam2_1                           = 1;  // 0 = SAM2.0, 1 = SAM2.1
 
+    // ── EdgeTAM-specific fields ─────────────────────────────────────
+    int32_t backbone_type             = 1;   // 1=hiera, 2=repvit
+    int32_t repvit_num_stages         = 4;
+    int32_t repvit_stages[4]          = {2, 2, 14, 2};
+    int32_t repvit_channels[4]        = {48, 96, 192, 384};
+    int32_t repvit_se_ratio_x100      = 25;
+
+    int32_t has_perceiver             = 0;
+    int32_t perceiver_depth           = 0;
+    int32_t perceiver_dim             = 0;
+    int32_t perceiver_n_latents_1d    = 0;
+    int32_t perceiver_n_latents_2d    = 0;
+    int32_t perceiver_ff_mult         = 0;
+
+    int32_t mem_attn_ca_type          = 0;   // 0=RoPEv1, 1=RoPEv2
+    int32_t mem_attn_ca_q_size        = 32;
+    int32_t mem_attn_ca_k_size        = 32;
+
     // ── SAM3 derived helpers ────────────────────────────────────────────
     int32_t n_img_embd() const { return img_size / patch_size; }            // 72
     int32_t n_img_tokens() const { return n_img_embd() * n_img_embd(); }    // 5184
@@ -153,6 +171,11 @@ struct sam3_hparams {
         }
         return false;
     }
+
+    // ── EdgeTAM derived helpers ────────────────────────────────────────
+    bool is_edgetam() const { return model_type == SAM3_MODEL_EDGETAM; }
+
+    int32_t edgetam_feat_size() const { return img_size / 16; }  // 1024/16 = 64
 
     // ── SAM2 derived helpers ────────────────────────────────────────────
     bool is_sam2() const { return model_type == SAM3_MODEL_SAM2; }
@@ -194,7 +217,9 @@ struct sam3_hparams {
 
     // Feature size for the active backbone
     int32_t feat_size() const {
-        return is_sam2() ? hiera_feat_size() : n_img_embd();
+        if (is_edgetam()) return edgetam_feat_size();
+        if (is_sam2()) return hiera_feat_size();
+        return n_img_embd();
     }
 
     bool is_hiera_global_attn(int block_idx) const {
@@ -207,6 +232,9 @@ struct sam3_hparams {
 
 // Compute feat_size for an arbitrary img_size.
 static int sam3_effective_feat_size(const sam3_hparams& hp, int img_size) {
+    if (hp.is_edgetam()) {
+        return img_size / 16;
+    }
     if (hp.is_sam2()) {
         int s = img_size / 4;
         int n_pools = std::min(hp.hiera_q_pool, hp.hiera_num_stages - 1);
@@ -692,6 +720,107 @@ struct sam2_fpn_neck {
     sam2_fpn_level levels[4];
 };
 
+/*
+** ── EdgeTAM RepViT Backbone ─────────────────────────────────────────────
+*/
+
+struct edgetam_repvit_block {
+    // Token mixer: single fused DW 3×3 (after RepVGG reparameterization)
+    struct ggml_tensor* tm_w         = nullptr;  // [3, 3, 1, ch]
+    struct ggml_tensor* tm_b         = nullptr;  // [ch]
+
+    // Squeeze-and-excitation (only on even-indexed blocks)
+    bool has_se = false;
+    struct ggml_tensor* se_fc1_w     = nullptr;  // [1, 1, ch, ch_rd]
+    struct ggml_tensor* se_fc1_b     = nullptr;  // [ch_rd]
+    struct ggml_tensor* se_fc2_w     = nullptr;  // [1, 1, ch_rd, ch]
+    struct ggml_tensor* se_fc2_b     = nullptr;  // [ch]
+
+    // Channel mixer: 1×1 expand → GELU → 1×1 project
+    struct ggml_tensor* cm_conv1_w   = nullptr;  // [1, 1, ch, ch*2]
+    struct ggml_tensor* cm_conv1_b   = nullptr;  // [ch*2]
+    struct ggml_tensor* cm_conv2_w   = nullptr;  // [1, 1, ch*2, ch]
+    struct ggml_tensor* cm_conv2_b   = nullptr;  // [ch]
+};
+
+struct edgetam_repvit_downsample {
+    // Pre-block (RepViT block at prev-stage channels, no SE)
+    edgetam_repvit_block pre_block;
+
+    // Spatial downsample: DW Conv 3×3, stride=2
+    struct ggml_tensor* spatial_w    = nullptr;  // [3, 3, 1, ch_in]
+    struct ggml_tensor* spatial_b    = nullptr;  // [ch_in]
+
+    // Channel expand: 1×1 Conv
+    struct ggml_tensor* channel_w    = nullptr;  // [1, 1, ch_in, ch_out]
+    struct ggml_tensor* channel_b    = nullptr;  // [ch_out]
+
+    // FFN: 1×1 expand → GELU → 1×1 project
+    struct ggml_tensor* ffn_conv1_w  = nullptr;  // [1, 1, ch_out, ch_out*2]
+    struct ggml_tensor* ffn_conv1_b  = nullptr;  // [ch_out*2]
+    struct ggml_tensor* ffn_conv2_w  = nullptr;  // [1, 1, ch_out*2, ch_out]
+    struct ggml_tensor* ffn_conv2_b  = nullptr;  // [ch_out]
+};
+
+struct edgetam_repvit_stage {
+    std::vector<edgetam_repvit_block> blocks;
+    bool has_downsample = false;
+    edgetam_repvit_downsample downsample;
+};
+
+struct edgetam_repvit {
+    // Stem: 2 conv layers (3→24→48, each stride 2)
+    struct ggml_tensor* stem_conv1_w = nullptr;  // [3, 3, 3, 24]
+    struct ggml_tensor* stem_conv1_b = nullptr;  // [24]
+    struct ggml_tensor* stem_conv2_w = nullptr;  // [3, 3, 24, 48]
+    struct ggml_tensor* stem_conv2_b = nullptr;  // [48]
+
+    edgetam_repvit_stage stages[4];
+};
+
+/*
+** ── EdgeTAM Spatial Perceiver ───────────────────────────────────────────
+*/
+
+struct edgetam_perceiver_layer {
+    // Cross-attention (latents attend to features)
+    struct ggml_tensor* ca_norm_latents_w = nullptr;
+    struct ggml_tensor* ca_norm_latents_b = nullptr;
+    struct ggml_tensor* ca_norm_x_w       = nullptr;
+    struct ggml_tensor* ca_norm_x_b       = nullptr;
+    struct ggml_tensor* ca_q_w            = nullptr;  // [64, 64] no bias
+    struct ggml_tensor* ca_kv_w           = nullptr;  // [128, 64] no bias
+    struct ggml_tensor* ca_out_w          = nullptr;  // [64, 64] no bias
+
+    // FFN after cross-attention
+    struct ggml_tensor* ff_norm_w         = nullptr;
+    struct ggml_tensor* ff_norm_b         = nullptr;
+    struct ggml_tensor* ff_fc1_w          = nullptr;  // [256, 64] no bias
+    struct ggml_tensor* ff_fc2_w          = nullptr;  // [64, 256] no bias
+
+    // Self-attention on latents
+    struct ggml_tensor* sa_norm_w         = nullptr;
+    struct ggml_tensor* sa_norm_b         = nullptr;
+    struct ggml_tensor* sa_q_w            = nullptr;  // [64, 64] no bias
+    struct ggml_tensor* sa_kv_w           = nullptr;  // [128, 64] no bias
+    struct ggml_tensor* sa_out_w          = nullptr;  // [64, 64] no bias
+
+    // FFN after self-attention
+    struct ggml_tensor* sa_ff_norm_w      = nullptr;
+    struct ggml_tensor* sa_ff_norm_b      = nullptr;
+    struct ggml_tensor* sa_ff_fc1_w       = nullptr;  // [256, 64]
+    struct ggml_tensor* sa_ff_fc2_w       = nullptr;  // [64, 256]
+};
+
+struct edgetam_perceiver {
+    struct ggml_tensor* latents_1d        = nullptr;  // [256, 64]
+    struct ggml_tensor* latents_2d        = nullptr;  // [256, 64]
+    struct ggml_tensor* norm_w            = nullptr;  // [64]
+    struct ggml_tensor* norm_b            = nullptr;  // [64]
+
+    std::vector<edgetam_perceiver_layer> layers;
+};
+
 /*****************************************************************************
 ** Top-Level Opaque Types (defined here, forward-declared in sam3.h)
 *****************************************************************************/
@@ -713,6 +842,10 @@ struct sam3_model {
     // ── SAM2-specific (loaded only when model_type == SAM2) ──────────────
     sam2_hiera          hiera;
     sam2_fpn_neck       fpn_neck;
+
+    // ── EdgeTAM-specific (loaded only when model_type == EDGETAM) ───────
+    edgetam_repvit      repvit;
+    edgetam_perceiver   perceiver;
 
     // ── Shared (loaded for both SAM2 and SAM3) ──────────────────────────
     sam3_sam_prompt_enc sam_pe;
@@ -830,6 +963,9 @@ struct sam3_tracker {
     std::vector<float> cached_sinpe_256;       // sam3_sinusoidal_pe_2d(72, 72, 256)
     std::vector<float> cached_sinpe_64;        // sam3_sinusoidal_pe_2d(72, 72, 64)
     std::vector<float> cached_axial_cis_reord; // reordered axial CIS for RoPE Q
+
+    // EdgeTAM-specific: RoPE for 16x16 grid (cross-attn K on perceiver 2D latents)
+    std::vector<float> cached_axial_cis_k16_reord; // [2, 128, 256] for 16x16 grid
 };
 
 // Resolve effective img_size / feat_size from state (which may override hp defaults).
@@ -1392,6 +1528,26 @@ static void sam3_print_hparams(const sam3_hparams& hp) {
     fprintf(stderr, "  visual_only    = %d\n", hp.visual_only);
 }
 
+// ── EdgeTAM-specific hparams extension ────────────────────────────────────
+
+static bool edgetam_load_extra_hparams(std::ifstream& fin, sam3_hparams& hp) {
+    auto rd = [&](int32_t& v) { fin.read(reinterpret_cast<char*>(&v), 4); };
+    rd(hp.repvit_num_stages);
+    for (int i = 0; i < 4; ++i) rd(hp.repvit_stages[i]);
+    for (int i = 0; i < 4; ++i) rd(hp.repvit_channels[i]);
+    rd(hp.repvit_se_ratio_x100);
+    rd(hp.has_perceiver);
+    rd(hp.perceiver_depth);
+    rd(hp.perceiver_dim);
+    rd(hp.perceiver_n_latents_1d);
+    rd(hp.perceiver_n_latents_2d);
+    rd(hp.perceiver_ff_mult);
+    rd(hp.mem_attn_ca_type);
+    rd(hp.mem_attn_ca_q_size);
+    rd(hp.mem_attn_ca_k_size);
+    return !fin.fail();
+}
+
 // ── SAM2-specific loading ─────────────────────────────────────────────────
 
 static bool sam2_load_hparams(std::ifstream& fin, sam3_hparams& hp) {
@@ -1446,9 +1602,38 @@ static bool sam2_load_hparams(std::ifstream& fin, sam3_hparams& hp) {
     rd(hp.multimask_output_in_sam);
     rd(hp.is_sam2_1);
 
-    hp.model_type = SAM3_MODEL_SAM2;
+    hp.backbone_type = backbone_type;
+    if (backbone_type == 2) {
+        // EdgeTAM: read extended hparams
+        if (!edgetam_load_extra_hparams(fin, hp)) return false;
+        hp.model_type = SAM3_MODEL_EDGETAM;
+    } else {
+        hp.model_type = SAM3_MODEL_SAM2;
+    }
 
     return !fin.fail();
+}
+
+static void edgetam_print_hparams(const sam3_hparams& hp) {
+    fprintf(stderr, "  model_type        = EdgeTAM\n");
+    fprintf(stderr, "  img_size          = %d\n", hp.img_size);
+    fprintf(stderr, "  backbone_type     = %d (repvit)\n", hp.backbone_type);
+    fprintf(stderr, "  repvit_stages     = [%d, %d, %d, %d]\n",
+            hp.repvit_stages[0], hp.repvit_stages[1],
+            hp.repvit_stages[2], hp.repvit_stages[3]);
+    fprintf(stderr, "  repvit_channels   = [%d, %d, %d, %d]\n",
+            hp.repvit_channels[0], hp.repvit_channels[1],
+            hp.repvit_channels[2], hp.repvit_channels[3]);
+    fprintf(stderr, "  repvit_se_ratio   = %d/100\n", hp.repvit_se_ratio_x100);
+    fprintf(stderr, "  has_perceiver     = %d\n", hp.has_perceiver);
+    fprintf(stderr, "  perceiver_depth   = %d\n", hp.perceiver_depth);
+    fprintf(stderr, "  perceiver_dim     = %d\n", hp.perceiver_dim);
+    fprintf(stderr, "  neck_dim          = %d\n", hp.neck_dim);
+    fprintf(stderr, "  sam_embed_dim     = %d\n", hp.sam_embed_dim);
+    fprintf(stderr, "  mem_attn_layers   = %d\n", hp.mem_attn_layers);
+    fprintf(stderr, "  num_maskmem       = %d\n", hp.num_maskmem);
+    fprintf(stderr, "  feat_size         = %d\n", hp.edgetam_feat_size());
+    fprintf(stderr, "  mem_attn_ca_type  = %d\n", hp.mem_attn_ca_type);
 }
 
 static void sam2_print_hparams(const sam3_hparams& hp) {
@@ -1853,6 +2038,403 @@ static void sam2_register_tensors(sam3_model& model) {
     }
 
     // ── SAM2 top-level tensors ───────────────────────────────────────────
+    model.no_mem_embed = T3f("no_mem_embed", D, 1, 1);
+    model.no_mem_pos_enc = T3f("no_mem_pos_enc", D, 1, 1);
+    if (hp.is_sam2_1) {
+        model.no_obj_embed_spatial = T2f("no_obj_embed_spatial", MD, 1);
+    }
+    T4f("trk_mask_ds.weight", 4, 4, 1, 1);
+    T1f("trk_mask_ds.bias", 1);
+}
+
+// Helper: make_divisible(v, divisor) — rounds v up to nearest multiple of divisor
+static int edgetam_make_divisible(int v, int divisor) {
+    int new_v = std::max(divisor, (v + divisor / 2) / divisor * divisor);
+    // Make sure round-down doesn't go below 90% of v
+    if (new_v < (int)(0.9f * v)) new_v += divisor;
+    return new_v;
+}
+
+static void edgetam_register_tensors(sam3_model& model) {
+    const auto& hp = model.hparams;
+    auto& tensors = model.tensors;
+    auto ctx = model.ctx;
+    const ggml_type WTYPE = model.weight_type;
+    const int64_t WBLK = ggml_blck_size(WTYPE);
+
+    auto T1f = [&](const std::string& name, int64_t d0) -> ggml_tensor* {
+        auto* t = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, d0);
+        ggml_set_name(t, name.c_str());
+        tensors[name] = t;
+        return t;
+    };
+    auto T2 = [&](const std::string& name, int64_t d0, int64_t d1) -> ggml_tensor* {
+        const ggml_type type = (d0 % WBLK == 0) ? WTYPE : GGML_TYPE_F32;
+        auto* t = ggml_new_tensor_2d(ctx, type, d0, d1);
+        ggml_set_name(t, name.c_str());
+        tensors[name] = t;
+        return t;
+    };
+    auto T2f = [&](const std::string& name, int64_t d0, int64_t d1) -> ggml_tensor* {
+        auto* t = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, d0, d1);
+        ggml_set_name(t, name.c_str());
+        tensors[name] = t;
+        return t;
+    };
+    auto T3f = [&](const std::string& name, int64_t d0, int64_t d1, int64_t d2) -> ggml_tensor* {
+        auto* t = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, d0, d1, d2);
+        ggml_set_name(t, name.c_str());
+        tensors[name] = t;
+        return t;
+    };
+    auto T4 = [&](const std::string& name, int64_t d0, int64_t d1, int64_t d2, int64_t d3) -> ggml_tensor* {
+        const ggml_type type = (d0 % WBLK == 0) ? WTYPE : GGML_TYPE_F32;
+        auto* t = ggml_new_tensor_4d(ctx, type, d0, d1, d2, d3);
+        ggml_set_name(t, name.c_str());
+        tensors[name] = t;
+        return t;
+    };
+    auto T4f = [&](const std::string& name, int64_t d0, int64_t d1, int64_t d2, int64_t d3) -> ggml_tensor* {
+        auto* t = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, d0, d1, d2, d3);
+        ggml_set_name(t, name.c_str());
+        tensors[name] = t;
+        return t;
+    };
+
+    const int D = hp.neck_dim;        // 256
+    const int MD = hp.mem_out_dim;    // 64
+    const int FFN = 2048;             // SAM/memory MLP hidden dim
+
+    // ── RepViT backbone ──────────────────────────────────────────────────
+    // Stem
+    model.repvit.stem_conv1_w = T4f("repvit.stem.conv1.weight", 3, 3, 3, 24);
+    model.repvit.stem_conv1_b = T1f("repvit.stem.conv1.bias", 24);
+    model.repvit.stem_conv2_w = T4f("repvit.stem.conv2.weight", 3, 3, 24, 48);
+    model.repvit.stem_conv2_b = T1f("repvit.stem.conv2.bias", 48);
+
+    // Stages
+    for (int s = 0; s < hp.repvit_num_stages; ++s) {
+        int ch = hp.repvit_channels[s];
+        int ch_rd = edgetam_make_divisible((int)(ch * hp.repvit_se_ratio_x100 / 100.0f), 8);
+        int n_blocks = hp.repvit_stages[s];
+
+        auto& stage = model.repvit.stages[s];
+        stage.blocks.resize(n_blocks);
+
+        for (int b = 0; b < n_blocks; ++b) {
+            auto& blk = stage.blocks[b];
+            auto p = "repvit.stages." + std::to_string(s) + ".blocks." + std::to_string(b);
+
+            // Token mixer DW conv 3×3
+            blk.tm_w = T4f(p + ".tm.weight", 3, 3, 1, ch);
+            blk.tm_b = T1f(p + ".tm.bias", ch);
+
+            // SE on even-indexed blocks only
+            if (b % 2 == 0) {
+                blk.has_se = true;
+                blk.se_fc1_w = T4f(p + ".se.fc1.weight", 1, 1, ch, ch_rd);
+                blk.se_fc1_b = T1f(p + ".se.fc1.bias", ch_rd);
+                blk.se_fc2_w = T4f(p + ".se.fc2.weight", 1, 1, ch_rd, ch);
+                blk.se_fc2_b = T1f(p + ".se.fc2.bias", ch);
+            }
+
+            // Channel mixer
+            blk.cm_conv1_w = T4f(p + ".cm.conv1.weight", 1, 1, ch, ch * 2);
+            blk.cm_conv1_b = T1f(p + ".cm.conv1.bias", ch * 2);
+            blk.cm_conv2_w = T4f(p + ".cm.conv2.weight", 1, 1, ch * 2, ch);
+            blk.cm_conv2_b = T1f(p + ".cm.conv2.bias", ch);
+        }
+
+        // Downsample (stages 1, 2, 3 have downsamples — at start of each new stage)
+        if (s > 0) {
+            stage.has_downsample = true;
+            auto& ds = stage.downsample;
+            int ch_prev = hp.repvit_channels[s - 1];
+            auto dp = "repvit.stages." + std::to_string(s) + ".ds";
+
+            // Pre-block (at previous stage channels, no SE)
+            ds.pre_block.tm_w = T4f(dp + ".pre.tm.weight", 3, 3, 1, ch_prev);
+            ds.pre_block.tm_b = T1f(dp + ".pre.tm.bias", ch_prev);
+            ds.pre_block.has_se = false;
+            ds.pre_block.cm_conv1_w = T4f(dp + ".pre.cm.conv1.weight", 1, 1, ch_prev, ch_prev * 2);
+            ds.pre_block.cm_conv1_b = T1f(dp + ".pre.cm.conv1.bias", ch_prev * 2);
+            ds.pre_block.cm_conv2_w = T4f(dp + ".pre.cm.conv2.weight", 1, 1, ch_prev * 2, ch_prev);
+            ds.pre_block.cm_conv2_b = T1f(dp + ".pre.cm.conv2.bias", ch_prev);
+
+            // Spatial downsample
+            ds.spatial_w = T4f(dp + ".spatial.weight", 3, 3, 1, ch_prev);
+            ds.spatial_b = T1f(dp + ".spatial.bias", ch_prev);
+
+            // Channel expand
+            ds.channel_w = T4f(dp + ".channel.weight", 1, 1, ch_prev, ch);
+            ds.channel_b = T1f(dp + ".channel.bias", ch);
+
+            // FFN
+            ds.ffn_conv1_w = T4f(dp + ".ffn.conv1.weight", 1, 1, ch, ch * 2);
+            ds.ffn_conv1_b = T1f(dp + ".ffn.conv1.bias", ch * 2);
+            ds.ffn_conv2_w = T4f(dp + ".ffn.conv2.weight", 1, 1, ch * 2, ch);
+            ds.ffn_conv2_b = T1f(dp + ".ffn.conv2.bias", ch);
+        }
+    }
+
+    // ── FPN neck (4 lateral 1×1 convs) ───────────────────────────────────
+    // backbone_channel_list = [ch3, ch2, ch1, ch0] (reversed: highest dim first)
+    for (int i = 0; i < 4; ++i) {
+        int stage = hp.repvit_num_stages - 1 - i;
+        int ch = hp.repvit_channels[stage];
+        auto p = "fpn.convs." + std::to_string(i);
+        model.fpn_neck.levels[i].conv_w = T4(p + ".weight", 1, 1, ch, D);
+        model.fpn_neck.levels[i].conv_b = T1f(p + ".bias", D);
+    }
+
+    // ── Perceiver (if present) ───────────────────────────────────────────
+    if (hp.has_perceiver) {
+        int pd = hp.perceiver_dim;  // typically 64
+        int ff_dim = pd * hp.perceiver_ff_mult;
+
+        model.perceiver.latents_1d = T2f("perceiver.latents", pd, hp.perceiver_n_latents_1d);
+        model.perceiver.latents_2d = T2f("perceiver.latents_2d", pd, hp.perceiver_n_latents_2d);
+        model.perceiver.norm_w = T1f("perceiver.norm.weight", pd);
+        model.perceiver.norm_b = T1f("perceiver.norm.bias", pd);
+
+        model.perceiver.layers.resize(hp.perceiver_depth);
+        for (int i = 0; i < hp.perceiver_depth; ++i) {
+            auto& ly = model.perceiver.layers[i];
+            auto p = "perceiver.layers." + std::to_string(i);
+
+            // Cross-attention
+            ly.ca_norm_latents_w = T1f(p + ".ca.norm_latents.weight", pd);
+            ly.ca_norm_latents_b = T1f(p + ".ca.norm_latents.bias", pd);
+            ly.ca_norm_x_w       = T1f(p + ".ca.norm_x.weight", pd);
+            ly.ca_norm_x_b       = T1f(p + ".ca.norm_x.bias", pd);
+            ly.ca_q_w            = T2(p + ".ca.q.weight", pd, pd);
+            ly.ca_kv_w           = T2(p + ".ca.kv.weight", pd, 2 * pd);
+            ly.ca_out_w          = T2(p + ".ca.out.weight", pd, pd);
+
+            // FFN after cross-attention
+            ly.ff_norm_w = T1f(p + ".ff.norm.weight", pd);
+            ly.ff_norm_b = T1f(p + ".ff.norm.bias", pd);
+            ly.ff_fc1_w  = T2(p + ".ff.fc1.weight", pd, ff_dim);
+            ly.ff_fc2_w  = T2(p + ".ff.fc2.weight", ff_dim, pd);
+
+            // Self-attention on latents
+            ly.sa_norm_w = T1f(p + ".sa.norm.weight", pd);
+            ly.sa_norm_b = T1f(p + ".sa.norm.bias", pd);
+            ly.sa_q_w    = T2(p + ".sa.q.weight", pd, pd);
+            ly.sa_kv_w   = T2(p + ".sa.kv.weight", pd, 2 * pd);
+            ly.sa_out_w  = T2(p + ".sa.out.weight", pd, pd);
+
+            // FFN after self-attention
+            ly.sa_ff_norm_w = T1f(p + ".sa_ff.norm.weight", pd);
+            ly.sa_ff_norm_b = T1f(p + ".sa_ff.norm.bias", pd);
+            ly.sa_ff_fc1_w  = T2(p + ".sa_ff.fc1.weight", pd, ff_dim);
+            ly.sa_ff_fc2_w  = T2(p + ".sa_ff.fc2.weight", ff_dim, pd);
+        }
+    }
+
+    // ── SAM prompt encoder (shared) ──────────────────────────────────────
+    model.sam_pe.pe_gaussian = T2f("sam_pe.pe_gaussian", 2, 128);
+    for (int i = 0; i < 4; ++i)
+        model.sam_pe.point_embed[i] = T2f("sam_pe.point_embeddings." + std::to_string(i) + ".weight", D, 1);
+    model.sam_pe.not_a_point_embed = T2f("sam_pe.not_a_point_embed.weight", D, 1);
+    model.sam_pe.no_mask_embed = T2f("sam_pe.no_mask_embed.weight", D, 1);
+
+    model.sam_pe.mask_ds_conv_w[0] = T4("sam_pe.mask_ds.0.weight", 2, 2, 1, 4);
+    model.sam_pe.mask_ds_conv_b[0] = T1f("sam_pe.mask_ds.0.bias", 4);
+    model.sam_pe.mask_ds_norm_w[0] = T1f("sam_pe.mask_ds.1.weight", 4);
+    model.sam_pe.mask_ds_norm_b[0] = T1f("sam_pe.mask_ds.1.bias", 4);
+    model.sam_pe.mask_ds_conv_w[1] = T4("sam_pe.mask_ds.3.weight", 2, 2, 4, 16);
+    model.sam_pe.mask_ds_conv_b[1] = T1f("sam_pe.mask_ds.3.bias", 16);
+    model.sam_pe.mask_ds_norm_w[1] = T1f("sam_pe.mask_ds.4.weight", 16);
+    model.sam_pe.mask_ds_norm_b[1] = T1f("sam_pe.mask_ds.4.bias", 16);
+    model.sam_pe.mask_ds_conv_w[2] = T4("sam_pe.mask_ds.6.weight", 1, 1, 16, D);
+    model.sam_pe.mask_ds_conv_b[2] = T1f("sam_pe.mask_ds.6.bias", D);
+
+    // ── SAM mask decoder (shared) ────────────────────────────────────────
+    model.sam_dec.iou_token = T2f("sam_dec.iou_token.weight", D, 1);
+    model.sam_dec.mask_tokens = T2f("sam_dec.mask_tokens.weight", D, 4);
+    if (hp.pred_obj_scores) {
+        model.sam_dec.obj_score_token = T2f("sam_dec.obj_score_token.weight", D, 1);
+    }
+
+    model.sam_dec.twoway_blocks.resize(hp.sam_dec_depth);
+    for (int i = 0; i < hp.sam_dec_depth; ++i) {
+        auto& blk = model.sam_dec.twoway_blocks[i];
+        auto p = "sam_dec.twoway." + std::to_string(i);
+
+        auto reg_attn = [&](sam3_sam_attn& a, const std::string& pfx, int in_dim, int out_dim) {
+            a.q_w = T2(pfx + ".q_proj.weight", in_dim, out_dim);
+            a.q_b = T1f(pfx + ".q_proj.bias", out_dim);
+            a.k_w = T2(pfx + ".k_proj.weight", in_dim, out_dim);
+            a.k_b = T1f(pfx + ".k_proj.bias", out_dim);
+            a.v_w = T2(pfx + ".v_proj.weight", in_dim, out_dim);
+            a.v_b = T1f(pfx + ".v_proj.bias", out_dim);
+            a.out_w = T2(pfx + ".out_proj.weight", out_dim, in_dim);
+            a.out_b = T1f(pfx + ".out_proj.bias", in_dim);
+        };
+
+        reg_attn(blk.self_attn, p + ".sa", D, D);
+        reg_attn(blk.ca_tok2img, p + ".cross_attn_token_to_image", D, 128);
+        reg_attn(blk.ca_img2tok, p + ".cross_attn_image_to_token", D, 128);
+
+        blk.norm1_w = T1f(p + ".norm1.weight", D);
+        blk.norm1_b = T1f(p + ".norm1.bias", D);
+        blk.norm2_w = T1f(p + ".norm2.weight", D);
+        blk.norm2_b = T1f(p + ".norm2.bias", D);
+        blk.norm3_w = T1f(p + ".norm3.weight", D);
+        blk.norm3_b = T1f(p + ".norm3.bias", D);
+        blk.norm4_w = T1f(p + ".norm4.weight", D);
+        blk.norm4_b = T1f(p + ".norm4.bias", D);
+
+        blk.mlp_fc1_w = T2(p + ".mlp.lin1.weight", D, FFN);
+        blk.mlp_fc1_b = T1f(p + ".mlp.lin1.bias", FFN);
+        blk.mlp_fc2_w = T2(p + ".mlp.lin2.weight", FFN, D);
+        blk.mlp_fc2_b = T1f(p + ".mlp.lin2.bias", D);
+    }
+
+    // Final attention
+    {
+        auto reg_attn = [&](sam3_sam_attn& a, const std::string& pfx, int in_dim, int out_dim) {
+            a.q_w = T2(pfx + ".q_proj.weight", in_dim, out_dim);
+            a.q_b = T1f(pfx + ".q_proj.bias", out_dim);
+            a.k_w = T2(pfx + ".k_proj.weight", in_dim, out_dim);
+            a.k_b = T1f(pfx + ".k_proj.bias", out_dim);
+            a.v_w = T2(pfx + ".v_proj.weight", in_dim, out_dim);
+            a.v_b = T1f(pfx + ".v_proj.bias", out_dim);
+            a.out_w = T2(pfx + ".out_proj.weight", out_dim, in_dim);
+            a.out_b = T1f(pfx + ".out_proj.bias", in_dim);
+        };
+        reg_attn(model.sam_dec.final_attn, "sam_dec.final_attn", D, 128);
+    }
+    model.sam_dec.final_norm_w = T1f("sam_dec.final_norm.weight", D);
+    model.sam_dec.final_norm_b = T1f("sam_dec.final_norm.bias", D);
+
+    // Upscaling
+    model.sam_dec.up1_w = T4("sam_dec.upscale.0.weight", 2, 2, 64, D);
+    model.sam_dec.up1_b = T1f("sam_dec.upscale.0.bias", 64);
+    model.sam_dec.up1_norm_w = T1f("sam_dec.upscale.1.weight", 64);
+    model.sam_dec.up1_norm_b = T1f("sam_dec.upscale.1.bias", 64);
+    model.sam_dec.up2_w = T4("sam_dec.upscale.3.weight", 2, 2, 32, 64);
+    model.sam_dec.up2_b = T1f("sam_dec.upscale.3.bias", 32);
+
+    // High-res feature convolutions
+    model.sam_dec.conv_s0_w = T4("sam_dec.conv_s0.weight", 1, 1, D, 32);
+    model.sam_dec.conv_s0_b = T1f("sam_dec.conv_s0.bias", 32);
+    model.sam_dec.conv_s1_w = T4("sam_dec.conv_s1.weight", 1, 1, D, 64);
+    model.sam_dec.conv_s1_b = T1f("sam_dec.conv_s1.bias", 64);
+
+    // Hypernetwork MLPs (4 × 3 layers: 256→256→256→32)
+    for (int m = 0; m < 4; ++m) {
+        for (int j = 0; j < 3; ++j) {
+            int in_d = D, out_d = (j == 2) ? 32 : D;
+            auto bp = "sam_dec.hyper." + std::to_string(m) + ".layers." + std::to_string(j);
+            model.sam_dec.hyper_w[m][j] = T2(bp + ".weight", in_d, out_d);
+            model.sam_dec.hyper_b[m][j] = T1f(bp + ".bias", out_d);
+        }
+    }
+
+    // IoU head (3 layers: 256→256→256→4)
+    for (int j = 0; j < 3; ++j) {
+        int out_d = (j == 2) ? 4 : D;
+        auto bp = "sam_dec.iou_prediction_head.layers." + std::to_string(j);
+        model.sam_dec.iou_head_w[j] = T2(bp + ".weight", D, out_d);
+        model.sam_dec.iou_head_b[j] = T1f(bp + ".bias", out_d);
+    }
+
+    // Object score head
+    if (hp.pred_obj_scores) {
+        for (int j = 0; j < 3; ++j) {
+            int out_d = (j == 2) ? 1 : D;
+            auto bp = "sam_dec.pred_obj_score_head.layers." + std::to_string(j);
+            model.sam_dec.obj_head_w[j] = T2(bp + ".weight", D, out_d);
+            model.sam_dec.obj_head_b[j] = T1f(bp + ".bias", out_d);
+        }
+    }
+
+    // ── Memory encoder (shared) ──────────────────────────────────────────
+    int ds_channels[] = {1, 4, 16, 64, 256};
+    int ds_indices[]  = {0, 3, 6, 9, 12};
+    int norm_indices[] = {1, 4, 7, 10};
+    for (int s = 0; s < 4; ++s) {
+        auto si = std::to_string(ds_indices[s]);
+        model.mem_enc.ds_conv_w[s] = T4("mem_enc.ds." + si + ".weight", 3, 3, ds_channels[s], ds_channels[s + 1]);
+        model.mem_enc.ds_conv_b[s] = T1f("mem_enc.ds." + si + ".bias", ds_channels[s + 1]);
+        auto ni = std::to_string(norm_indices[s]);
+        model.mem_enc.ds_norm_w[s] = T1f("mem_enc.ds." + ni + ".weight", ds_channels[s + 1]);
+        model.mem_enc.ds_norm_b[s] = T1f("mem_enc.ds." + ni + ".bias", ds_channels[s + 1]);
+    }
+    model.mem_enc.ds_conv_w[4] = T4("mem_enc.ds.12.weight", 1, 1, D, D);
+    model.mem_enc.ds_conv_b[4] = T1f("mem_enc.ds.12.bias", D);
+
+    model.mem_enc.pix_proj_w = T4("mem_enc.pix_feat_proj.weight", 1, 1, D, D);
+    model.mem_enc.pix_proj_b = T1f("mem_enc.pix_feat_proj.bias", D);
+
+    for (int i = 0; i < 2; ++i) {
+        auto p = "mem_enc.fuser." + std::to_string(i);
+        model.mem_enc.fuser_dw_w[i] = T4(p + ".dwconv.weight", 7, 7, 1, D);
+        model.mem_enc.fuser_dw_b[i] = T1f(p + ".dwconv.bias", D);
+        model.mem_enc.fuser_norm_w[i] = T1f(p + ".norm.weight", D);
+        model.mem_enc.fuser_norm_b[i] = T1f(p + ".norm.bias", D);
+        model.mem_enc.fuser_fc1_w[i] = T2(p + ".pwconv1.weight", D, 1024);
+        model.mem_enc.fuser_fc1_b[i] = T1f(p + ".pwconv1.bias", 1024);
+        model.mem_enc.fuser_fc2_w[i] = T2(p + ".pwconv2.weight", 1024, D);
+        model.mem_enc.fuser_fc2_b[i] = T1f(p + ".pwconv2.bias", D);
+        model.mem_enc.fuser_gamma[i] = T1f(p + ".gamma", D);
+    }
+
+    model.mem_enc.out_proj_w = T4("mem_enc.out_proj.weight", 1, 1, D, MD);
+    model.mem_enc.out_proj_b = T1f("mem_enc.out_proj.bias", MD);
+    model.mem_enc.tpos[0] = T4f("mem_enc.tpos_enc", MD, 1, 1, hp.num_maskmem);
+
+    // ── Memory attention (shared) ────────────────────────────────────────
+    model.mem_attn.layers.resize(hp.mem_attn_layers);
+    model.mem_attn_norm_w = T1f("mem_attn.norm.weight", D);
+    model.mem_attn_norm_b = T1f("mem_attn.norm.bias", D);
+
+    for (int i = 0; i < hp.mem_attn_layers; ++i) {
+        auto& ly = model.mem_attn.layers[i];
+        auto p = "mem_attn.layers." + std::to_string(i);
+        ly.sa_q_w = T2(p + ".sa.q_proj.weight", D, D);
+        ly.sa_q_b = T1f(p + ".sa.q_proj.bias", D);
+        ly.sa_k_w = T2(p + ".sa.k_proj.weight", D, D);
+        ly.sa_k_b = T1f(p + ".sa.k_proj.bias", D);
+        ly.sa_v_w = T2(p + ".sa.v_proj.weight", D, D);
+        ly.sa_v_b = T1f(p + ".sa.v_proj.bias", D);
+        ly.sa_out_w = T2(p + ".sa.out_proj.weight", D, D);
+        ly.sa_out_b = T1f(p + ".sa.out_proj.bias", D);
+        ly.norm1_w = T1f(p + ".norm1.weight", D);
+        ly.norm1_b = T1f(p + ".norm1.bias", D);
+        ly.ca_q_w = T2(p + ".ca.q_proj.weight", D, D);
+        ly.ca_q_b = T1f(p + ".ca.q_proj.bias", D);
+        ly.ca_k_w = T2(p + ".ca.k_proj.weight", MD, D);
+        ly.ca_k_b = T1f(p + ".ca.k_proj.bias", D);
+        ly.ca_v_w = T2(p + ".ca.v_proj.weight", MD, D);
+        ly.ca_v_b = T1f(p + ".ca.v_proj.bias", D);
+        ly.ca_out_w = T2(p + ".ca.out_proj.weight", D, D);
+        ly.ca_out_b = T1f(p + ".ca.out_proj.bias", D);
+        ly.norm2_w = T1f(p + ".norm2.weight", D);
+        ly.norm2_b = T1f(p + ".norm2.bias", D);
+        ly.ffn_fc1_w = T2(p + ".linear1.weight", D, FFN);
+        ly.ffn_fc1_b = T1f(p + ".linear1.bias", FFN);
+        ly.ffn_fc2_w = T2(p + ".linear2.weight", FFN, D);
+        ly.ffn_fc2_b = T1f(p + ".linear2.bias", D);
+        ly.norm3_w = T1f(p + ".norm3.weight", D);
+        ly.norm3_b = T1f(p + ".norm3.bias", D);
+    }
+
+    // ── Object pointer projection (shared) ───────────────────────────────
+    for (int j = 0; j < 3; ++j) {
+        auto bp = "obj_ptr_proj.layers." + std::to_string(j);
+        model.obj_ptr_proj_w[j] = T2(bp + ".weight", D, D);
+        model.obj_ptr_proj_b[j] = T1f(bp + ".bias", D);
+    }
+    model.no_obj_ptr = T2f("no_obj_ptr", D, 1);
+    if (hp.is_sam2_1) {
+        model.obj_ptr_tpos_w = T2("obj_ptr_tpos_proj.weight", D, MD);
+        model.obj_ptr_tpos_b = T1f("obj_ptr_tpos_proj.bias", MD);
+    }
+
+    // ── EdgeTAM top-level tensors ────────────────────────────────────────
     model.no_mem_embed = T3f("no_mem_embed", D, 1, 1);
     model.no_mem_pos_enc = T3f("no_mem_pos_enc", D, 1, 1);
     if (hp.is_sam2_1) {
@@ -2665,7 +3247,11 @@ std::shared_ptr<sam3_model> sam3_load_model(const sam3_params& params) {
             fprintf(stderr, "%s: failed to read SAM2 hyperparameters\n", __func__);
             return nullptr;
         }
-        sam2_print_hparams(model->hparams);
+        if (model->hparams.is_edgetam()) {
+            edgetam_print_hparams(model->hparams);
+        } else {
+            sam2_print_hparams(model->hparams);
+        }
     } else {
         if (!sam3_load_hparams(fin, model->hparams)) {
             fprintf(stderr, "%s: failed to read SAM3 hyperparameters\n", __func__);
@@ -2705,7 +3291,9 @@ std::shared_ptr<sam3_model> sam3_load_model(const sam3_params& params) {
     }
 
     // ── Register all tensor shapes ───────────────────────────────────────
-    if (is_sam2) {
+    if (model->hparams.is_edgetam()) {
+        edgetam_register_tensors(*model);
+    } else if (is_sam2) {
         sam2_precompute_hiera_metadata(*model);
         sam2_register_tensors(*model);
     } else {
@@ -2760,7 +3348,7 @@ void sam3_free_model(sam3_model& model) {
 }
 
 bool sam3_is_visual_only(const sam3_model& model) {
-    return model.hparams.visual_only != 0 || model.hparams.is_sam2();
+    return model.hparams.visual_only != 0 || model.hparams.is_sam2() || model.hparams.is_edgetam();
 }
 
 sam3_model_type sam3_get_model_type(const sam3_model& model) {
@@ -4003,6 +4591,1257 @@ static void sam2_build_fpn_neck_graph(struct ggml_context* ctx,
     }
 }
 
+/*
+** ── EdgeTAM FPN Neck (optimized layout) ─────────────────────────────────
+**
+** Operates entirely in [W, H, C, 1] layout — no permutations needed.
+** Uses edgetam_conv1x1_mulmat for lateral 1×1 convs.
+** ggml_upscale scales ne[0] and ne[1] (W and H) — correct for this layout.
+*/
+
+// Forward declaration of the mul_mat 1×1 conv helper
+static struct ggml_tensor* edgetam_conv1x1_mulmat(struct ggml_context* ctx,
+                                                    struct ggml_tensor* x,
+                                                    struct ggml_tensor* w,
+                                                    struct ggml_tensor* b);
+
+static void edgetam_build_fpn_neck_graph(struct ggml_context* ctx,
+                                          struct ggml_tensor* stage_outs[4],  // [W, H, C, 1]
+                                          const sam3_model& model,
+                                          struct ggml_tensor* fpn_outs[4]) {
+    const auto& hp = model.hparams;
+
+    // Lateral 1×1 convolutions via mul_mat (no im2col overhead)
+    struct ggml_tensor* laterals[4];
+    for (int i = 0; i < 4; ++i) {
+        int conv_idx = 3 - i;
+        // stage_outs[i] is [W, H, C, 1], conv weight is [1, 1, C, D]
+        laterals[i] = edgetam_conv1x1_mulmat(ctx, stage_outs[i],
+                                              model.fpn_neck.levels[conv_idx].conv_w,
+                                              model.fpn_neck.levels[conv_idx].conv_b);
+        // laterals[i]: [W, H, D, 1]
+    }
+
+    // Top-down fusion (high to low resolution)
+    struct ggml_tensor* fpn_raw[4];
+    struct ggml_tensor* prev = nullptr;
+
+    for (int ri = 0; ri < 4; ++ri) {
+        int i = 3 - ri;
+        bool is_top_down = false;
+        for (int j = 0; j < hp.fpn_top_down_n; ++j) {
+            if (hp.fpn_top_down_levels[j] == i) { is_top_down = true; break; }
+        }
+
+        if (is_top_down && prev != nullptr) {
+            // ggml_upscale 2× on [W, H, D, 1] — scales W (ne[0]) and H (ne[1])
+            auto* upsampled = ggml_upscale(ctx, prev, 2, GGML_SCALE_MODE_NEAREST);
+            fpn_raw[i] = ggml_add(ctx, laterals[i], upsampled);
+            prev = fpn_raw[i];
+        } else {
+            fpn_raw[i] = laterals[i];
+            if (is_top_down || prev == nullptr) {
+                prev = fpn_raw[i];
+            }
+        }
+    }
+
+    // Apply scalp: discard the last `scalp` levels
+    int n_out = 4 - hp.scalp;
+    for (int i = 0; i < 4; ++i) {
+        if (i < n_out) {
+            // Permute [W, H, D, 1] → [D, W, H, 1] for downstream consumers
+            fpn_outs[i] = ggml_cont(ctx, ggml_permute(ctx, fpn_raw[i], 1, 2, 0, 3));
+        } else {
+            fpn_outs[i] = nullptr;
+        }
+    }
+}
+
+/*
+** ── EdgeTAM RepViT Forward Pass ─────────────────────────────────────────
+*/
+
+// Conv2d bias addition helper: adds bias [ch] to conv output [W, H, ch, B]
+static struct ggml_tensor* edgetam_conv2d_bias(struct ggml_context* ctx,
+                                                struct ggml_tensor* x,
+                                                struct ggml_tensor* bias) {
+    // x: [W, H, C, B], bias: [C]
+    // Reshape bias to [1, 1, C, 1] and broadcast-add
+    auto* b = ggml_reshape_4d(ctx, bias, 1, 1, bias->ne[0], 1);
+    return ggml_add(ctx, x, b);
+}
+
+// 1×1 convolution as mul_mat: avoids im2col+cont overhead.
+// Input x: [W, H, Cin, 1], weight w: [1, 1, Cin, Cout], bias b: [Cout]
+// Returns: [W, H, Cout, 1]
+static struct ggml_tensor* edgetam_conv1x1_mulmat(struct ggml_context* ctx,
+                                                    struct ggml_tensor* x,
+                                                    struct ggml_tensor* w,
+                                                    struct ggml_tensor* b) {
+    const int64_t W  = x->ne[0];
+    const int64_t H  = x->ne[1];
+    const int64_t Ci = x->ne[2];
+    const int64_t Co = w->ne[3];
+
+    // Permute [W, H, Cin, 1] → [Cin, H, W, 1] then reshape to [Cin, H*W]
+    // ggml_permute: ne[axis_i] = a->ne[i], so to get ne[0]=Cin(dim2):
+    //   axis0=1, axis1=2, axis2=0, axis3=3 → ne = [Cin, W, H, 1]
+    // Wait — we want ne[0]=Cin for mul_mat contraction, rest doesn't matter.
+    // Actually ggml_mul_mat contracts over ne[0] of both operands.
+    auto* x_perm = ggml_cont(ctx, ggml_permute(ctx, x, 1, 2, 0, 3));
+    // x_perm: [Cin, W, H, 1]
+    auto* x_2d = ggml_reshape_2d(ctx, x_perm, Ci, W * H);  // [Cin, W*H]
+
+    // Weight: [1, 1, Cin, Cout] → [Cin, Cout]
+    auto* w_2d = ggml_reshape_2d(ctx, w, Ci, Co);  // [Cin, Cout]
+
+    // mul_mat: contracts over ne[0]=Cin → output [Cout, W*H]
+    auto* y = ggml_mul_mat(ctx, w_2d, x_2d);  // [Cout, W*H]
+
+    // Reshape to [Cout, W, H, 1] then permute back to [W, H, Cout, 1]
+    auto* y_4d = ggml_reshape_4d(ctx, y, Co, W, H, 1);  // [Cout, W, H, 1]
+    // ggml_permute: ne[axis_i] = a->ne[i], want [W, H, Cout, 1]:
+    //   ne[0]=W(dim1), ne[1]=H(dim2), ne[2]=Cout(dim0) → axis0=2, axis1=0, axis2=1, axis3=3
+    auto* y_whc = ggml_cont(ctx, ggml_permute(ctx, y_4d, 2, 0, 1, 3));
+    // y_whc: [W, H, Cout, 1]
+
+    // Add bias
+    if (b) {
+        y_whc = edgetam_conv2d_bias(ctx, y_whc, b);
+    }
+    return y_whc;
+}
+
+// RepViT block forward: token_mixer DW → optional SE → channel_mixer + residual
+static struct ggml_tensor* edgetam_repvit_block_forward(struct ggml_context* ctx,
+                                                         struct ggml_tensor* x,
+                                                         const edgetam_repvit_block& blk) {
+    // x layout: [W, H, C, 1]
+    // Token mixer: DW 3×3 conv, stride=1, pad=1 (RepVGG-reparameterized, no residual)
+    // Use ggml_conv_2d_dw_direct which requires F32 kernel
+    auto* tm_w_f32 = (blk.tm_w->type == GGML_TYPE_F32) ? blk.tm_w
+                     : ggml_cast(ctx, blk.tm_w, GGML_TYPE_F32);
+    x = ggml_conv_2d_dw_direct(ctx, tm_w_f32, x, 1, 1, 1, 1, 1, 1);
+    x = edgetam_conv2d_bias(ctx, x, blk.tm_b);
+
+    // Squeeze-and-excitation (optional, on even-indexed blocks)
+    if (blk.has_se) {
+        int W = (int)x->ne[0];
+        int H = (int)x->ne[1];
+        // Global average pool: [W, H, C, 1] → [1, 1, C, 1]
+        auto* pooled = ggml_pool_2d(ctx, x, GGML_OP_POOL_AVG, W, H, W, H, 0, 0);
+        // SE operates on tiny [1,1,C,1] — keep using ggml_conv_2d (overhead negligible)
+        auto* se = ggml_conv_2d(ctx, blk.se_fc1_w, pooled, 1, 1, 0, 0, 1, 1);
+        se = edgetam_conv2d_bias(ctx, se, blk.se_fc1_b);
+        se = ggml_relu(ctx, se);
+        se = ggml_conv_2d(ctx, blk.se_fc2_w, se, 1, 1, 0, 0, 1, 1);
+        se = edgetam_conv2d_bias(ctx, se, blk.se_fc2_b);
+        se = ggml_sigmoid(ctx, se);
+        x = ggml_mul(ctx, x, se);
+    }
+
+    // Channel mixer: 1×1 expand → GELU → 1×1 project (use mul_mat path)
+    auto* identity = x;
+    auto* cm = edgetam_conv1x1_mulmat(ctx, x, blk.cm_conv1_w, blk.cm_conv1_b);
+    cm = ggml_gelu(ctx, cm);
+    cm = edgetam_conv1x1_mulmat(ctx, cm, blk.cm_conv2_w, blk.cm_conv2_b);
+    return ggml_add(ctx, cm, identity);
+}
+
+// Downsample: pre_block → spatial DW s=2 → channel expand → FFN + residual
+static struct ggml_tensor* edgetam_repvit_downsample_forward(struct ggml_context* ctx,
+                                                              struct ggml_tensor* x,
+                                                              const edgetam_repvit_downsample& ds) {
+    // Pre-block at current channels
+    x = edgetam_repvit_block_forward(ctx, x, ds.pre_block);
+
+    // Spatial downsample: DW 3×3 conv, stride=2, pad=1
+    auto* ds_w_f32 = (ds.spatial_w->type == GGML_TYPE_F32) ? ds.spatial_w
+                     : ggml_cast(ctx, ds.spatial_w, GGML_TYPE_F32);
+    x = ggml_conv_2d_dw_direct(ctx, ds_w_f32, x, 2, 2, 1, 1, 1, 1);
+    x = edgetam_conv2d_bias(ctx, x, ds.spatial_b);
+
+    // Channel expand: 1×1 conv (mul_mat path)
+    x = edgetam_conv1x1_mulmat(ctx, x, ds.channel_w, ds.channel_b);
+
+    // FFN + residual (mul_mat path for 1×1 convs)
+    auto* ffn_in = x;
+    auto* ffn = edgetam_conv1x1_mulmat(ctx, x, ds.ffn_conv1_w, ds.ffn_conv1_b);
+    ffn = ggml_gelu(ctx, ffn);
+    ffn = edgetam_conv1x1_mulmat(ctx, ffn, ds.ffn_conv2_w, ds.ffn_conv2_b);
+    x = ggml_add(ctx, ffn, ffn_in);
+
+    return x;
+}
+
+// Build the full RepViT backbone graph.
+// Input: [W, H, 3, 1] image
+// Returns 4 feature maps as stage_outs[0..3], each [C_stage, W_stage, H_stage, 1]
+static void edgetam_build_repvit_graph(struct ggml_context* ctx,
+                                        struct ggml_tensor* input,
+                                        const sam3_model& model,
+                                        struct ggml_tensor* stage_outs[4]) {
+    const auto& repvit = model.repvit;
+    const auto& hp = model.hparams;
+
+    // Stem: conv1 (3→24, k=3, s=2, p=1) + GELU, conv2 (24→48, k=3, s=2, p=1), NO GELU
+    // Use ggml_conv_2d_direct to avoid im2col + cont overhead (single Metal kernel)
+    auto* x = ggml_conv_2d(ctx, repvit.stem_conv1_w, input, 2, 2, 1, 1, 1, 1);
+    x = edgetam_conv2d_bias(ctx, x, repvit.stem_conv1_b);
+    x = ggml_gelu(ctx, x);
+    x = ggml_conv_2d(ctx, repvit.stem_conv2_w, x, 2, 2, 1, 1, 1, 1);
+    x = edgetam_conv2d_bias(ctx, x, repvit.stem_conv2_b);
+    // No GELU after stem conv2
+
+    // 4 stages
+    for (int s = 0; s < hp.repvit_num_stages; ++s) {
+        auto& stage = repvit.stages[s];
+
+        // Downsample at start of stages 1, 2, 3
+        if (stage.has_downsample) {
+            x = edgetam_repvit_downsample_forward(ctx, x, stage.downsample);
+        }
+
+        // Process all blocks in this stage
+        for (int b = 0; b < (int)stage.blocks.size(); ++b) {
+            x = edgetam_repvit_block_forward(ctx, x, stage.blocks[b]);
+        }
+
+        // Store stage output.
+        // Keep as [W, H, C, 1] — the EdgeTAM FPN handles this layout directly
+        stage_outs[s] = x;
+    }
+}
+
+// Full EdgeTAM image encoding: preprocess → RepViT → FPN → state
+static bool edgetam_encode_image(sam3_state& state,
+                                  const sam3_model& model,
+                                  const sam3_image& image) {
+    auto t_start = std::chrono::high_resolution_clock::now();
+    const auto& hp = model.hparams;
+    const int img_size = sam3_eff_img_size(state, hp);
+
+    fprintf(stderr, "%s: encoding %dx%d image (EdgeTAM RepViT)\n", __func__,
+            image.width, image.height);
+
+    state.orig_width = image.width;
+    state.orig_height = image.height;
+
+    // ── Preprocess (same ImageNet normalization as SAM2) ─────────────────
+    auto img_data = sam2_preprocess_image(image, img_size);
+
+    // ── Build graph ──────────────────────────────────────────────────────
+    const size_t buf_size = ggml_tensor_overhead() * 16384 + ggml_graph_overhead() * 2;
+    struct ggml_init_params gparams = {
+        /*.mem_size   =*/buf_size,
+        /*.mem_buffer =*/nullptr,
+        /*.no_alloc   =*/true,
+    };
+    auto* ctx0 = ggml_init(gparams);
+    if (!ctx0) {
+        fprintf(stderr, "%s: failed to init compute context\n", __func__);
+        return false;
+    }
+
+    auto* inp = ggml_new_tensor_4d(ctx0, GGML_TYPE_F32, img_size, img_size, 3, 1);
+    ggml_set_name(inp, "input_image");
+    ggml_set_input(inp);
+
+    // Build RepViT backbone
+    struct ggml_tensor* stage_outs[4] = {};
+    edgetam_build_repvit_graph(ctx0, inp, model, stage_outs);
+
+    // Build EdgeTAM FPN neck (optimized: mul_mat for 1×1, unified [W,H,C] layout)
+    struct ggml_tensor* fpn_outs[4] = {};
+    edgetam_build_fpn_neck_graph(ctx0, stage_outs, model, fpn_outs);
+
+    // Mark FPN outputs
+    int n_fpn = 4 - hp.scalp;
+    for (int i = 0; i < n_fpn; ++i) {
+        char name[64];
+        snprintf(name, sizeof(name), "fpn_out_%d", i);
+        ggml_set_name(fpn_outs[i], name);
+        ggml_set_output(fpn_outs[i]);
+    }
+
+    // Build computation graph
+    auto* graph = ggml_new_graph_custom(ctx0, 32768, false);
+    for (int i = 0; i < n_fpn; ++i) {
+        ggml_build_forward_expand(graph, fpn_outs[i]);
+    }
+
+    // ── Allocate + compute ───────────────────────────────────────────────
+    auto* galloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(model.backend));
+    if (!ggml_gallocr_reserve(galloc, graph)) {
+        fprintf(stderr, "%s: failed to reserve graph memory\n", __func__);
+        ggml_gallocr_free(galloc);
+        ggml_free(ctx0);
+        return false;
+    }
+    if (!ggml_gallocr_alloc_graph(galloc, graph)) {
+        fprintf(stderr, "%s: failed to alloc graph\n", __func__);
+        ggml_gallocr_free(galloc);
+        ggml_free(ctx0);
+        return false;
+    }
+
+    // Set input image
+    ggml_backend_tensor_set(inp, img_data.data(), 0, img_data.size() * sizeof(float));
+
+    // Compute
+    if (!sam3_graph_compute(model.backend, graph, state.n_threads)) {
+        fprintf(stderr, "%s: graph compute failed\n", __func__);
+        ggml_gallocr_free(galloc);
+        ggml_free(ctx0);
+        return false;
+    }
+
+    // ── Copy results to state ────────────────────────────────────────────
+    // Free old state buffers
+    if (state.buffer) { ggml_backend_buffer_free(state.buffer); state.buffer = nullptr; }
+    if (state.pe_buf) { ggml_backend_buffer_free(state.pe_buf); state.pe_buf = nullptr; }
+    if (state.pe_ctx) { ggml_free(state.pe_ctx); state.pe_ctx = nullptr; }
+    if (state.ctx) { ggml_free(state.ctx); state.ctx = nullptr; }
+
+    // Create state context for persistent tensors
+    size_t state_ctx_size = ggml_tensor_overhead() * 32;
+    struct ggml_init_params sparams = {state_ctx_size, nullptr, true};
+    state.ctx = ggml_init(sparams);
+
+    for (int i = 0; i < n_fpn; ++i) {
+        auto* src = fpn_outs[i];
+        state.neck_trk[i] = ggml_new_tensor_4d(state.ctx, GGML_TYPE_F32,
+                                                 src->ne[0], src->ne[1], src->ne[2], src->ne[3]);
+        char name[64];
+        snprintf(name, sizeof(name), "neck_trk_%d", i);
+        ggml_set_name(state.neck_trk[i], name);
+    }
+    for (int i = n_fpn; i < 4; ++i) {
+        state.neck_trk[i] = nullptr;
+    }
+
+    // Allocate state buffer
+    state.buffer = ggml_backend_alloc_ctx_tensors(state.ctx, model.backend);
+
+    // Copy FPN outputs to state
+    for (int i = 0; i < n_fpn; ++i) {
+        int64_t n_bytes = ggml_nbytes(state.neck_trk[i]);
+        std::vector<char> buf(n_bytes);
+        ggml_backend_tensor_get(fpn_outs[i], buf.data(), 0, n_bytes);
+        ggml_backend_tensor_set(state.neck_trk[i], buf.data(), 0, n_bytes);
+    }
+
+    // Compute sinusoidal PE for each FPN level
+    size_t pe_ctx_size = ggml_tensor_overhead() * 16;
+    struct ggml_init_params pe_params = {pe_ctx_size, nullptr, true};
+    state.pe_ctx = ggml_init(pe_params);
+
+    for (int i = 0; i < n_fpn; ++i) {
+        int H = (int)state.neck_trk[i]->ne[2];
+        int W = (int)state.neck_trk[i]->ne[1];
+        state.neck_trk_pe[i] = ggml_new_tensor_4d(state.pe_ctx, GGML_TYPE_F32,
+                                                    hp.neck_dim, W, H, 1);
+        char name[64];
+        snprintf(name, sizeof(name), "neck_trk_pe_%d", i);
+        ggml_set_name(state.neck_trk_pe[i], name);
+    }
+    state.pe_buf = ggml_backend_alloc_ctx_tensors(state.pe_ctx, model.backend);
+    for (int i = 0; i < n_fpn; ++i) {
+        int H = (int)state.neck_trk[i]->ne[2];
+        int W = (int)state.neck_trk[i]->ne[1];
+        auto pe = sam3_sinusoidal_pe_2d(H, W, hp.neck_dim);
+        ggml_backend_tensor_set(state.neck_trk_pe[i], pe.data(), 0, pe.size() * sizeof(float));
+    }
+
+    ggml_gallocr_free(galloc);
+    ggml_free(ctx0);
+
+    auto t_end = std::chrono::high_resolution_clock::now();
+    auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(t_end - t_start).count();
+    fprintf(stderr, "%s: EdgeTAM image encoded in %lld ms\n", __func__, ms);
+    for (int i = 0; i < n_fpn; ++i) {
+        fprintf(stderr, "  neck_trk[%d]: [%lld, %lld, %lld, %lld]\n", i,
+                (long long)state.neck_trk[i]->ne[0], (long long)state.neck_trk[i]->ne[1],
+                (long long)state.neck_trk[i]->ne[2], (long long)state.neck_trk[i]->ne[3]);
+    }
+
+    return true;
+}
+
+/*****************************************************************************
+** EdgeTAM Profiling
+**
+** Profiles the RepViT backbone + FPN neck by building and timing separate
+** sub-graphs for each pipeline stage.
+*****************************************************************************/
+
+// Helper: build a sub-graph, allocate, set inputs, compute, read outputs.
+// Returns elapsed wall-clock time in microseconds.
+struct sam3_profile_subgraph_result {
+    double  elapsed_us = 0.0;
+    int     n_nodes    = 0;
+    bool    ok         = false;
+};
+
+// Print a per-op-type summary of a built graph.
+static void sam3_profile_print_op_summary(struct ggml_cgraph* graph, const char* label) {
+    int n = ggml_graph_n_nodes(graph);
+
+    // Count ops by name
+    std::map<std::string, int> op_counts;
+    std::map<std::string, int64_t> op_elements;  // total output elements
+    for (int i = 0; i < n; ++i) {
+        auto* node = ggml_graph_node(graph, i);
+        std::string name = ggml_op_name(node->op);
+        op_counts[name]++;
+        op_elements[name] += ggml_nelements(node);
+    }
+
+    fprintf(stderr, "\n  %-25s  %5s  %14s\n", "Op", "Count", "Out elements");
+    fprintf(stderr, "  %-25s  %5s  %14s\n",
+            "-------------------------", "-----", "--------------");
+    for (auto& kv : op_counts) {
+        fprintf(stderr, "  %-25s  %5d  %14lld\n",
+                kv.first.c_str(), kv.second, (long long)op_elements[kv.first]);
+    }
+    fprintf(stderr, "  %-25s  %5d\n", "TOTAL", n);
+}
+
+// Helper: capture op counts from a graph.
+static std::map<std::string, int> sam3_profile_op_counts(struct ggml_cgraph* graph) {
+    std::map<std::string, int> counts;
+    int n = ggml_graph_n_nodes(graph);
+    for (int i = 0; i < n; ++i) {
+        auto* node = ggml_graph_node(graph, i);
+        counts[ggml_op_name(node->op)]++;
+    }
+    return counts;
+}
+
+// Helper: run a single sub-graph timing trial.
+// Allocates, warms up, times n_iter runs, reads output tensors, then frees.
+// output_tensors: list of tensors to read back BEFORE freeing the allocator.
+// output_buffers: filled with read-back data (parallel to output_tensors).
+static sam3_profile_subgraph_result sam3_profile_run_subgraph(
+        ggml_backend_t backend,
+        struct ggml_cgraph* graph,
+        struct ggml_tensor* input_tensor,
+        const float* input_data,
+        size_t input_bytes,
+        int n_threads,
+        int n_warmup,
+        int n_iter,
+        const std::vector<struct ggml_tensor*>& output_tensors = {},
+        std::vector<std::vector<float>>* output_buffers = nullptr) {
+    sam3_profile_subgraph_result res;
+    res.n_nodes = ggml_graph_n_nodes(graph);
+
+    auto* galloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
+    if (!ggml_gallocr_reserve(galloc, graph) || !ggml_gallocr_alloc_graph(galloc, graph)) {
+        fprintf(stderr, "%s: graph alloc failed\n", __func__);
+        ggml_gallocr_free(galloc);
+        return res;
+    }
+
+    // Warm up
+    for (int i = 0; i < n_warmup; ++i) {
+        ggml_backend_tensor_set(input_tensor, input_data, 0, input_bytes);
+        sam3_graph_compute(backend, graph, n_threads);
+    }
+
+    // Timed runs
+    double total_us = 0.0;
+    for (int i = 0; i < n_iter; ++i) {
+        ggml_backend_tensor_set(input_tensor, input_data, 0, input_bytes);
+        auto t0 = std::chrono::high_resolution_clock::now();
+        sam3_graph_compute(backend, graph, n_threads);
+        auto t1 = std::chrono::high_resolution_clock::now();
+        total_us += std::chrono::duration<double, std::micro>(t1 - t0).count();
+    }
+
+    res.elapsed_us = total_us / n_iter;
+    res.ok = true;
+
+    // Read back output tensors BEFORE freeing the allocator
+    if (output_buffers) {
+        output_buffers->resize(output_tensors.size());
+        for (size_t i = 0; i < output_tensors.size(); ++i) {
+            int64_t n = ggml_nelements(output_tensors[i]);
+            (*output_buffers)[i].resize(n);
+            ggml_backend_tensor_get(output_tensors[i], (*output_buffers)[i].data(),
+                                     0, n * sizeof(float));
+        }
+    }
+
+    ggml_gallocr_free(galloc);
+    return res;
+}
+
+bool sam3_profile_edgetam_encode(const sam3_model& model,
+                                  const sam3_image& image,
+                                  int n_threads,
+                                  int n_warmup,
+                                  int n_iter) {
+    const auto& hp = model.hparams;
+    if (!hp.is_edgetam()) {
+        fprintf(stderr, "%s: model is not EdgeTAM\n", __func__);
+        return false;
+    }
+
+    const int img_size = hp.img_size;
+    fprintf(stderr, "%s: profiling EdgeTAM RepViT+FPN on %dx%d image\n",
+            __func__, img_size, img_size);
+    fprintf(stderr, "  warmup=%d, iterations=%d, threads=%d\n",
+            n_warmup, n_iter, n_threads);
+    fprintf(stderr, "  backend: %s\n", ggml_backend_name(model.backend));
+
+    // Stage config
+    fprintf(stderr, "  stages: [%d, %d, %d, %d] blocks, channels: [%d, %d, %d, %d]\n",
+            hp.repvit_stages[0], hp.repvit_stages[1],
+            hp.repvit_stages[2], hp.repvit_stages[3],
+            hp.repvit_channels[0], hp.repvit_channels[1],
+            hp.repvit_channels[2], hp.repvit_channels[3]);
+
+    // ── Preprocess image ────────────────────────────────────────────────
+    auto img_data = sam2_preprocess_image(image, img_size);
+
+    // ════════════════════════════════════════════════════════════════════
+    // PART 1: Full graph — op summary + total timing
+    // ════════════════════════════════════════════════════════════════════
+    fprintf(stderr, "\n=== FULL GRAPH (RepViT + FPN) ===\n");
+    {
+        const size_t buf_size = ggml_tensor_overhead() * 16384 + ggml_graph_overhead() * 2;
+        struct ggml_init_params gp = {buf_size, nullptr, true};
+        auto* ctx0 = ggml_init(gp);
+
+        auto* inp = ggml_new_tensor_4d(ctx0, GGML_TYPE_F32, img_size, img_size, 3, 1);
+        ggml_set_name(inp, "input_image");
+        ggml_set_input(inp);
+
+        struct ggml_tensor* stage_outs[4] = {};
+        edgetam_build_repvit_graph(ctx0, inp, model, stage_outs);
+
+        struct ggml_tensor* fpn_outs[4] = {};
+        edgetam_build_fpn_neck_graph(ctx0, stage_outs, model, fpn_outs);
+
+        int n_fpn = 4 - hp.scalp;
+        auto* graph = ggml_new_graph_custom(ctx0, 32768, false);
+        for (int i = 0; i < n_fpn; ++i) {
+            char name[64];
+            snprintf(name, sizeof(name), "fpn_out_%d", i);
+            ggml_set_name(fpn_outs[i], name);
+            ggml_set_output(fpn_outs[i]);
+            ggml_build_forward_expand(graph, fpn_outs[i]);
+        }
+
+        sam3_profile_print_op_summary(graph, "Full RepViT+FPN");
+
+        // Print output shapes
+        fprintf(stderr, "\n  Output shapes:\n");
+        for (int i = 0; i < n_fpn; ++i) {
+            fprintf(stderr, "    fpn_out[%d]: [%lld, %lld, %lld, %lld]\n", i,
+                    (long long)fpn_outs[i]->ne[0], (long long)fpn_outs[i]->ne[1],
+                    (long long)fpn_outs[i]->ne[2], (long long)fpn_outs[i]->ne[3]);
+        }
+
+        // Time it (no outputs needed from full graph)
+        auto r = sam3_profile_run_subgraph(model.backend, graph, inp,
+                                            img_data.data(), img_data.size() * sizeof(float),
+                                            n_threads, n_warmup, n_iter);
+        if (r.ok) {
+            fprintf(stderr, "\n  Total: %.2f ms  (%d nodes)\n", r.elapsed_us / 1000.0, r.n_nodes);
+        }
+
+        ggml_free(ctx0);
+    }
+
+    // ════════════════════════════════════════════════════════════════════
+    // PART 2: Per-stage sub-graphs — build and time each separately
+    // ════════════════════════════════════════════════════════════════════
+
+    struct StageResult {
+        std::string name;
+        double      ms;
+        int         n_nodes;
+        int64_t     out_shape[4];
+        std::map<std::string, int> op_counts;
+    };
+    std::vector<StageResult> results;
+
+    // Current feature data flowing between stages (CPU-side buffer, graph isolation)
+    std::vector<float> cur_data = img_data;
+    int64_t cur_ne[4] = {img_size, img_size, 3, 1};  // [W, H, C, B]
+
+    // ── STEM ────────────────────────────────────────────────────────────
+    {
+        const size_t buf_size = ggml_tensor_overhead() * 4096 + ggml_graph_overhead();
+        struct ggml_init_params gp = {buf_size, nullptr, true};
+        auto* ctx0 = ggml_init(gp);
+
+        auto* inp = ggml_new_tensor_4d(ctx0, GGML_TYPE_F32, cur_ne[0], cur_ne[1], cur_ne[2], cur_ne[3]);
+        ggml_set_name(inp, "stem_in");
+        ggml_set_input(inp);
+
+        const auto& repvit = model.repvit;
+        auto* x = ggml_conv_2d(ctx0, repvit.stem_conv1_w, inp, 2, 2, 1, 1, 1, 1);
+        x = edgetam_conv2d_bias(ctx0, x, repvit.stem_conv1_b);
+        x = ggml_gelu(ctx0, x);
+        x = ggml_conv_2d(ctx0, repvit.stem_conv2_w, x, 2, 2, 1, 1, 1, 1);
+        x = edgetam_conv2d_bias(ctx0, x, repvit.stem_conv2_b);
+
+        ggml_set_name(x, "stem_out");
+        ggml_set_output(x);
+
+        auto* graph = ggml_new_graph_custom(ctx0, 4096, false);
+        ggml_build_forward_expand(graph, x);
+
+        std::vector<std::vector<float>> out_bufs;
+        auto r = sam3_profile_run_subgraph(model.backend, graph, inp,
+                                            cur_data.data(), cur_data.size() * sizeof(float),
+                                            n_threads, n_warmup, n_iter,
+                                            {x}, &out_bufs);
+
+        StageResult sr;
+        sr.name = "Stem (2 convs)";
+        sr.ms = r.ok ? r.elapsed_us / 1000.0 : -1.0;
+        sr.n_nodes = r.n_nodes;
+        for (int i = 0; i < 4; ++i) sr.out_shape[i] = x->ne[i];
+        sr.op_counts = sam3_profile_op_counts(graph);
+        results.push_back(sr);
+
+        // Use read-back output for next stage
+        if (r.ok) {
+            cur_data = std::move(out_bufs[0]);
+            for (int i = 0; i < 4; ++i) cur_ne[i] = x->ne[i];
+        }
+
+        ggml_free(ctx0);
+    }
+
+    // ── STAGES 0-3 ──────────────────────────────────────────────────────
+    // Store stage outputs for FPN (in [W, H, C, 1] layout — no permute needed)
+    std::vector<float> stage_data[4];
+    int64_t stage_ne[4][4] = {};
+
+    for (int s = 0; s < hp.repvit_num_stages; ++s) {
+        const size_t buf_size = ggml_tensor_overhead() * 8192 + ggml_graph_overhead();
+        struct ggml_init_params gp = {buf_size, nullptr, true};
+        auto* ctx0 = ggml_init(gp);
+
+        auto* inp = ggml_new_tensor_4d(ctx0, GGML_TYPE_F32, cur_ne[0], cur_ne[1], cur_ne[2], cur_ne[3]);
+        ggml_set_name(inp, "stage_in");
+        ggml_set_input(inp);
+
+        auto* x = inp;
+        auto& stage = model.repvit.stages[s];
+
+        // Downsample at start of stages 1, 2, 3
+        if (stage.has_downsample) {
+            x = edgetam_repvit_downsample_forward(ctx0, x, stage.downsample);
+        }
+
+        // Process all blocks
+        for (int b = 0; b < (int)stage.blocks.size(); ++b) {
+            x = edgetam_repvit_block_forward(ctx0, x, stage.blocks[b]);
+        }
+
+        // Output stays in [W, H, C, 1] — no permute
+        char oname[64];
+        snprintf(oname, sizeof(oname), "stage_%d_out", s);
+        ggml_set_name(x, oname);
+        ggml_set_output(x);
+
+        auto* graph = ggml_new_graph_custom(ctx0, 8192, false);
+        ggml_build_forward_expand(graph, x);
+
+        std::vector<std::vector<float>> out_bufs;
+        auto r = sam3_profile_run_subgraph(model.backend, graph, inp,
+                                            cur_data.data(), cur_data.size() * sizeof(float),
+                                            n_threads, n_warmup, n_iter,
+                                            {x}, &out_bufs);
+
+        char sname[64];
+        snprintf(sname, sizeof(sname), "Stage %d (%d blk%s%s)", s,
+                 (int)stage.blocks.size(),
+                 stage.blocks.size() != 1 ? "s" : "",
+                 stage.has_downsample ? " + ds" : "");
+        StageResult sr;
+        sr.name = sname;
+        sr.ms = r.ok ? r.elapsed_us / 1000.0 : -1.0;
+        sr.n_nodes = r.n_nodes;
+        for (int i = 0; i < 4; ++i) sr.out_shape[i] = x->ne[i];
+        sr.op_counts = sam3_profile_op_counts(graph);
+        results.push_back(sr);
+
+        if (r.ok) {
+            cur_data = std::move(out_bufs[0]);
+            for (int i = 0; i < 4; ++i) cur_ne[i] = x->ne[i];
+
+            // Stage data for FPN (same [W, H, C, 1] layout)
+            stage_data[s] = cur_data;
+            for (int i = 0; i < 4; ++i) stage_ne[s][i] = x->ne[i];
+        }
+
+        ggml_free(ctx0);
+    }
+
+    // ── FPN NECK ────────────────────────────────────────────────────────
+    {
+        const size_t buf_size = ggml_tensor_overhead() * 8192 + ggml_graph_overhead();
+        struct ggml_init_params gp = {buf_size, nullptr, true};
+        auto* ctx0 = ggml_init(gp);
+
+        // Create input tensors for each stage (graph isolation)
+        struct ggml_tensor* stage_inputs[4] = {};
+        for (int i = 0; i < 4; ++i) {
+            stage_inputs[i] = ggml_new_tensor_4d(ctx0, GGML_TYPE_F32,
+                                                  stage_ne[i][0], stage_ne[i][1],
+                                                  stage_ne[i][2], stage_ne[i][3]);
+            char name[64];
+            snprintf(name, sizeof(name), "fpn_stage_in_%d", i);
+            ggml_set_name(stage_inputs[i], name);
+            ggml_set_input(stage_inputs[i]);
+        }
+
+        struct ggml_tensor* fpn_outs[4] = {};
+        edgetam_build_fpn_neck_graph(ctx0, stage_inputs, model, fpn_outs);
+
+        int n_fpn = 4 - hp.scalp;
+        auto* graph = ggml_new_graph_custom(ctx0, 8192, false);
+        for (int i = 0; i < n_fpn; ++i) {
+            char name[64];
+            snprintf(name, sizeof(name), "fpn_out_%d", i);
+            ggml_set_name(fpn_outs[i], name);
+            ggml_set_output(fpn_outs[i]);
+            ggml_build_forward_expand(graph, fpn_outs[i]);
+        }
+
+        // Allocate and set inputs
+        auto* galloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(model.backend));
+        if (!ggml_gallocr_reserve(galloc, graph) || !ggml_gallocr_alloc_graph(galloc, graph)) {
+            fprintf(stderr, "%s: FPN graph alloc failed\n", __func__);
+            ggml_gallocr_free(galloc);
+            ggml_free(ctx0);
+            return false;
+        }
+
+        // Warm up
+        for (int i = 0; i < n_warmup; ++i) {
+            for (int j = 0; j < 4; ++j) {
+                ggml_backend_tensor_set(stage_inputs[j], stage_data[j].data(), 0,
+                                         stage_data[j].size() * sizeof(float));
+            }
+            sam3_graph_compute(model.backend, graph, n_threads);
+        }
+
+        // Timed runs
+        double total_us = 0.0;
+        for (int i = 0; i < n_iter; ++i) {
+            for (int j = 0; j < 4; ++j) {
+                ggml_backend_tensor_set(stage_inputs[j], stage_data[j].data(), 0,
+                                         stage_data[j].size() * sizeof(float));
+            }
+            auto t0 = std::chrono::high_resolution_clock::now();
+            sam3_graph_compute(model.backend, graph, n_threads);
+            auto t1 = std::chrono::high_resolution_clock::now();
+            total_us += std::chrono::duration<double, std::micro>(t1 - t0).count();
+        }
+        double fpn_ms = total_us / n_iter / 1000.0;
+
+        StageResult sr;
+        sr.name = "FPN neck";
+        sr.ms = fpn_ms;
+        sr.n_nodes = ggml_graph_n_nodes(graph);
+        sr.out_shape[0] = sr.out_shape[1] = sr.out_shape[2] = sr.out_shape[3] = 0;
+        if (fpn_outs[0]) {
+            for (int i = 0; i < 4; ++i) sr.out_shape[i] = fpn_outs[0]->ne[i];
+        }
+        sr.op_counts = sam3_profile_op_counts(graph);
+        results.push_back(sr);
+
+        ggml_gallocr_free(galloc);
+        ggml_free(ctx0);
+    }
+
+    // ════════════════════════════════════════════════════════════════════
+    // PART 3: Summary table
+    // ════════════════════════════════════════════════════════════════════
+    fprintf(stderr, "\n=== TIMING BREAKDOWN ===\n\n");
+
+    // First pass: compute total for percentage column
+    double total_ms = 0.0;
+    for (auto& sr : results) {
+        if (sr.ms > 0) total_ms += sr.ms;
+    }
+
+    fprintf(stderr, "  %-28s  %8s  %5s  %5s  %s\n",
+            "Stage", "Time(ms)", "%%", "Nodes", "Output Shape");
+    fprintf(stderr, "  %-28s  %8s  %5s  %5s  %s\n",
+            "----------------------------", "--------", "-----", "-----",
+            "--------------------");
+
+    for (auto& sr : results) {
+        char shape[64];
+        snprintf(shape, sizeof(shape), "[%lld, %lld, %lld, %lld]",
+                 (long long)sr.out_shape[0], (long long)sr.out_shape[1],
+                 (long long)sr.out_shape[2], (long long)sr.out_shape[3]);
+        double pct = (total_ms > 0 && sr.ms > 0) ? 100.0 * sr.ms / total_ms : 0.0;
+        fprintf(stderr, "  %-28s  %8.2f  %4.1f%%  %5d  %s\n",
+                sr.name.c_str(), sr.ms, pct, sr.n_nodes, shape);
+    }
+    fprintf(stderr, "  %-28s  %8.2f\n", "SUM (per-stage)", total_ms);
+
+    // Per-op type breakdown for each stage
+    fprintf(stderr, "\n=== PER-STAGE OP COUNTS ===\n");
+    for (auto& sr : results) {
+        fprintf(stderr, "\n  %s (%.2f ms, %d nodes):\n", sr.name.c_str(), sr.ms, sr.n_nodes);
+        fprintf(stderr, "    %-18s  %5s\n", "Op", "Count");
+        fprintf(stderr, "    %-18s  %5s\n", "------------------", "-----");
+        for (auto& kv : sr.op_counts) {
+            fprintf(stderr, "    %-18s  %5d\n", kv.first.c_str(), kv.second);
+        }
+    }
+
+    return true;
+}
+
+/*****************************************************************************
+** EdgeTAM Spatial Perceiver
+**
+** Compresses spatial memory features from [64, H, W] to [512, 64] latent
+** tokens via two parallel paths (1D global + 2D windowed), each running
+** shared perceiver layers (cross-attention → FFN → self-attention → FFN).
+*****************************************************************************/
+
+// Helper: build one perceiver layer on latents, given features x.
+// latents: [D, N_lat, batch]   (D=64, N_lat = n latent tokens)
+// x:       [D, N_x,   batch]   (D=64, N_x = n feature tokens)
+// pos:     [D, N_x,   batch]   or nullptr (added to K and V after projection)
+// Returns updated latents [D, N_lat, batch].
+static struct ggml_tensor* edgetam_perceiver_layer_forward(
+        struct ggml_context* ctx,
+        struct ggml_tensor*  latents,
+        struct ggml_tensor*  x,
+        struct ggml_tensor*  pos,
+        const edgetam_perceiver_layer& layer) {
+    const int64_t D     = latents->ne[0];  // 64
+    const int64_t N_lat = latents->ne[1];  // 256 (1D) or 1 (2D per window)
+    const int64_t batch = latents->ne[2];  // 1 (1D) or 256 (2D)
+    const int64_t N_x   = x->ne[1];       // H*W (1D) or 16 (2D per window)
+    const float scale   = 1.0f / sqrtf((float)D);  // 0.125 for D=64
+
+    // ── Cross-attention: latents attend to features ─────────────────────
+    {
+        auto* lat_n = sam3_layer_norm(ctx, latents, layer.ca_norm_latents_w,
+                                      layer.ca_norm_latents_b);
+        auto* x_n   = sam3_layer_norm(ctx, x, layer.ca_norm_x_w, layer.ca_norm_x_b);
+
+        // Q from latents: [D, N_lat, batch] → [D, N_lat, batch]
+        auto* q = ggml_mul_mat(ctx, layer.ca_q_w, lat_n);  // [D, N_lat, batch]
+
+        // KV from features: [2*D, N_x, batch]
+        auto* kv = ggml_mul_mat(ctx, layer.ca_kv_w, x_n);  // [2*D, N_x, batch]
+
+        // Split into K and V via views — kv is contiguous [2*D, N_x, batch]
+        auto* k_raw = ggml_view_3d(ctx, kv, D, N_x, batch,
+                                   kv->nb[1], kv->nb[2], 0);               // [D, N_x, batch]
+        auto* v_raw = ggml_view_3d(ctx, kv, D, N_x, batch,
+                                   kv->nb[1], kv->nb[2], D * sizeof(float)); // [D, N_x, batch]
+
+        // Add positional encoding to K and V
+        struct ggml_tensor* k;
+        struct ggml_tensor* v;
+        if (pos) {
+            k = ggml_add(ctx, k_raw, pos);
+            v = ggml_add(ctx, v_raw, pos);
+        } else {
+            k = ggml_cont(ctx, k_raw);
+            v = ggml_cont(ctx, v_raw);
+        }
+
+        // Reshape for flash_attn_ext (1 head):
+        // Q: [D, N_lat, 1, batch]  K: [D, N_x, 1, batch]  V: [D, N_x, 1, batch]
+        q = ggml_reshape_4d(ctx, q, D, N_lat, 1, batch);
+        k = ggml_reshape_4d(ctx, k, D, N_x,   1, batch);
+        v = ggml_reshape_4d(ctx, v, D, N_x,   1, batch);
+
+        auto* attn = ggml_flash_attn_ext(ctx, q, k, v, nullptr, scale, 0.0f, 0.0f);
+        // Output: [D, 1, N_lat, batch] (permuted) → reshape to [D, N_lat, batch]
+        attn = ggml_reshape_3d(ctx, attn, D, N_lat, batch);
+
+        // Output projection
+        auto* ca_out = ggml_mul_mat(ctx, layer.ca_out_w, attn);  // [D, N_lat, batch]
+
+        // Residual
+        latents = ggml_add(ctx, latents, ca_out);
+    }
+
+    // ── FFN after cross-attention ───────────────────────────────────────
+    {
+        auto* ln = sam3_layer_norm(ctx, latents, layer.ff_norm_w, layer.ff_norm_b);
+        auto* h  = ggml_mul_mat(ctx, layer.ff_fc1_w, ln);   // [256, N_lat, batch]
+        h = ggml_gelu(ctx, h);
+        h = ggml_mul_mat(ctx, layer.ff_fc2_w, h);           // [D, N_lat, batch]
+        latents = ggml_add(ctx, latents, h);
+    }
+
+    // ── Self-attention on latents ───────────────────────────────────────
+    {
+        auto* lat_n = sam3_layer_norm(ctx, latents, layer.sa_norm_w, layer.sa_norm_b);
+
+        auto* q  = ggml_mul_mat(ctx, layer.sa_q_w, lat_n);  // [D, N_lat, batch]
+        auto* kv = ggml_mul_mat(ctx, layer.sa_kv_w, lat_n); // [2*D, N_lat, batch]
+
+        auto* k = ggml_view_3d(ctx, kv, D, N_lat, batch,
+                               kv->nb[1], kv->nb[2], 0);
+        auto* v = ggml_view_3d(ctx, kv, D, N_lat, batch,
+                               kv->nb[1], kv->nb[2], D * sizeof(float));
+        k = ggml_cont(ctx, k);
+        v = ggml_cont(ctx, v);
+
+        q = ggml_reshape_4d(ctx, q, D, N_lat, 1, batch);
+        k = ggml_reshape_4d(ctx, k, D, N_lat, 1, batch);
+        v = ggml_reshape_4d(ctx, v, D, N_lat, 1, batch);
+
+        auto* attn = ggml_flash_attn_ext(ctx, q, k, v, nullptr, scale, 0.0f, 0.0f);
+        attn = ggml_reshape_3d(ctx, attn, D, N_lat, batch);
+
+        auto* sa_out = ggml_mul_mat(ctx, layer.sa_out_w, attn);
+        latents = ggml_add(ctx, latents, sa_out);
+    }
+
+    // ── FFN after self-attention ────────────────────────────────────────
+    {
+        auto* ln = sam3_layer_norm(ctx, latents, layer.sa_ff_norm_w, layer.sa_ff_norm_b);
+        auto* h  = ggml_mul_mat(ctx, layer.sa_ff_fc1_w, ln);
+        h = ggml_gelu(ctx, h);
+        h = ggml_mul_mat(ctx, layer.sa_ff_fc2_w, h);
+        latents = ggml_add(ctx, latents, h);
+    }
+
+    return latents;
+}
+
+// CPU-side window partition: rearrange [D, H*W] features into [256, 16, D]
+// (256 windows of 4x4=16 tokens each, assuming H=W=64 and window_size=4).
+// Input layout: [D, H*W] with inner dim D (ggml convention: ne[0]=D, ne[1]=H*W).
+// Stored row-major: element (d, pos) at flat[d + pos * D], pos = w + h * W.
+// Output layout: [D, 16, 256] — 256 windows, each with 16 tokens of dim D.
+static void edgetam_window_partition_cpu(
+        const float* src, int D, int H, int W,
+        int window_size, float* dst) {
+    const int nw_h = H / window_size;  // 16
+    const int nw_w = W / window_size;  // 16
+    const int ws2  = window_size * window_size;  // 16
+
+    // For each window (wh, ww), for each pixel (ph, pw) within the window:
+    //   src_pos = (wh * ws + ph) * W + (ww * ws + pw)
+    //   dst: window_idx = wh * nw_w + ww,  token_idx = ph * ws + pw
+    //   dst[d + token_idx * D + window_idx * D * ws2]
+    for (int wh = 0; wh < nw_h; ++wh) {
+        for (int ww = 0; ww < nw_w; ++ww) {
+            int win_idx = wh * nw_w + ww;
+            for (int ph = 0; ph < window_size; ++ph) {
+                for (int pw = 0; pw < window_size; ++pw) {
+                    int tok_idx  = ph * window_size + pw;
+                    int src_h    = wh * window_size + ph;
+                    int src_w    = ww * window_size + pw;
+                    int src_pos  = src_w + src_h * W;  // H*W spatial index
+
+                    // Copy D elements
+                    const float* s = src + src_pos * D;
+                    float* d       = dst + win_idx * (D * ws2) + tok_idx * D;
+                    memcpy(d, s, D * sizeof(float));
+                }
+            }
+        }
+    }
+}
+
+// Inverse of window partition: [D, 16, 256] → [D, H, W] spatial layout.
+// Rearranges 256 windows of 16 tokens each back into [D, H*W] feature map.
+// Output has ggml layout [D, W, H] (ne[0]=D, ne[1]=W, ne[2]=H).
+static void edgetam_window_unpartition_cpu(
+        const float* src, int D, int H, int W,
+        int window_size, float* dst) {
+    const int nw_h = H / window_size;
+    const int nw_w = W / window_size;
+    const int ws2  = window_size * window_size;
+
+    for (int wh = 0; wh < nw_h; ++wh) {
+        for (int ww = 0; ww < nw_w; ++ww) {
+            int win_idx = wh * nw_w + ww;
+            for (int ph = 0; ph < window_size; ++ph) {
+                for (int pw = 0; pw < window_size; ++pw) {
+                    int tok_idx = ph * window_size + pw;
+                    int dst_h   = wh * window_size + ph;
+                    int dst_w   = ww * window_size + pw;
+                    int dst_pos = dst_w + dst_h * W;
+
+                    const float* s = src + win_idx * (D * ws2) + tok_idx * D;
+                    float* d       = dst + dst_pos * D;
+                    memcpy(d, s, D * sizeof(float));
+                }
+            }
+        }
+    }
+}
+
+static bool edgetam_perceiver_forward(
+        const sam3_model& model,
+        const std::vector<float>& mem_features,  // [64 * H * W]
+        const std::vector<float>& mem_pos,        // [64 * H * W]
+        int H, int W,
+        std::vector<float>& out_latents,          // output: [512 * 64]
+        std::vector<float>& out_pos) {            // output: [512 * 64]
+    auto t_start = std::chrono::high_resolution_clock::now();
+
+    const auto& perc = model.perceiver;
+    const int D        = 64;
+    const int N_1d     = 256;     // number of 1D latent tokens
+    const int N_2d     = 256;     // number of 2D latent tokens
+    const int HW       = H * W;
+    const int n_layers = (int)perc.layers.size();
+    const int nw       = (int)sqrtf((float)N_2d);  // 16 windows per spatial dim
+    const int ws       = H / nw;   // window size (4 for H=64, 2 for H=32)
+    const int ws2      = ws * ws;   // tokens per window
+
+    fprintf(stderr, "%s: H=%d W=%d D=%d layers=%d 1d_tokens=%d 2d_tokens=%d ws=%d\n",
+            __func__, H, W, D, n_layers, N_1d, N_2d, ws);
+
+    if (ws < 1 || H % ws != 0 || W % ws != 0) {
+        fprintf(stderr, "%s: H=%d or W=%d not divisible by window_size=%d (nw=%d)\n",
+                __func__, H, W, ws, nw);
+        return false;
+    }
+    if (nw * nw != N_2d) {
+        fprintf(stderr, "%s: expected %d 2D windows but got %d\n",
+                __func__, N_2d, nw * nw);
+        return false;
+    }
+
+    // ── Read learnable latent tokens from model weights ─────────────────
+    // latents_1d: ggml shape [64, 256] → ne[0]=64(D), ne[1]=256(N)
+    std::vector<float> latents_1d_data(D * N_1d);
+    sam3_read_f32(perc.latents_1d, latents_1d_data.data(), D * N_1d);
+
+    std::vector<float> latents_2d_data(D * N_2d);
+    sam3_read_f32(perc.latents_2d, latents_2d_data.data(), D * N_2d);
+
+    // ── Prepare 2D windowed features on CPU ─────────────────────────────
+    // mem_features layout: [D, H*W] (ggml: ne[0]=D, ne[1]=H*W, stored as
+    //   element (d, pos) at flat index d + pos*D where pos = w + h*W).
+    // Actually, the features from the memory encoder have layout [D, W, H] in
+    // ggml 4D, flattened to [D, H*W]. We need to interpret as a 2D spatial grid.
+    // The input is already in [D, H*W] layout with spatial stride such that
+    // pos = w + h * W.
+
+    // Window partition: [D, H*W] → [D, ws2, N_2d] i.e. [64, 16, 256]
+    std::vector<float> feat_windowed(D * ws2 * N_2d);
+    edgetam_window_partition_cpu(mem_features.data(), D, H, W, ws, feat_windowed.data());
+
+    // Reshape latents_2d for windowed processing: [D, N_2d] → [D, 1, N_2d]
+    // Each window has exactly 1 latent token.
+    // The latents_2d weight is [D, 256] = 256 latent tokens.
+    // For 2D: batch=256 windows, each with 1 latent and 16 feature tokens.
+    // Rearrange latents_2d from [D, 256] to [D, 1, 256] (batch dim = 256)
+    // Already in correct layout: element (d, n) at d + n*D → for batch n, token 0, dim d.
+
+    // ══════════════════════════════════════════════════════════════════════
+    // SUB-GRAPH 1: 1D path — global cross-attention of 256 latents to H*W features
+    // ══════════════════════════════════════════════════════════════════════
+    std::vector<float> result_1d(D * N_1d);
+    {
+        const size_t buf_size = ggml_tensor_overhead() * 4096 + ggml_graph_overhead();
+        struct ggml_init_params gparams = {buf_size, nullptr, true};
+        auto* ctx0 = ggml_init(gparams);
+        if (!ctx0) {
+            fprintf(stderr, "%s: failed to init 1D context\n", __func__);
+            return false;
+        }
+
+        // Input tensors (fresh, no dependency chains)
+        auto* lat_in = ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, D, N_1d, 1);
+        ggml_set_name(lat_in, "lat_1d_in");
+        ggml_set_input(lat_in);
+
+        auto* x_in = ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, D, HW, 1);
+        ggml_set_name(x_in, "feat_1d_in");
+        ggml_set_input(x_in);
+
+        auto* pos_in = ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, D, HW, 1);
+        ggml_set_name(pos_in, "pos_1d_in");
+        ggml_set_input(pos_in);
+
+        // Run perceiver layers
+        auto* latents = lat_in;
+        for (int l = 0; l < n_layers; ++l) {
+            latents = edgetam_perceiver_layer_forward(ctx0, latents, x_in, pos_in,
+                                                      perc.layers[l]);
+        }
+
+        // Final LayerNorm
+        latents = sam3_layer_norm(ctx0, latents, perc.norm_w, perc.norm_b);
+        ggml_set_name(latents, "lat_1d_out");
+        ggml_set_output(latents);
+
+        // Build + allocate + compute
+        auto* graph = ggml_new_graph_custom(ctx0, 16384, false);
+        ggml_build_forward_expand(graph, latents);
+
+        auto* galloc = ggml_gallocr_new(
+            ggml_backend_get_default_buffer_type(model.backend));
+        if (!ggml_gallocr_reserve(galloc, graph) ||
+            !ggml_gallocr_alloc_graph(galloc, graph)) {
+            fprintf(stderr, "%s: 1D graph alloc failed\n", __func__);
+            ggml_gallocr_free(galloc);
+            ggml_free(ctx0);
+            return false;
+        }
+
+        // Set inputs
+        ggml_backend_tensor_set(lat_in, latents_1d_data.data(), 0,
+                                D * N_1d * sizeof(float));
+        ggml_backend_tensor_set(x_in, mem_features.data(), 0,
+                                D * HW * sizeof(float));
+        ggml_backend_tensor_set(pos_in, mem_pos.data(), 0,
+                                D * HW * sizeof(float));
+
+        if (!sam3_graph_compute(model.backend, graph, 4)) {
+            fprintf(stderr, "%s: 1D graph compute failed\n", __func__);
+            ggml_gallocr_free(galloc);
+            ggml_free(ctx0);
+            return false;
+        }
+
+        ggml_backend_tensor_get(latents, result_1d.data(), 0,
+                                D * N_1d * sizeof(float));
+
+        ggml_gallocr_free(galloc);
+        ggml_free(ctx0);
+    }
+
+    // ══════════════════════════════════════════════════════════════════════
+    // SUB-GRAPH 2: 2D path — windowed cross-attention (256 windows, 1 latent each)
+    // ══════════════════════════════════════════════════════════════════════
+    std::vector<float> result_2d(D * N_2d);
+    {
+        const size_t buf_size = ggml_tensor_overhead() * 4096 + ggml_graph_overhead();
+        struct ggml_init_params gparams = {buf_size, nullptr, true};
+        auto* ctx0 = ggml_init(gparams);
+        if (!ctx0) {
+            fprintf(stderr, "%s: failed to init 2D context\n", __func__);
+            return false;
+        }
+
+        // Input: windowed features [D, ws2, N_2d] where batch dim = N_2d = 256
+        auto* x_in = ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, D, ws2, N_2d);
+        ggml_set_name(x_in, "feat_2d_in");
+        ggml_set_input(x_in);
+
+        // Input: latents [D, 1, N_2d] — 1 latent per window
+        auto* lat_in = ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, D, 1, N_2d);
+        ggml_set_name(lat_in, "lat_2d_in");
+        ggml_set_input(lat_in);
+
+        // Run perceiver layers (same weights, no positional encoding for 2D path)
+        auto* latents = lat_in;
+        for (int l = 0; l < n_layers; ++l) {
+            latents = edgetam_perceiver_layer_forward(ctx0, latents, x_in,
+                                                      nullptr, perc.layers[l]);
+        }
+
+        // The 2D latents: [D, 1, N_2d] → squeeze to [D, N_2d] for output
+        auto* lat_out = ggml_reshape_2d(ctx0, latents, D, N_2d);
+
+        // Final LayerNorm (shared norm_w/norm_b)
+        lat_out = sam3_layer_norm(ctx0, lat_out, perc.norm_w, perc.norm_b);
+        ggml_set_name(lat_out, "lat_2d_out");
+        ggml_set_output(lat_out);
+
+        auto* graph = ggml_new_graph_custom(ctx0, 16384, false);
+        ggml_build_forward_expand(graph, lat_out);
+
+        auto* galloc = ggml_gallocr_new(
+            ggml_backend_get_default_buffer_type(model.backend));
+        if (!ggml_gallocr_reserve(galloc, graph) ||
+            !ggml_gallocr_alloc_graph(galloc, graph)) {
+            fprintf(stderr, "%s: 2D graph alloc failed\n", __func__);
+            ggml_gallocr_free(galloc);
+            ggml_free(ctx0);
+            return false;
+        }
+
+        // Set windowed features
+        ggml_backend_tensor_set(x_in, feat_windowed.data(), 0,
+                                D * ws2 * N_2d * sizeof(float));
+
+        // Set latents: [D, 256] → interpret as [D, 1, 256]
+        ggml_backend_tensor_set(lat_in, latents_2d_data.data(), 0,
+                                D * N_2d * sizeof(float));
+
+        if (!sam3_graph_compute(model.backend, graph, 4)) {
+            fprintf(stderr, "%s: 2D graph compute failed\n", __func__);
+            ggml_gallocr_free(galloc);
+            ggml_free(ctx0);
+            return false;
+        }
+
+        ggml_backend_tensor_get(lat_out, result_2d.data(), 0,
+                                D * N_2d * sizeof(float));
+
+        ggml_gallocr_free(galloc);
+        ggml_free(ctx0);
+    }
+
+    // ══════════════════════════════════════════════════════════════════════
+    // Combine outputs: concat [1D, 2D] along token dimension
+    // ══════════════════════════════════════════════════════════════════════
+
+    const int N_total = N_1d + N_2d;  // 512
+    out_latents.resize(N_total * D);
+    out_pos.resize(N_total * D);
+
+    // 1D latents: first 256 tokens
+    memcpy(out_latents.data(), result_1d.data(), D * N_1d * sizeof(float));
+
+    // 2D latents: next 256 tokens
+    // The 2D latents are currently in [D, N_2d] flat layout from the graph output.
+    // The Python code reshapes (1, 256, 64) → (1, 16, 16, 64), permutes to
+    // (1, 64, 16, 16), then flattens back to (1, 256, 64). Since 256 = 16*16
+    // and the window indices are already in row-major order (wh*nw_w + ww),
+    // this reshape→permute→flatten is a no-op on the data — the token ordering
+    // is identical. So we can just copy directly.
+    memcpy(out_latents.data() + D * N_1d, result_2d.data(),
+           D * N_2d * sizeof(float));
+
+    // ── Position encodings ──────────────────────────────────────────────
+    // 1D path: pos is all zeros (no spatial meaning for global tokens)
+    memset(out_pos.data(), 0, D * N_1d * sizeof(float));
+
+    // 2D path: sinusoidal PE for a 16×16 grid with dim=64
+    // sam3_sinusoidal_pe_2d produces [D, W, H] layout = [64, 16, 16] = [64 * 256]
+    auto pe_2d = sam3_sinusoidal_pe_2d(nw, nw, D);
+    // The PE is in [D, nw_w, nw_h] spatial layout. The 2D latents are indexed
+    // by window (wh, ww) in row-major order. The PE spatial index is
+    // (w + h * nw_w) matching our window index (wh * nw_w + ww) only if
+    // we interpret h=wh, w=ww. sam3_sinusoidal_pe_2d stores as:
+    //   pe[c + x * D + y * D * W]  where x=col, y=row
+    // Window index = wh * nw_w + ww, so we need pe at (y=wh, x=ww):
+    //   pe[c + ww * D + wh * D * nw_w]
+    // Flat token index = wh * nw_w + ww, so dst offset = (wh*nw_w + ww) * D.
+    // We can just copy the PE directly since the spatial ordering matches.
+    memcpy(out_pos.data() + D * N_1d, pe_2d.data(), D * N_2d * sizeof(float));
+
+    auto t_end = std::chrono::high_resolution_clock::now();
+    auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(t_end - t_start).count();
+    fprintf(stderr, "%s: perceiver done in %lld ms — output [%d, %d]\n",
+            __func__, ms, N_total, D);
+
+    return true;
+}
+
 // Full SAM2 image encoding: preprocess → Hiera → FPN → state
 static bool sam2_encode_image_hiera(sam3_state& state,
                                      const sam3_model& model,
@@ -4174,6 +6013,11 @@ static bool sam2_encode_image_hiera(sam3_state& state,
 bool sam3_encode_image(sam3_state& state,
                        const sam3_model& model,
                        const sam3_image& image) {
+    // ── EdgeTAM dispatch ─────────────────────────────────────────────────
+    if (model.hparams.is_edgetam()) {
+        return edgetam_encode_image(state, model, image);
+    }
+
     // ── SAM2 dispatch ────────────────────────────────────────────────────
     if (model.hparams.is_sam2()) {
         return sam2_encode_image_hiera(state, model, image);
@@ -5153,6 +6997,107 @@ bool sam3_encode_image_from_preprocessed(sam3_state& state,
     }
 
     fprintf(stderr, "%s: encoding from preprocessed %dx%d\n", __func__, img_size, img_size);
+
+    // EdgeTAM dispatch: build RepViT graph directly from preprocessed data
+    if (hp.is_edgetam()) {
+        state.orig_width = img_size;
+        state.orig_height = img_size;
+
+        const size_t buf_size = ggml_tensor_overhead() * 16384 + ggml_graph_overhead() * 2;
+        struct ggml_init_params gparams = {buf_size, nullptr, true};
+        auto* ctx0 = ggml_init(gparams);
+        if (!ctx0) return false;
+
+        auto* inp = ggml_new_tensor_4d(ctx0, GGML_TYPE_F32, img_size, img_size, 3, 1);
+        ggml_set_name(inp, "input_image");
+        ggml_set_input(inp);
+
+        struct ggml_tensor* stage_outs[4] = {};
+        edgetam_build_repvit_graph(ctx0, inp, model, stage_outs);
+
+        struct ggml_tensor* fpn_outs[4] = {};
+        edgetam_build_fpn_neck_graph(ctx0, stage_outs, model, fpn_outs);
+
+        int n_fpn = 4 - hp.scalp;
+        for (int i = 0; i < n_fpn; ++i) {
+            char name[64];
+            snprintf(name, sizeof(name), "fpn_out_%d", i);
+            ggml_set_name(fpn_outs[i], name);
+            ggml_set_output(fpn_outs[i]);
+        }
+
+        auto* graph = ggml_new_graph_custom(ctx0, 32768, false);
+        for (int i = 0; i < n_fpn; ++i)
+            ggml_build_forward_expand(graph, fpn_outs[i]);
+
+        auto* galloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(model.backend));
+        if (!ggml_gallocr_reserve(galloc, graph) || !ggml_gallocr_alloc_graph(galloc, graph)) {
+            ggml_gallocr_free(galloc);
+            ggml_free(ctx0);
+            return false;
+        }
+
+        ggml_backend_tensor_set(inp, chw_data, 0, 3 * img_size * img_size * sizeof(float));
+
+        if (!sam3_graph_compute(model.backend, graph, state.n_threads)) {
+            ggml_gallocr_free(galloc);
+            ggml_free(ctx0);
+            return false;
+        }
+
+        // Copy to state (same pattern as edgetam_encode_image)
+        if (state.buffer) { ggml_backend_buffer_free(state.buffer); state.buffer = nullptr; }
+        if (state.pe_buf) { ggml_backend_buffer_free(state.pe_buf); state.pe_buf = nullptr; }
+        if (state.pe_ctx) { ggml_free(state.pe_ctx); state.pe_ctx = nullptr; }
+        if (state.ctx) { ggml_free(state.ctx); state.ctx = nullptr; }
+
+        size_t state_ctx_size = ggml_tensor_overhead() * 32;
+        struct ggml_init_params sparams = {state_ctx_size, nullptr, true};
+        state.ctx = ggml_init(sparams);
+
+        for (int i = 0; i < n_fpn; ++i) {
+            auto* src = fpn_outs[i];
+            state.neck_trk[i] = ggml_new_tensor_4d(state.ctx, GGML_TYPE_F32,
+                                                     src->ne[0], src->ne[1], src->ne[2], src->ne[3]);
+            char nm[64];
+            snprintf(nm, sizeof(nm), "neck_trk_%d", i);
+            ggml_set_name(state.neck_trk[i], nm);
+        }
+        for (int i = n_fpn; i < 4; ++i) state.neck_trk[i] = nullptr;
+
+        state.buffer = ggml_backend_alloc_ctx_tensors(state.ctx, model.backend);
+        for (int i = 0; i < n_fpn; ++i) {
+            int64_t nb = ggml_nbytes(state.neck_trk[i]);
+            std::vector<char> buf(nb);
+            ggml_backend_tensor_get(fpn_outs[i], buf.data(), 0, nb);
+            ggml_backend_tensor_set(state.neck_trk[i], buf.data(), 0, nb);
+        }
+
+        size_t pe_ctx_size = ggml_tensor_overhead() * 16;
+        struct ggml_init_params pe_params = {pe_ctx_size, nullptr, true};
+        state.pe_ctx = ggml_init(pe_params);
+        for (int i = 0; i < n_fpn; ++i) {
+            int H = (int)state.neck_trk[i]->ne[2];
+            int W = (int)state.neck_trk[i]->ne[1];
+            state.neck_trk_pe[i] = ggml_new_tensor_4d(state.pe_ctx, GGML_TYPE_F32,
+                                                        hp.neck_dim, W, H, 1);
+        }
+        state.pe_buf = ggml_backend_alloc_ctx_tensors(state.pe_ctx, model.backend);
+        for (int i = 0; i < n_fpn; ++i) {
+            int H = (int)state.neck_trk[i]->ne[2];
+            int W = (int)state.neck_trk[i]->ne[1];
+            auto pe = sam3_sinusoidal_pe_2d(H, W, hp.neck_dim);
+            ggml_backend_tensor_set(state.neck_trk_pe[i], pe.data(), 0, pe.size() * sizeof(float));
+        }
+
+        ggml_gallocr_free(galloc);
+        ggml_free(ctx0);
+
+        auto t_end = std::chrono::high_resolution_clock::now();
+        auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(t_end - t_start).count();
+        fprintf(stderr, "%s: EdgeTAM preprocessed encode done in %lld ms\n", __func__, ms);
+        return true;
+    }
 
     // SAM2 dispatch: build a fake sam3_image and use the SAM2 encoder
     if (hp.is_sam2()) {
@@ -7176,7 +9121,9 @@ static sam3_prompt_data sam3_build_prompt_and_pos(
     const int MD = hp.mem_out_dim;  // 64
     const int D = hp.neck_dim;      // 256
     const int H = (eff_feat_size > 0) ? eff_feat_size : hp.feat_size();
-    const int HH = H * H;
+    // Per-slot token count: from actual data size (handles both HxH and perceiver 512)
+    const int HH = mem_slot_feats.empty() ? (H * H)
+                 : (int)(mem_slot_feats[0].size() / MD);
 
     sam3_prompt_data pd;
     pd.num_obj_ptr_tokens = 0;
@@ -7189,6 +9136,7 @@ static sam3_prompt_data sam3_build_prompt_and_pos(
 
     // 1. Spatial memory tokens
     for (size_t s = 0; s < mem_slot_feats.size(); ++s) {
+        const int slot_tokens = (int)(mem_slot_feats[s].size() / MD);
         // Append spatial features
         pd.prompt.insert(pd.prompt.end(), mem_slot_feats[s].begin(), mem_slot_feats[s].end());
 
@@ -7197,7 +9145,7 @@ static sam3_prompt_data sam3_build_prompt_and_pos(
         int tpos_idx = spatial_tpos[s];
         if (tpos_idx >= 0 && tpos_idx < hp.num_maskmem) {
             int enc_idx = hp.num_maskmem - tpos_idx - 1;  // Python: maskmem_tpos_enc[num_maskmem - tpos - 1]
-            for (int n = 0; n < HH; ++n)
+            for (int n = 0; n < slot_tokens; ++n)
                 for (int d = 0; d < MD; ++d)
                     pos[d + n * MD] += tpos_all[d + enc_idx * MD];
         }
@@ -7391,10 +9339,10 @@ static void sam3_extract_obj_ptr_cpu(
     const auto& hp = model.hparams;
     const int D = hp.neck_dim;
 
-    // SAM2 with fixed_no_obj_ptr: blend projected ptr with no_obj_ptr
+    // SAM2/EdgeTAM with fixed_no_obj_ptr: blend projected ptr with no_obj_ptr
     // based on presence score λ.
     // SAM3 / SAM2 without fixed_no_obj_ptr: binary threshold.
-    if (hp.is_sam2() && hp.fixed_no_obj_ptr) {
+    if ((hp.is_sam2() || hp.is_edgetam()) && hp.fixed_no_obj_ptr) {
         // λ = (obj_score > 0) ? 1.0 : 0.0  (hard threshold, not sigmoid)
         float lambda = (obj_score > 0.0f) ? 1.0f : 0.0f;
 
@@ -9187,6 +11135,22 @@ static void sam3_ensure_tracker_pe_caches(sam3_tracker& tracker, const sam3_hpar
             tracker.cached_axial_cis_reord[1 + i * 2 + n * D] = rope_raw[n * D + i * 2 + 1];
         }
 
+    // EdgeTAM: compute 16x16 RoPE for cross-attention K (perceiver 2D latents)
+    if (hp.has_perceiver) {
+        const int K16 = 16;  // perceiver 2D grid size
+        const int NK = K16 * K16;  // 256 tokens
+        std::vector<float> rope_k16_raw(NK * D);
+        sam3_compute_axial_cis(rope_k16_raw.data(), D, K16, K16, 10000.0f, 1.0f);
+        tracker.cached_axial_cis_k16_reord.resize(2 * half_d * NK);
+        for (int n = 0; n < NK; ++n)
+            for (int i = 0; i < half_d; ++i) {
+                tracker.cached_axial_cis_k16_reord[0 + i * 2 + n * D] = rope_k16_raw[n * D + i * 2 + 0];
+                tracker.cached_axial_cis_k16_reord[1 + i * 2 + n * D] = rope_k16_raw[n * D + i * 2 + 1];
+            }
+        SAM3_LOG(2, "%s: EdgeTAM K16 RoPE cache: %zu floats\n", __func__,
+                 tracker.cached_axial_cis_k16_reord.size());
+    }
+
     tracker.pe_caches_valid = true;
     SAM3_LOG(2, "%s: tracker PE caches populated (%.1f KB)\n", __func__,
              (tracker.cached_sinpe_256.size() + tracker.cached_sinpe_64.size() +
@@ -9208,20 +11172,34 @@ static sam3_prop_output sam3_propagate_single(
     if (sel.empty()) return output;
 
     // ── Build prompt and prompt_pos via sam3_build_prompt_and_pos ─────────
+    // EdgeTAM with perceiver: each slot has 512 tokens (not H*H).
+    // Standard SAM2/SAM3: each slot has H*H tokens.
+    const bool use_perceiver = hp.has_perceiver != 0;
+    const int N_per_slot = use_perceiver ? (hp.perceiver_n_latents_1d + hp.perceiver_n_latents_2d) : N;
+
     int n_sel = (int)sel.size();
     std::vector<std::vector<float>> slot_feats(n_sel), slot_pes(n_sel);
     std::vector<int> spatial_tpos(n_sel, 1);  // default t_pos=1 for non-cond
     for (int s = 0; s < n_sel; ++s) {
-        slot_feats[s].resize(MD * N);
+        slot_feats[s].resize(MD * N_per_slot);
         ggml_backend_tensor_get(mem_bank[sel[s]].spatial_feats,
-                                slot_feats[s].data(), 0, MD * N * sizeof(float));
-        slot_pes[s].resize(MD * N);
+                                slot_feats[s].data(), 0, MD * N_per_slot * sizeof(float));
+        slot_pes[s].resize(MD * N_per_slot);
         if (mem_bank[sel[s]].spatial_pe) {
             ggml_backend_tensor_get(mem_bank[sel[s]].spatial_pe,
-                                    slot_pes[s].data(), 0, MD * N * sizeof(float));
+                                    slot_pes[s].data(), 0, MD * N_per_slot * sizeof(float));
         } else {
             sam3_ensure_tracker_pe_caches(tracker, hp, H);
-            slot_pes[s] = tracker.cached_sinpe_64;
+            if (use_perceiver) {
+                // For perceiver: zeros for 1D tokens, sinusoidal for 2D tokens
+                const int N_1d = hp.perceiver_n_latents_1d;
+                const int N_2d = hp.perceiver_n_latents_2d;
+                memset(slot_pes[s].data(), 0, MD * N_1d * sizeof(float));
+                auto pe_2d = sam3_sinusoidal_pe_2d(16, 16, MD);
+                memcpy(slot_pes[s].data() + MD * N_1d, pe_2d.data(), MD * N_2d * sizeof(float));
+            } else {
+                slot_pes[s] = tracker.cached_sinpe_64;
+            }
         }
         spatial_tpos[s] = mem_bank[sel[s]].is_cond_frame ? 0 : (n_sel - s);
     }
@@ -9244,12 +11222,35 @@ static sam3_prop_output sam3_propagate_single(
     sam3_ensure_tracker_pe_caches(tracker, hp, H);
     const int half_d = D / 2;  // 128
     const auto& rope_q_reord = tracker.cached_axial_cis_reord;
-    // For cross-attn K: repeat cached Q pattern for M_spatial tokens
+    // For cross-attn K: build rope_k_data for all M_spatial tokens
     std::vector<float> rope_k_data;
     if (pd.M_spatial > 0) {
         rope_k_data.resize(2 * half_d * pd.M_spatial);
-        for (int s = 0; s < pd.M_spatial / N; ++s)
-            memcpy(rope_k_data.data() + s * D * N, rope_q_reord.data(), D * N * sizeof(float));
+        if (use_perceiver) {
+            // EdgeTAM perceiver: each frame has N_per_slot=512 tokens.
+            // First 256 (1D latents): identity RoPE (cos=1, sin=0).
+            // Last 256 (2D latents): 16x16 RoPE from cached_axial_cis_k16_reord.
+            const int N_1d = hp.perceiver_n_latents_1d;   // 256
+            const int N_2d = hp.perceiver_n_latents_2d;   // 256
+            const auto& rope_k16 = tracker.cached_axial_cis_k16_reord;  // [2, 128, 256]
+            for (int s = 0; s < n_sel; ++s) {
+                float* dst = rope_k_data.data() + s * D * N_per_slot;
+                // 1D tokens: identity RoPE (cos=1, sin=0) in [2, half_d, N_1d] layout
+                // Layout: for token n, dim i: cos at [0 + i*2 + n*D], sin at [1 + i*2 + n*D]
+                for (int n = 0; n < N_1d; ++n)
+                    for (int i = 0; i < half_d; ++i) {
+                        dst[0 + i * 2 + n * D] = 1.0f;  // cos = 1
+                        dst[1 + i * 2 + n * D] = 0.0f;  // sin = 0
+                    }
+                // 2D tokens: copy 16x16 RoPE
+                float* dst_2d = dst + D * N_1d;
+                memcpy(dst_2d, rope_k16.data(), D * N_2d * sizeof(float));
+            }
+        } else {
+            // Standard: repeat HxH axial CIS for each memory frame
+            for (int s = 0; s < pd.M_spatial / N; ++s)
+                memcpy(rope_k_data.data() + s * D * N, rope_q_reord.data(), D * N * sizeof(float));
+        }
     }
 
     // ── Build graph ─────────────────────────────────────────────────────
@@ -9387,9 +11388,9 @@ static sam3_prop_output sam3_propagate_single(
     const int mhw = H * 4;
     const int num_mask_tokens = hp.sam_n_multimask + 1;  // 4
 
-    // SAM2 with multimask_output_in_sam: read all masks, select best by IoU.
+    // SAM2/EdgeTAM with multimask_output_in_sam: read all masks, select best by IoU.
     // SAM3 / SAM2 without multimask: use first mask only.
-    bool use_multimask = hp.is_sam2() && hp.multimask_output_in_sam;
+    bool use_multimask = (hp.is_sam2() || hp.is_edgetam()) && hp.multimask_output_in_sam;
 
     if (use_multimask) {
         // Read all 4 IoU predictions
@@ -9583,7 +11584,7 @@ static bool sam3_encode_memory(
     std::vector<float> md(MD * H * H);
     ggml_backend_tensor_get(mo, md.data(), 0, md.size() * sizeof(float));
 
-    // Apply no_obj_embed_spatial if occluded (SAM2.1 only)
+    // Apply no_obj_embed_spatial if occluded (SAM2.1 only — EdgeTAM does not have this)
     if (obj_score <= 0.0f && model.no_obj_embed_spatial) {
         std::vector<float> no_obj_emb(MD);
         auto* noe = model.no_obj_embed_spatial;
@@ -9602,6 +11603,62 @@ static bool sam3_encode_memory(
         struct ggml_init_params tp = {ggml_tensor_overhead() * 4096, nullptr, true};
         tracker.ctx = ggml_init(tp);
     }
+
+    // ── EdgeTAM perceiver: compress memory features before storage ───────
+    if (hp.has_perceiver) {
+        // Compute sinusoidal PE for memory features (needed as perceiver input)
+        sam3_ensure_tracker_pe_caches(tracker, hp, H);
+        const auto& mem_pos = tracker.cached_sinpe_64;
+
+        std::vector<float> perc_latents, perc_pos;
+        if (!edgetam_perceiver_forward(model, md, mem_pos, H, H,
+                                        perc_latents, perc_pos)) {
+            fprintf(stderr, "%s: perceiver forward failed\n", __func__);
+            ggml_gallocr_free(ga);
+            ggml_free(ctx0);
+            return false;
+        }
+
+        // Store perceiver output: [MD=64, N_perc] (N_1d + N_2d latents)
+        const int N_perc = hp.perceiver_n_latents_1d + hp.perceiver_n_latents_2d;
+        auto* st = ggml_new_tensor_2d(tracker.ctx, GGML_TYPE_F32, MD, N_perc);
+        auto* sb = ggml_backend_alloc_buffer(model.backend, MD * N_perc * sizeof(float));
+        struct ggml_tallocr ta_perc = ggml_tallocr_new(sb);
+        ggml_tallocr_alloc(&ta_perc, st);
+        tracker.owned_buffers.push_back(sb);
+        ggml_backend_tensor_set(st, perc_latents.data(), 0, MD * N_perc * sizeof(float));
+
+        // Store perceiver PE: [MD=64, 512] (first 256 zeros, last 256 sinusoidal)
+        auto* spe = ggml_new_tensor_2d(tracker.ctx, GGML_TYPE_F32, MD, N_perc);
+        auto* speb = ggml_backend_alloc_buffer(model.backend, MD * N_perc * sizeof(float));
+        struct ggml_tallocr ta_perc2 = ggml_tallocr_new(speb);
+        ggml_tallocr_alloc(&ta_perc2, spe);
+        tracker.owned_buffers.push_back(speb);
+        ggml_backend_tensor_set(spe, perc_pos.data(), 0, MD * N_perc * sizeof(float));
+
+        sam3_memory_slot slot;
+        slot.spatial_feats = st;
+        slot.spatial_pe = spe;
+        slot.frame_index = frame_idx;
+        slot.is_cond_frame = is_cond;
+        auto& bk = tracker.mem_banks[inst_id];
+        bk.push_back(slot);
+        while ((int)bk.size() > hp.num_maskmem) {
+            bool removed = false;
+            for (auto it = bk.begin(); it != bk.end(); ++it)
+                if (!it->is_cond_frame) {
+                    bk.erase(it);
+                    removed = true;
+                    break;
+                }
+            if (!removed) bk.erase(bk.begin() + 1);
+        }
+        ggml_gallocr_free(ga);
+        ggml_free(ctx0);
+        return true;
+    }
+
+    // ── Standard path (SAM2/SAM3): store raw [MD, H, H] features ────────
     // Store spatial features
     auto* st = ggml_new_tensor_4d(tracker.ctx, GGML_TYPE_F32, MD, H, H, 1);
     auto* sb = ggml_backend_alloc_buffer(model.backend, MD * H * H * sizeof(float));

@@ -7,6 +7,9 @@ target_link_libraries(sam3_quantize PRIVATE ggml)
 add_executable(sam3_benchmark benchmark.cpp)
 target_link_libraries(sam3_benchmark PRIVATE sam3)
 
+add_executable(sam3_profile_edgetam profile_edgetam.cpp)
+target_link_libraries(sam3_profile_edgetam PRIVATE sam3)
+
 # SDL2 + ImGui are optional — build only if SDL2 is found.
 find_package(SDL2 QUIET)
 
