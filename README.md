@@ -2,13 +2,8 @@
 
 State-of-the-art image and video segmentation in portable C/C++
 
-<!-- TODO: Add hero GIF showing sam3_image segmenting objects with text prompts
-     Capture: run sam3_image with SAM3 model, type "cat" on data/test_image.jpg,
-     record the mask overlay result. Tools: Kap (macOS) or LICEcap. Keep under 15s. -->
-
-<!-- TODO: Add hero GIF showing sam3_video tracking objects across frames
-     Capture: run sam3_video with SAM2.1 model, click to add instance on frame 0,
-     play forward to show mask propagation. Keep under 20s. -->
+![SAM3 Image Segmentation Demo](https://media4.giphy.com/media/v1.Y2lkPTc5MGI3NjExM2E3Ymt6aWFkc3dxb2NkbGJzbmt2NmFlNjV0MGIyeWx0NjZiM3gyNyZlcD12MV9pbnRlcm5hbF9naWZfYnlfaWQmY3Q9Zw/LLAtsdffGRXDQOWOH8/giphy.gif)
+![SAM3 Video Segmentation Demo](https://raw.githubusercontent.com/PABannier/sam3.cpp/main/assets/sam3_video_seg.gif)
 
 ---
 
