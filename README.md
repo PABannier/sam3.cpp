@@ -11,15 +11,13 @@ State-of-the-art image and video segmentation in portable C/C++
 
 Running Meta's Segment Anything models typically requires Python, PyTorch, and a CUDA GPU. **sam3.cpp** eliminates all of that. It's a single C++ library that runs SAM 2, SAM 2.1, SAM 3, and EdgeTAM inference on CPU and Apple Metal. No Python runtime, no GPU drivers, no heavyweight dependencies. Just compile and segment.
 
-- **4 model families in one library**: SAM 2, SAM 2.1 (Hiera backbone), SAM 3 (ViT backbone + text detection), and EdgeTAM (RepViT backbone — 22x faster than SAM 2 on mobile)
-- **4-bit quantization**: EdgeTAM fits in **15 MB** with Q4_0; SAM 2.1 Tiny in **22 MB** tracking at **~1 fps** on Metal; SAM 3 drops from 3.4 GB to 673 MB
-- **Apple Metal GPU acceleration**: the full ViT/Hiera/RepViT backbone and transformer decoder run on the GPU via ggml's Metal backend
-- **Text-prompted detection** (SAM 3): type `"cat"` and get every cat in the image, no clicks needed. This is the PCS (Promptable Concept Segmentation) path, unique to SAM 3
-- **Point/box segmentation** (all models): click a point or draw a box, get a mask. The classic SAM workflow, available for SAM 2, 2.1, 3, and EdgeTAM
-- **Video object tracking**: memory bank with 7 temporal slots propagates masks across frames. Add instances mid-video, refine with clicks, export per-frame PNGs
-- **On-device tracking** (EdgeTAM): RepViT-M1 backbone with Perceiver memory compression achieves real-time tracking on Apple Silicon — 27 MB model, **~440 ms/frame** on Metal
-- **Single-file library**: `sam3.cpp` + `sam3.h`. Structs and free functions only, C++14, no exceptions, no inheritance
-- **Zero dependencies** beyond [ggml](https://github.com/ggerganov/ggml) (tensor computation, bundled as submodule) and [stb](https://github.com/nothings/stb) (image I/O, vendored)
+- **4 model families**: SAM 2, SAM 2.1 (Hiera), SAM 3 (ViT + text detection), EdgeTAM (RepViT, 22x faster than SAM 2 on mobile)
+- **4-bit quantization**: EdgeTAM in **15 MB**, SAM 2.1 Tiny in **22 MB** at ~1 fps on Metal, SAM 3 down to 673 MB
+- **Apple Metal GPU acceleration** for the full backbone and transformer decoder
+- **Text-prompted detection** (SAM 3 only): type `"cat"` and get every cat in the image, no clicks needed
+- **Point/box segmentation + video tracking** with memory bank across all models
+- **Single-file library**: `sam3.cpp` + `sam3.h`, C++14, no exceptions, no inheritance
+- **Zero dependencies** beyond [ggml](https://github.com/ggerganov/ggml) and [stb](https://github.com/nothings/stb)
 
 ## Quick Start
 
@@ -51,7 +49,7 @@ The interactive apps use SDL2 + ImGui. If SDL2 isn't found, only the benchmark a
 
 Video object tracking latency on **Apple M4 Pro (24 GB)**, 5 frames at 1008x1008 resolution, 4 threads. Each run is isolated in a forked subprocess.
 
-### SAM 3 (Full — text detection + visual tracking)
+### SAM 3 (Full: text detection + visual tracking)
 
 | Model | Size | Track/frame Metal (s) | Track/frame CPU (s) | Total Metal (s) | Total CPU (s) |
 |-------|------|-----------------------|---------------------|-----------------|---------------|
@@ -130,9 +128,9 @@ Options: `--models-dir <path>`, `--video <path>`, `--n-frames <n>`, `--n-threads
 
 All models are available in GGML format on Hugging Face:
 
-**[PABannier/sam3.cpp](https://huggingface.co/PABannier/sam3.cpp)** — 52 model files covering 4 architectures x multiple sizes x up to 5 precisions.
+**[PABannier/sam3.cpp](https://huggingface.co/PABannier/sam3.cpp)**: 52 model files covering 4 architectures x multiple sizes x up to 5 precisions.
 
-### SAM 3 (850M params — ViT-32 backbone + text encoder + DETR decoder)
+### SAM 3 (850M params, ViT-32 backbone + text encoder + DETR decoder)
 
 | Variant | Precision | Size | Features |
 |---------|-----------|------|----------|
@@ -185,8 +183,8 @@ All models are available in GGML format on Hugging Face:
 
 - C++14 compiler (Clang, GCC, MSVC)
 - CMake 3.14+
-- (Optional) SDL2 — for the interactive image/video examples
-- (Optional) ffmpeg — for video frame decoding
+- (Optional) SDL2 for the interactive image/video examples
+- (Optional) ffmpeg for video frame decoding
 
 ### Build
 
@@ -225,11 +223,11 @@ make -j
 ```
 
 **Controls:**
-- **Left-click** — add positive point
-- **Right-click** — add negative point
-- **Drag** — draw bounding box
-- **Text field + Segment** — detect all instances matching the text prompt (SAM 3 only)
-- **Export** — save masks as PNG
+- **Left-click**: add positive point
+- **Right-click**: add negative point
+- **Drag**: draw bounding box
+- **Text field + Segment**: detect all instances matching the text prompt (SAM 3 only)
+- **Export**: save masks as PNG
 
 ### Video Tracking (Interactive GUI)
 
@@ -297,7 +295,7 @@ sam3_tracker_add_instance(*tracker, *state, *model, pvs);
 // Subsequent frames: propagate masks
 for (int f = 1; f < n_frames; f++) {
     sam3_result result = sam3_propagate_frame(*tracker, *state, *model, frames[f]);
-    // result.detections[i].mask — tracked mask for each instance
+    // result.detections[i].mask - tracked mask for each instance
 }
 ```
 
@@ -347,9 +345,9 @@ uv run python convert_edgetam_to_ggml.py \
 
 ## Acknowledgments
 
-- [Meta AI Research](https://github.com/facebookresearch) — SAM, SAM 2, SAM 3, and EdgeTAM
-- [ggml](https://github.com/ggerganov/ggml) — the tensor computation library that makes this possible
-- [sam.cpp](https://github.com/YavorGIvanov/sam.cpp) — the original SAM 1 C++ port that inspired this project's architecture
+- [Meta AI Research](https://github.com/facebookresearch) for SAM, SAM 2, SAM 3, and EdgeTAM
+- [ggml](https://github.com/ggerganov/ggml), the tensor computation library that makes this possible
+- [sam.cpp](https://github.com/YavorGIvanov/sam.cpp), the original SAM 1 C++ port that inspired this project's architecture
 
 ## License
 
