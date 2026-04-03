@@ -43,6 +43,65 @@ static const float INSTANCE_COLORS[][3] = {
 };
 static constexpr int N_COLORS = sizeof(INSTANCE_COLORS) / sizeof(INSTANCE_COLORS[0]);
 
+static std::string basename_of(const std::string& path) {
+    auto pos = path.find_last_of("/\\");
+    return (pos == std::string::npos) ? path : path.substr(pos + 1);
+}
+
+static void apply_theme() {
+    ImGuiStyle& s = ImGui::GetStyle();
+    s.WindowRounding    = 6.0f;
+    s.FrameRounding     = 4.0f;
+    s.GrabRounding      = 3.0f;
+    s.ScrollbarRounding = 4.0f;
+    s.TabRounding       = 4.0f;
+    s.ChildRounding     = 4.0f;
+    s.PopupRounding     = 4.0f;
+    s.FramePadding      = ImVec2(6, 4);
+    s.ItemSpacing       = ImVec2(8, 5);
+    s.WindowPadding     = ImVec2(10, 10);
+    s.FrameBorderSize   = 0.0f;
+    s.WindowBorderSize  = 0.0f;
+    s.ScrollbarSize     = 12.0f;
+
+    ImVec4* c = s.Colors;
+    c[ImGuiCol_WindowBg]            = ImVec4(0.08f, 0.08f, 0.10f, 1.00f);
+    c[ImGuiCol_ChildBg]             = ImVec4(0.08f, 0.08f, 0.10f, 1.00f);
+    c[ImGuiCol_PopupBg]             = ImVec4(0.10f, 0.10f, 0.13f, 0.96f);
+    c[ImGuiCol_Border]              = ImVec4(0.20f, 0.20f, 0.25f, 0.50f);
+    c[ImGuiCol_FrameBg]             = ImVec4(0.14f, 0.14f, 0.18f, 1.00f);
+    c[ImGuiCol_FrameBgHovered]      = ImVec4(0.22f, 0.22f, 0.28f, 1.00f);
+    c[ImGuiCol_FrameBgActive]       = ImVec4(0.26f, 0.26f, 0.34f, 1.00f);
+    c[ImGuiCol_TitleBg]             = ImVec4(0.08f, 0.08f, 0.10f, 1.00f);
+    c[ImGuiCol_TitleBgActive]       = ImVec4(0.12f, 0.12f, 0.16f, 1.00f);
+    c[ImGuiCol_MenuBarBg]           = ImVec4(0.10f, 0.10f, 0.13f, 1.00f);
+    c[ImGuiCol_ScrollbarBg]         = ImVec4(0.06f, 0.06f, 0.08f, 0.60f);
+    c[ImGuiCol_ScrollbarGrab]       = ImVec4(0.28f, 0.28f, 0.34f, 1.00f);
+    c[ImGuiCol_ScrollbarGrabHovered]= ImVec4(0.36f, 0.36f, 0.42f, 1.00f);
+    c[ImGuiCol_ScrollbarGrabActive] = ImVec4(0.40f, 0.40f, 0.50f, 1.00f);
+    c[ImGuiCol_CheckMark]           = ImVec4(0.45f, 0.60f, 1.00f, 1.00f);
+    c[ImGuiCol_SliderGrab]          = ImVec4(0.38f, 0.52f, 0.90f, 1.00f);
+    c[ImGuiCol_SliderGrabActive]    = ImVec4(0.50f, 0.64f, 1.00f, 1.00f);
+    c[ImGuiCol_Button]              = ImVec4(0.18f, 0.20f, 0.28f, 1.00f);
+    c[ImGuiCol_ButtonHovered]       = ImVec4(0.30f, 0.34f, 0.48f, 1.00f);
+    c[ImGuiCol_ButtonActive]        = ImVec4(0.36f, 0.40f, 0.56f, 1.00f);
+    c[ImGuiCol_Header]              = ImVec4(0.18f, 0.20f, 0.28f, 1.00f);
+    c[ImGuiCol_HeaderHovered]       = ImVec4(0.26f, 0.30f, 0.42f, 1.00f);
+    c[ImGuiCol_HeaderActive]        = ImVec4(0.30f, 0.34f, 0.48f, 1.00f);
+    c[ImGuiCol_Separator]           = ImVec4(0.22f, 0.22f, 0.28f, 1.00f);
+    c[ImGuiCol_SeparatorHovered]    = ImVec4(0.36f, 0.42f, 0.60f, 1.00f);
+    c[ImGuiCol_SeparatorActive]     = ImVec4(0.42f, 0.50f, 0.70f, 1.00f);
+    c[ImGuiCol_ResizeGrip]          = ImVec4(0.30f, 0.36f, 0.52f, 0.50f);
+    c[ImGuiCol_ResizeGripHovered]   = ImVec4(0.40f, 0.48f, 0.68f, 0.70f);
+    c[ImGuiCol_ResizeGripActive]    = ImVec4(0.46f, 0.54f, 0.76f, 0.90f);
+    c[ImGuiCol_Tab]                 = ImVec4(0.14f, 0.14f, 0.18f, 1.00f);
+    c[ImGuiCol_TabHovered]          = ImVec4(0.30f, 0.34f, 0.48f, 1.00f);
+    c[ImGuiCol_TabSelected]         = ImVec4(0.22f, 0.26f, 0.38f, 1.00f);
+    c[ImGuiCol_TextSelectedBg]      = ImVec4(0.26f, 0.36f, 0.56f, 0.50f);
+    c[ImGuiCol_Text]                = ImVec4(0.90f, 0.90f, 0.94f, 1.00f);
+    c[ImGuiCol_TextDisabled]        = ImVec4(0.44f, 0.44f, 0.50f, 1.00f);
+}
+
 enum vtrack_mode { VMODE_TEXT, VMODE_BOX, VMODE_POINTS };
 
 struct vapp_state {
@@ -111,7 +170,7 @@ static GLuint upload_texture(const uint8_t* data, int w, int h, int ch, GLuint e
     if (!tex) glGenTextures(1, &tex);
     glBindTexture(GL_TEXTURE_2D, tex);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
     GLenum fmt = (ch == 4) ? GL_RGBA : GL_RGB;
     glTexImage2D(GL_TEXTURE_2D, 0, fmt, w, h, 0, fmt, GL_UNSIGNED_BYTE, data);
     return tex;
@@ -352,8 +411,13 @@ int main(int argc, char** argv) {
     const char* glsl_version = "#version 130";
 #endif
 
+    std::string init_title = basename_of(app.params.model_path);
+    if (!app.video_path.empty()) {
+        init_title = basename_of(app.video_path) + " \xe2\x80\x94 " + init_title;
+    }
+
     SDL_Window* window = SDL_CreateWindow(
-        "sam3 — Video Tracking",
+        init_title.c_str(),
         SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
         1280, 800,
         SDL_WINDOW_OPENGL | SDL_WINDOW_RESIZABLE | SDL_WINDOW_ALLOW_HIGHDPI);
@@ -366,6 +430,13 @@ int main(int argc, char** argv) {
     SDL_GL_MakeCurrent(window, gl_ctx);
     SDL_GL_SetSwapInterval(1);
 
+    // ── HiDPI scaling ────────────────────────────────────────────────────────
+
+    int fb_w_init, fb_h_init, win_w_init, win_h_init;
+    SDL_GL_GetDrawableSize(window, &fb_w_init, &fb_h_init);
+    SDL_GetWindowSize(window, &win_w_init, &win_h_init);
+    float dpi_scale = (win_w_init > 0) ? (float)fb_w_init / (float)win_w_init : 1.0f;
+
     // ── Init ImGui ───────────────────────────────────────────────────────────
 
     IMGUI_CHECKVERSION();
@@ -373,6 +444,25 @@ int main(int argc, char** argv) {
     ImGuiIO& io = ImGui::GetIO();
     io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
     ImGui::StyleColorsDark();
+    apply_theme();
+
+    float font_size = 15.0f * dpi_scale;
+    ImFontConfig font_cfg;
+    font_cfg.OversampleH = 2;
+    font_cfg.OversampleV = 2;
+    ImFont* font = nullptr;
+#ifdef __APPLE__
+    font = io.Fonts->AddFontFromFileTTF("/System/Library/Fonts/SFNS.ttf", font_size, &font_cfg);
+#elif defined(_WIN32)
+    font = io.Fonts->AddFontFromFileTTF("C:\\Windows\\Fonts\\segoeui.ttf", font_size, &font_cfg);
+#else
+    font = io.Fonts->AddFontFromFileTTF("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", font_size, &font_cfg);
+#endif
+    if (!font) {
+        font_cfg.SizePixels = 13.0f * dpi_scale;
+        io.Fonts->AddFontDefault(&font_cfg);
+    }
+    io.FontGlobalScale = 1.0f / dpi_scale;
 
     ImGui_ImplSDL2_InitForOpenGL(window, gl_ctx);
     ImGui_ImplOpenGL3_Init(glsl_version);
