@@ -23,7 +23,7 @@ jobs:
           - name: macOS x86_64
             os: macos-latest
             artifact: sam3-darwin-x86_64
-            cmake_args: "-DGGML_METAL=OFF -DSAM3_METAL=OFF -DBUILD_SHARED_LIBS=OFF -DCMAKE_OSX_ARCHITECTURES=x86_64"
+            cmake_args: "-DGGML_METAL=OFF -DSAM3_METAL=OFF -DBUILD_SHARED_LIBS=OFF -DCMAKE_OSX_ARCHITECTURES=x86_64 -DGGML_NATIVE=OFF"
             build_args: ""
             ext: tar.gz
 
