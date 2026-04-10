@@ -23,8 +23,12 @@
 #define popen  _popen
 #define pclose _pclose
 #define mkdir(path, mode) _mkdir(path)
+#define SAM3_NULL_DEV   "NUL"
+#define SAM3_POPEN_READ "rb"
 #else
 #include <sys/stat.h>
+#define SAM3_NULL_DEV   "/dev/null"
+#define SAM3_POPEN_READ "r"
 #endif
 
 /* C++ standard library */
@@ -12289,16 +12293,16 @@ sam3_image sam3_decode_video_frame(const std::string& video_path, int frame_inde
     snprintf(cmd, sizeof(cmd),
              "ffmpeg -nostdin -loglevel error -i \"%s\" "
              "-vf \"select=eq(n\\,%d)\" -vsync vfr -frames:v 1 "
-             "-f rawvideo -pix_fmt rgb24 pipe:1 2>/dev/null",
-             video_path.c_str(), frame_index);
+             "-f rawvideo -pix_fmt rgb24 pipe:1 2>%s",
+             video_path.c_str(), frame_index, SAM3_NULL_DEV);
 
     // First, get dimensions
     char info_cmd[1024];
     snprintf(info_cmd, sizeof(info_cmd),
              "ffprobe -v error -select_streams v:0 "
-             "-show_entries stream=width,height -of csv=p=0 \"%s\" 2>/dev/null",
-             video_path.c_str());
-    FILE* fp = popen(info_cmd, "r");
+             "-show_entries stream=width,height -of csv=p=0 \"%s\" 2>%s",
+             video_path.c_str(), SAM3_NULL_DEV);
+    FILE* fp = popen(info_cmd, SAM3_POPEN_READ);
     if (!fp) return img;
     int w = 0, h = 0;
     if (fscanf(fp, "%d,%d", &w, &h) != 2) {
@@ -12312,7 +12316,7 @@ sam3_image sam3_decode_video_frame(const std::string& video_path, int frame_inde
     img.channels = 3;
     img.data.resize(w * h * 3);
 
-    fp = popen(cmd, "r");
+    fp = popen(cmd, SAM3_POPEN_READ);
     if (!fp) {
         img.data.clear();
         return img;
@@ -12333,9 +12337,9 @@ sam3_video_info sam3_get_video_info(const std::string& video_path) {
     snprintf(cmd, sizeof(cmd),
              "ffprobe -v error -select_streams v:0 "
              "-show_entries stream=width,height,r_frame_rate,nb_frames "
-             "-of csv=p=0 \"%s\" 2>/dev/null",
-             video_path.c_str());
-    FILE* fp = popen(cmd, "r");
+             "-of csv=p=0 \"%s\" 2>%s",
+             video_path.c_str(), SAM3_NULL_DEV);
+    FILE* fp = popen(cmd, SAM3_POPEN_READ);
     if (!fp) return info;
 
     int w = 0, h = 0, num = 0, den = 1, nf = 0;

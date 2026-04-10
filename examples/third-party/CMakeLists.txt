@@ -1,5 +1,23 @@
-# ImGui library with SDL2 + OpenGL3 backend
-set(IMGUI_DIR ${CMAKE_CURRENT_SOURCE_DIR}/imgui)
+# ImGui library with SDL2 + OpenGL3 backend.
+#
+# ImGui is not vendored. Prefer a local checkout at examples/third-party/imgui
+# (useful for offline builds); otherwise fetch it at configure time via
+# FetchContent, pinned to a known-good tag.
+if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/imgui/imgui.cpp")
+    set(IMGUI_DIR ${CMAKE_CURRENT_SOURCE_DIR}/imgui)
+    message(STATUS "Using local ImGui checkout at ${IMGUI_DIR}")
+else()
+    include(FetchContent)
+    FetchContent_Declare(
+        imgui
+        GIT_REPOSITORY https://github.com/ocornut/imgui.git
+        GIT_TAG        v1.91.8
+        GIT_SHALLOW    TRUE
+    )
+    FetchContent_MakeAvailable(imgui)
+    set(IMGUI_DIR ${imgui_SOURCE_DIR})
+    message(STATUS "Fetched ImGui v1.91.8 into ${IMGUI_DIR}")
+endif()
 
 add_library(imgui-sdl2 STATIC
     ${IMGUI_DIR}/imgui.cpp
@@ -26,8 +44,9 @@ else()
     target_link_libraries(imgui-sdl2 PUBLIC OpenGL::GL)
 endif()
 
+# On non-Apple, leave IMGUI_IMPL_OPENGL_LOADER_* undefined so imgui uses its
+# bundled imgl3w loader (required for GL 3+ on MSVC where opengl32.lib only
+# exports GL 1.1 symbols).
 if(APPLE)
     target_compile_definitions(imgui-sdl2 PUBLIC GL_SILENCE_DEPRECATION)
-else()
-    target_compile_definitions(imgui-sdl2 PUBLIC IMGUI_IMPL_OPENGL_LOADER_CUSTOM)
 endif()

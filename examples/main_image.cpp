@@ -14,19 +14,13 @@
 
 #include "sam3.h"
 
+#define SDL_MAIN_HANDLED
 #include <SDL.h>
+#include <SDL_opengl.h>
+
 #include <imgui.h>
 #include <imgui_impl_sdl2.h>
 #include <imgui_impl_opengl3.h>
-
-#ifdef __APPLE__
-#ifndef GL_SILENCE_DEPRECATION
-#define GL_SILENCE_DEPRECATION
-#endif
-#include <OpenGL/gl3.h>
-#else
-#include <GL/gl.h>
-#endif
 
 #include <algorithm>
 #include <cmath>

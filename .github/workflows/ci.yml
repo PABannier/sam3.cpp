@@ -30,7 +30,7 @@ jobs:
 
           - name: Windows (MSVC)
             os: windows-latest
-            cmake_args: "-DGGML_METAL=OFF -DSAM3_METAL=OFF -A x64"
+            cmake_args: "-DGGML_METAL=OFF -DSAM3_METAL=OFF -A x64 -DCMAKE_TOOLCHAIN_FILE=C:/vcpkg/scripts/buildsystems/vcpkg.cmake -DVCPKG_TARGET_TRIPLET=x64-windows"
             build_args: "--config Release"
 
     steps:
@@ -46,6 +46,11 @@ jobs:
       - name: Install Ninja (macOS)
         if: runner.os == 'macOS'
         run: brew install ninja
+
+      - name: Install SDL2 (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: vcpkg install sdl2:x64-windows
 
       - name: ccache
         uses: hendrikmuhs/ccache-action@v1
@@ -64,7 +69,7 @@ jobs:
       - name: Build
         run: cmake --build build ${{ matrix.build_args }} --parallel
 
-      - name: Verify library
+      - name: Verify build artifacts
         shell: bash
         run: |
           if [ -f build/libsam3.a ]; then
@@ -76,4 +81,15 @@ jobs:
           else
             echo "ERROR: sam3 library not found"
             exit 1
+          fi
+
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            for exe in sam3_image.exe sam3_video.exe; do
+              if [ -f "build/examples/Release/$exe" ]; then
+                echo "Found build/examples/Release/$exe"
+              else
+                echo "ERROR: $exe not built (GUI examples were silently skipped — likely SDL2 not found)"
+                exit 1
+              fi
+            done
           fi
