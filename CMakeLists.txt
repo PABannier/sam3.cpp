@@ -38,3 +38,20 @@ option(SAM3_BUILD_TESTS "Build test executables" OFF)
 if(SAM3_BUILD_TESTS)
     add_subdirectory(tests)
 endif()
+
+# install
+include(GNUInstallDirs)
+
+install(TARGETS sam3
+    ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
+    LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
+)
+install(FILES sam3.h DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
+
+configure_file(
+    ${CMAKE_CURRENT_SOURCE_DIR}/sam3.pc.in
+    ${CMAKE_CURRENT_BINARY_DIR}/sam3.pc
+    @ONLY
+)
+install(FILES ${CMAKE_CURRENT_BINARY_DIR}/sam3.pc
+    DESTINATION ${CMAKE_INSTALL_LIBDIR}/pkgconfig)
