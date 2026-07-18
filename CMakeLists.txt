@@ -16,6 +16,13 @@ if(APPLE AND SAM3_METAL)
     set(GGML_METAL_EMBED_LIBRARY ON CACHE BOOL "" FORCE)
 endif()
 
+# Check if CUDA should be enabled
+option(SAM3_CUDA "Enable CUDA backend" OFF)
+# ggml options — enable CUDA
+if(SAM3_CUDA)
+    set(GGML_CUDA ON CACHE BOOL "" FORCE)
+endif()
+
 add_subdirectory(ggml)
 
 # sam3 static library

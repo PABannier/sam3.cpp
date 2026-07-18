@@ -2,7 +2,7 @@
 
 ## Project
 
-sam3.cpp — a C++14 port of Meta's SAM 3 (Segment Anything Model 3) using ggml for inference on CPU and Metal.
+sam3.cpp — a C++14 port of Meta's SAM 3 (Segment Anything Model 3) using ggml for inference on CPU, Metal, and CUDA.
 
 ## Architecture
 

@@ -175,7 +175,8 @@ All models are available in GGML format on Hugging Face:
 | Video tracking (memory bank) | Yes | Yes | Yes | Yes |
 | Interactive refinement | Yes | Yes | Yes | Yes |
 | Quantization (Q4/Q8) | Yes | Yes | Yes | Yes |
-| Metal GPU | Yes | Yes | Yes | Yes |
+| Metal GPU (macOS) | Yes | Yes | Yes | Yes |
+| CUDA GPU (NVIDIA) | Yes | Yes | Yes | Yes |
 
 ## Building from Source
 
@@ -201,6 +202,28 @@ Metal is enabled automatically on macOS. To disable it:
 ```bash
 cmake .. -DSAM3_METAL=OFF
 ```
+
+**CUDA support must be explicitly enabled** with the `-DSAM3_CUDA=ON` flag:
+
+```bash
+cmake .. -DSAM3_CUDA=ON
+make -j
+```
+
+**Prerequisites for CUDA:**
+- NVIDIA GPU with CUDA support (Compute Capability 7.5+)
+- NVIDIA CUDA Toolkit installed (version 11.0+)
+- The `nvcc` compiler must be in your PATH
+- Up-to-date NVIDIA drivers
+
+Check that CUDA is properly configured:
+```bash
+which nvcc      # Should show the path to nvcc
+nvcc --version  # Should show CUDA version
+nvidia-smi      # Should show your GPU
+```
+
+When both CUDA and Metal backends are available, CUDA takes priority.
 
 To build tests:
 

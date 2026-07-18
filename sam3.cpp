@@ -12,6 +12,10 @@
 #include "ggml-metal.h"
 #endif
 
+#ifdef GGML_USE_CUDA
+#include "ggml-cuda.h"
+#endif
+
 /* stb (implementation compiled here -- order is pinned) */
 #define STB_IMAGE_IMPLEMENTATION
 #include "stb_image.h"
@@ -3276,8 +3280,14 @@ std::shared_ptr<sam3_model> sam3_load_model(const sam3_params& params) {
     }
 
     // ── Init backend ─────────────────────────────────────────────────────
-#ifdef GGML_USE_METAL
+#ifdef GGML_USE_CUDA
     if (params.use_gpu) {
+        fprintf(stderr, "%s: using CUDA backend\n", __func__);
+        model->backend = ggml_backend_cuda_init(0); // device 0
+    }
+#endif
+#ifdef GGML_USE_METAL
+    if (!model->backend && params.use_gpu) {
         fprintf(stderr, "%s: using Metal backend\n", __func__);
         model->backend = ggml_backend_metal_init();
     }
@@ -3707,6 +3717,65 @@ static struct ggml_tensor* sam3_apply_rope(struct ggml_context* ctx,
     // Interleave back: [2, half, N, nheads_B]
     auto* out = ggml_concat(ctx, out_re, out_im, 0);
     return ggml_reshape_3d(ctx, ggml_cont(ctx, out), head_dim, N, nheads_B);
+}
+
+// Helper: flash attention with fallback to manual SDPA for unsupported dimensions
+// CUDA flash attention only supports: 40, 64, 72, 80, 96, 112, 128, 192, 256, 320, 512, 576
+// Many SAM3 components use HD=32 which requires manual SDPA fallback
+static struct ggml_tensor* sam3_flash_attn_with_fallback(
+    struct ggml_context* ctx,
+    struct ggml_tensor* Q,      // [HD, N_q, NH, B]
+    struct ggml_tensor* K,      // [HD, N_kv, NH, B]
+    struct ggml_tensor* V,      // [HD, N_kv, NH, B] (can be non-contiguous)
+    struct ggml_tensor* mask,   // optional mask for flash_attn_ext
+    float scale,
+    int64_t HD,                 // head dimension
+    int64_t n_heads) {
+    // Check if flash attention is supported for this configuration
+    const bool use_flash_attn = (HD == 40 || HD == 64 || HD == 72 || HD == 80 ||
+                                  HD == 96 || HD == 112 || HD == 128 || HD == 192 ||
+                                  HD == 256 || HD == 320 || HD == 512 || HD == 576);
+
+    if (use_flash_attn) {
+        return ggml_flash_attn_ext(ctx, Q, K, V, mask, scale, 0.0f, 0.0f);
+    } else {
+        // Manual SDPA for unsupported dimensions (e.g., HD=32)
+        const int64_t N_q = Q->ne[1];
+        const int64_t N_kv = K->ne[1];
+        const int64_t B = Q->ne[3];
+
+        // Ensure tensors are contiguous before reshaping
+        Q = ggml_cont(ctx, Q);
+        K = ggml_cont(ctx, K);
+        V = ggml_cont(ctx, V);
+
+        auto* Q3 = ggml_reshape_3d(ctx, Q, HD, N_q, n_heads * B);
+        auto* K3 = ggml_reshape_3d(ctx, K, HD, N_kv, n_heads * B);
+        auto* V3 = ggml_reshape_3d(ctx, V, HD, N_kv, n_heads * B);
+
+        // QK^T: ggml_mul_mat(K, Q) → K^T @ Q → [N_kv, N_q, NH*B]
+        auto* attn_scores = ggml_mul_mat(ctx, K3, Q3);
+
+        // Apply mask and scale in one step if mask provided
+        if (mask) {
+            // For masked attention, use soft_max_ext which handles scale and mask together
+            attn_scores = ggml_soft_max_ext(ctx, attn_scores, mask, scale, 0.0f);
+        } else {
+            attn_scores = ggml_scale(ctx, attn_scores, scale);
+            attn_scores = ggml_soft_max(ctx, attn_scores);
+        }
+
+        // attn @ V: transpose V then multiply
+        auto* VT = ggml_permute(ctx, V3, 1, 0, 2, 3);  // [N_kv, HD, NH*B]
+        VT = ggml_cont(ctx, VT);
+        auto* out3 = ggml_mul_mat(ctx, VT, attn_scores);  // [HD, N_q, NH*B]
+
+        // Reshape back to 4D and permute to match flash_attn_ext output
+        auto* out = ggml_reshape_4d(ctx, out3, HD, N_q, n_heads, B);
+        out = ggml_cont(ctx, ggml_permute(ctx, out, 0, 2, 1, 3));  // [HD, NH, N_q, B]
+
+        return out;
+    }
 }
 
 // Single ViT block forward: pre-norm → attn (window or global, with RoPE) → residual → pre-norm → MLP → residual
@@ -4396,7 +4465,7 @@ static struct ggml_tensor* sam2_hiera_block_forward(struct ggml_context* ctx,
     V = ggml_permute(ctx, V, 0, 2, 1, 3);  // non-contiguous OK for flash_attn
 
     float scale = 1.0f / sqrtf((float)head_dim);
-    auto* attn_out = ggml_flash_attn_ext(ctx, Q, K, V, nullptr, scale, 0, 0);
+    auto* attn_out = sam3_flash_attn_with_fallback(ctx, Q, K, V, nullptr, scale, head_dim, NH);
 
     // Recombine: flash_attn output is [HD, N_q, NH, B_win]
     // → reshape to [C_out, N_q, B_win]
@@ -5519,7 +5588,7 @@ static struct ggml_tensor* edgetam_perceiver_layer_forward(
         k = ggml_reshape_4d(ctx, k, D, N_lat, 1, batch);
         v = ggml_reshape_4d(ctx, v, D, N_lat, 1, batch);
 
-        auto* attn = ggml_flash_attn_ext(ctx, q, k, v, nullptr, scale, 0.0f, 0.0f);
+        auto* attn = sam3_flash_attn_with_fallback(ctx, q, k, v, nullptr, scale, D, 1);
         attn = ggml_reshape_3d(ctx, attn, D, N_lat, batch);
 
         auto* sa_out = ggml_mul_mat(ctx, layer.sa_out_w, attn);
@@ -6821,7 +6890,7 @@ static struct ggml_tensor * sam3_build_vit_attn_core_from_qkv(struct ggml_contex
     K = ggml_reshape_4d(ctx, K, HD, W_cur * H_cur, NH, B_cur);
 
     const float scale = 1.0f / sqrtf((float) HD);
-    struct ggml_tensor * attn_out = ggml_flash_attn_ext(ctx, Q, K, V, nullptr, scale, 0.0f, 0.0f);
+    struct ggml_tensor * attn_out = sam3_flash_attn_with_fallback(ctx, Q, K, V, nullptr, scale, HD, NH);
 
     return ggml_cont(ctx, ggml_reshape_4d(ctx, attn_out, E, W_cur, H_cur, B_cur));
 }
@@ -7538,7 +7607,7 @@ static struct ggml_tensor* sam3_multihead_attn_fused(
     V = ggml_permute(ctx, V, 0, 2, 1, 3);  // [HD, N_kv, NH, B] non-contiguous; flash_attn uses strides
 
     float scale = 1.0f / sqrtf((float)HD);
-    auto* attn_out = ggml_flash_attn_ext(ctx, Q, K, V, attn_mask, scale, 0.0f, 0.0f);
+    auto* attn_out = sam3_flash_attn_with_fallback(ctx, Q, K, V, attn_mask, scale, HD, n_heads);
 
     auto* merged = ggml_reshape_3d(ctx, attn_out, D, N_q, B);
     merged = ggml_mul_mat(ctx, out_proj_w, merged);
@@ -7721,7 +7790,7 @@ static sam3_geom_result sam3_build_geom_enc_graph(
             V = ggml_permute(ctx, V, 0, 2, 1, 3);
 
             float scale = 1.0f / sqrtf((float)HD);
-            auto* sa_out = ggml_flash_attn_ext(ctx, Q, K, V, nullptr, scale, 0.0f, 0.0f);
+            auto* sa_out = sam3_flash_attn_with_fallback(ctx, Q, K, V, nullptr, scale, HD, n_heads);
             sa_out = ggml_reshape_3d(ctx, sa_out, D, S, 1);
 
             sa_out = ggml_mul_mat(ctx, ly.sa_out_proj_w, sa_out);
@@ -7763,7 +7832,7 @@ static sam3_geom_result sam3_build_geom_enc_graph(
             V = ggml_permute(ctx, V, 0, 2, 1, 3);
 
             float scale = 1.0f / sqrtf((float)HD);
-            auto* ca_out = ggml_flash_attn_ext(ctx, Q, K, V, nullptr, scale, 0.0f, 0.0f);
+            auto* ca_out = sam3_flash_attn_with_fallback(ctx, Q, K, V, nullptr, scale, HD, n_heads);
             ca_out = ggml_reshape_3d(ctx, ca_out, D, S_q, 1);
 
             ca_out = ggml_mul_mat(ctx, ly.ca_out_w, ca_out);
@@ -8071,7 +8140,7 @@ static struct ggml_tensor* sam3_fenc_layer_forward(
         V = ggml_permute(ctx, V, 0, 2, 1, 3);
 
         float scale = 1.0f / sqrtf((float)HD);
-        auto* sa_out = ggml_flash_attn_ext(ctx, Q, K, V, nullptr, scale, 0.0f, 0.0f);
+        auto* sa_out = sam3_flash_attn_with_fallback(ctx, Q, K, V, nullptr, scale, HD, n_heads);
         sa_out = ggml_reshape_3d(ctx, sa_out, D, N, B);
 
         sa_out = ggml_mul_mat(ctx, ly.sa_out_proj_w, sa_out);
@@ -8113,7 +8182,7 @@ static struct ggml_tensor* sam3_fenc_layer_forward(
 
         auto* ca_mask = sam3_expand_token_attn_bias(ctx, prompt_attn_bias, N_q, n_heads, B);
         float scale = 1.0f / sqrtf((float)HD);
-        auto* ca_out = ggml_flash_attn_ext(ctx, Q, K, V, ca_mask, scale, 0.0f, 0.0f);
+        auto* ca_out = sam3_flash_attn_with_fallback(ctx, Q, K, V, ca_mask, scale, HD, n_heads);
         ca_out = ggml_reshape_3d(ctx, ca_out, D, N_q, B);
 
         ca_out = ggml_mul_mat(ctx, ly.ca_out_w, ca_out);
@@ -8489,7 +8558,7 @@ static struct ggml_tensor* sam3_ddec_layer_forward(
         V = ggml_permute(ctx, V, 0, 2, 1, 3);
 
         float scale = 1.0f / sqrtf((float)HD);
-        auto* sa_out = ggml_flash_attn_ext(ctx, Q, K, V, nullptr, scale, 0.0f, 0.0f);
+        auto* sa_out = sam3_flash_attn_with_fallback(ctx, Q, K, V, nullptr, scale, HD, n_heads);
         sa_out = ggml_reshape_3d(ctx, sa_out, D, N, B);
         sa_out = ggml_mul_mat(ctx, ly.sa_out_proj_w, sa_out);
         sa_out = ggml_add(ctx, sa_out, ly.sa_out_proj_b);
@@ -8532,7 +8601,7 @@ static struct ggml_tensor* sam3_ddec_layer_forward(
 
         auto* text_mask = sam3_expand_token_attn_bias(ctx, text_attn_bias, N_q, n_heads, B);
         float scale = 1.0f / sqrtf((float)HD);
-        auto* ca_out = ggml_flash_attn_ext(ctx, Q, K, V, text_mask, scale, 0.0f, 0.0f);
+        auto* ca_out = sam3_flash_attn_with_fallback(ctx, Q, K, V, text_mask, scale, HD, n_heads);
         ca_out = ggml_reshape_3d(ctx, ca_out, D, N_q, B);
         ca_out = ggml_mul_mat(ctx, ly.ca_text_out_w, ca_out);
         ca_out = ggml_add(ctx, ca_out, ly.ca_text_out_b);
@@ -8588,7 +8657,7 @@ static struct ggml_tensor* sam3_ddec_layer_forward(
             ca_out = ggml_mul_mat(ctx, v_t, kq);                 // [HD, N_q, NH, B]
             ca_out = ggml_cont(ctx, ggml_permute(ctx, ca_out, 0, 2, 1, 3));
         } else {
-            ca_out = ggml_flash_attn_ext(ctx, Q, K, V, nullptr, scale, 0.0f, 0.0f);
+            ca_out = sam3_flash_attn_with_fallback(ctx, Q, K, V, nullptr, scale, HD, n_heads);
         }
 
         ca_out = ggml_reshape_3d(ctx, ca_out, D, N_q, B);
@@ -8672,26 +8741,56 @@ static struct ggml_tensor* sam3_dot_product_scoring(
         auto* tp = ggml_cont(ctx, ggml_permute(ctx, text_mlp, 1, 0, 2, 3));  // [T, D, B]
         // Mask: text_valid_mask is [T, 1, B] — broadcast multiply zeros out padding
         tp = ggml_mul(ctx, tp, text_valid_mask);  // [T, D, B] with padding zeroed
-        // Sum over T dimension: pool_1d with SUM kernel=T
-        // ggml_pool_1d AVG divides by T; we want SUM then divide by n_valid.
-        // Use AVG and then scale by T/n_valid? Or use a manual approach.
-        // Simpler: sum via pool_1d with AVG, then scale by T/n_valid.
-        // But n_valid is dynamic. Instead: sum = mean * T, then divide by n_valid.
-        // We pass n_valid as part of the mask: text_valid_mask sums to n_valid.
-        // pool_1d(masked, AVG, T, T, 0) = sum(masked) / T. Multiply by T → sum(masked).
-        // Then divide by n_valid. But n_valid is a scalar we know CPU-side.
-        // For simplicity: compute AVG over ALL T positions (with padding zeroed out).
-        // This gives sum(valid) / T. To get sum(valid) / n_valid, scale by T / n_valid.
-        // We embed the scale factor into the mask: mask = (T / n_valid) for valid, 0 for pad.
-        // Then AVG(mask * features) = sum(valid * T/n_valid) / T = sum(valid) / n_valid. ✓
-        // Caller should set mask values to T/n_valid for valid tokens, 0 for padding.
-        auto* pooled_t = ggml_pool_1d(ctx, tp, GGML_OP_POOL_AVG, (int)T, (int)T, 0);
-        text_pooled = ggml_cont(ctx, ggml_permute(ctx, pooled_t, 1, 0, 2, 3));  // [D, 1, B]
+
+        // Mean pooling without ggml_pool_1d (not supported on CUDA)
+        // Reshape to [D, T*B] then use mul_mat with ones vector to sum over T
+        // Then divide by T to get mean
+        auto* tp_flat = ggml_reshape_2d(ctx, tp, D, T * B);  // [D, T*B]
+
+        // Create a ones vector [T*B, 1] and multiply to sum over second dim
+        // Actually simpler: use ggml_sum_rows which sums over rows
+        // But we need to average. Let's use a scale factor instead.
+        // Reshape back and use ggml_mean if available, or manual approach
+
+        // Manual mean: reshape to [D*B, T], sum each row, divide by T
+        auto* reshaped = ggml_reshape_3d(ctx, tp, T, D, B);  // [T, D, B]
+        reshaped = ggml_cont(ctx, ggml_permute(ctx, reshaped, 1, 0, 2, 3));  // [D, T, B]
+
+        // Sum over dimension 1 (T) then divide: create [D, 1, B]
+        // Use sum_rows which sums dim1, but result needs proper shape
+        // Actually use ggml_view to extract each position and sum manually
+        // Simpler: average by scaling after summing
+        struct ggml_tensor* text_pooled_temp = nullptr;
+        for (int t = 0; t < (int)T; ++t) {
+            auto* slice = ggml_view_3d(ctx, reshaped, D, 1, B,
+                                       reshaped->nb[1], reshaped->nb[2],
+                                       t * reshaped->nb[1]);
+            if (text_pooled_temp == nullptr) {
+                text_pooled_temp = ggml_cont(ctx, slice);
+            } else {
+                text_pooled_temp = ggml_add(ctx, text_pooled_temp, slice);
+            }
+        }
+        text_pooled_temp = ggml_scale(ctx, text_pooled_temp, 1.0f / (float)T);
+        text_pooled = text_pooled_temp;  // [D, 1, B]
     } else {
-        // All tokens valid — simple mean
-        auto* tp = ggml_cont(ctx, ggml_permute(ctx, text_mlp, 1, 0, 2, 3));
-        auto* pooled_t = ggml_pool_1d(ctx, tp, GGML_OP_POOL_AVG, (int)T, (int)T, 0);
-        text_pooled = ggml_cont(ctx, ggml_permute(ctx, pooled_t, 1, 0, 2, 3));
+        // All tokens valid — simple mean using same approach
+        auto* tp = ggml_cont(ctx, ggml_permute(ctx, text_mlp, 1, 0, 2, 3));  // [T, D, B]
+        auto* reshaped = ggml_cont(ctx, ggml_permute(ctx, tp, 1, 0, 2, 3));  // [D, T, B]
+
+        struct ggml_tensor* text_pooled_temp = nullptr;
+        for (int t = 0; t < (int)T; ++t) {
+            auto* slice = ggml_view_3d(ctx, reshaped, D, 1, B,
+                                       reshaped->nb[1], reshaped->nb[2],
+                                       t * reshaped->nb[1]);
+            if (text_pooled_temp == nullptr) {
+                text_pooled_temp = ggml_cont(ctx, slice);
+            } else {
+                text_pooled_temp = ggml_add(ctx, text_pooled_temp, slice);
+            }
+        }
+        text_pooled_temp = ggml_scale(ctx, text_pooled_temp, 1.0f / (float)T);
+        text_pooled = text_pooled_temp;  // [D, 1, B]
     }
     ggml_set_name(text_pooled, "scoring_pooled");
 
@@ -9268,7 +9367,7 @@ static struct ggml_tensor* sam3_build_mem_attn_graph(
             v = ggml_permute(ctx, v, 0, 2, 1, 3);
 
             float scale = 1.0f / sqrtf((float)D);
-            auto* sa_out = ggml_flash_attn_ext(ctx, q, k, v, nullptr, scale, 0.0f, 0.0f);
+            auto* sa_out = sam3_flash_attn_with_fallback(ctx, q, k, v, nullptr, scale, D, 1);
             sa_out = ggml_reshape_3d(ctx, sa_out, D, N, 1);
             sa_out = ggml_add(ctx, ggml_mul_mat(ctx, ly.sa_out_w, sa_out), ly.sa_out_b);
             x = ggml_add(ctx, x, sa_out);
@@ -9313,7 +9412,7 @@ static struct ggml_tensor* sam3_build_mem_attn_graph(
             v = ggml_permute(ctx, v, 0, 2, 1, 3);
 
             float scale = 1.0f / sqrtf((float)D);
-            auto* ca_out = ggml_flash_attn_ext(ctx, q, k, v, nullptr, scale, 0.0f, 0.0f);
+            auto* ca_out = sam3_flash_attn_with_fallback(ctx, q, k, v, nullptr, scale, D, 1);
             ca_out = ggml_reshape_3d(ctx, ca_out, D, N, 1);
             ca_out = ggml_add(ctx, ggml_mul_mat(ctx, ly.ca_out_w, ca_out), ly.ca_out_b);
             x = ggml_add(ctx, x, ca_out);
@@ -9670,6 +9769,7 @@ sam3_result sam3_segment_pcs(sam3_state& state,
                 __func__, model.hparams.is_sam2() ? "SAM2" : "visual-only");
         return sam3_result{};
     }
+
 
 #if SAM3_LOG_LEVEL >= 1
     auto t_start = std::chrono::high_resolution_clock::now();
@@ -10205,45 +10305,10 @@ static struct ggml_tensor* sam3_sam_attention(
     V = ggml_reshape_4d(ctx, V, HD, n_heads, N_kv, B);
     V = ggml_cont(ctx, ggml_permute(ctx, V, 0, 2, 1, 3));  // [HD, N_kv, NH, B] contiguous
 
-    // Attention
+    // Attention with automatic fallback for unsupported dimensions
     float scale = 1.0f / sqrtf((float)HD);
-    auto* out = ggml_flash_attn_ext(ctx, Q, K, V, nullptr, scale, 0.0f, 0.0f);
-    // out: [HD, NH, N_q, B] (flash_attn_ext swaps dims 1,2 vs input)
-
-#if 0  // Manual SDPA (for debugging only)
-    auto* Q3 = ggml_reshape_3d(ctx, Q, HD, N_q, n_heads * B);
-    auto* K3 = ggml_reshape_3d(ctx, K, HD, N_kv, n_heads * B);
-    auto* V3 = ggml_reshape_3d(ctx, V, HD, N_kv, n_heads * B);
-    // QK^T: ggml_mul_mat(K, Q) → K^T @ Q → [N_kv, N_q, NH*B]
-    auto* attn_scores = ggml_mul_mat(ctx, K3, Q3);
-    attn_scores = ggml_scale(ctx, attn_scores, scale);
-    attn_scores = ggml_soft_max(ctx, attn_scores);
-
-    // attn @ V: need attn^T [N_q, N_kv] and V^T [HD, N_kv]
-    // ggml_mul_mat(attn^T, V) = (attn^T)^T @ V = attn @ V = [N_q, HD]... no.
-    // ggml_mul_mat(A, B) = A^T @ B where A=[K, M], B=[K, N] → [M, N]
-    // Want: output[q, d] = sum_k attn[q, k] * V[k, d]
-    // = (V^T @ attn^T)^T... let me think differently.
-    // attn_scores is [N_kv, N_q, NH*B]. For each head:
-    //   attn[k, q] = attn_scores[k, q]  (col q has the weights for query q)
-    // V3 is [HD, N_kv, NH*B].
-    // Want: out[d, q] = sum_k V[d, k] * attn[k, q] = V @ attn
-    // = ggml_mul_mat? mul_mat(A, B) = A^T B with A=[K, M], B=[K, N] → [M, N]
-    // V has ne=[HD, N_kv, ...]. attn has ne=[N_kv, N_q, ...].
-    // If A=V3 (ne0=HD, ne1=N_kv) and B=attn_scores (ne0=N_kv, ne1=N_q):
-    // Shared dim ne0: V3 ne0=HD ≠ attn ne0=N_kv. Mismatch!
-    //
-    // Need to transpose V: V^T is [N_kv, HD]. Then A=V^T, B=attn_scores.
-    // A ne0=N_kv, B ne0=N_kv → shared. A^T B = V @ attn → [HD, N_q]. ✓
-    auto* VT = ggml_permute(ctx, V3, 1, 0, 2, 3);  // [N_kv, HD, NH*B]
-    VT = ggml_cont(ctx, VT);
-    auto* out3 = ggml_mul_mat(ctx, VT, attn_scores);  // [HD, N_q, NH*B]
-
-    // Reshape back to 4D: [HD, N_q, NH, B]
-    auto* out = ggml_reshape_4d(ctx, out3, HD, N_q, n_heads, B);
-    // Permute to [HD, NH, N_q, B] to match flash_attn_ext output convention
-    out = ggml_cont(ctx, ggml_permute(ctx, out, 0, 2, 1, 3));
-#endif
+    auto* out = sam3_flash_attn_with_fallback(ctx, Q, K, V, nullptr, scale, HD, n_heads);
+    // out: [HD, NH, N_q, B]
 
     // Merge heads: [ID=HD*NH, N_q, B]
     auto* merged = ggml_reshape_3d(ctx, out, ID, N_q, B);
