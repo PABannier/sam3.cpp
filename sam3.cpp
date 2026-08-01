@@ -3709,13 +3709,77 @@ static struct ggml_tensor* sam3_apply_rope(struct ggml_context* ctx,
     return ggml_reshape_3d(ctx, ggml_cont(ctx, out), head_dim, N, nheads_B);
 }
 
+// Fused 2D-axial RoPE using ggml's GGML_ROPE_TYPE_VISION kernel — a single
+// fused op replacing the ~8-primitive complex-multiply path in
+// sam3_apply_rope (measured ~26x faster per call on Metal).
+//
+// Convention bridge. The model stores freqs_cis as consecutive interleaved
+// (real,imag) pairs: head_dim element 2c is the real part of complex pair c
+// and 2c+1 the imag part, with pair c rotated by the axial frequency for its
+// spatial position (compute_axial_cis: pairs 0..15 use the X axis, 16..31 the
+// Y axis, freq = base^(-c/16)). ggml's vision kernel instead pairs head_dim
+// elements (c, c+n_dims) (split-half) and computes the very same axial
+// frequencies internally from theta_base + integer positions with
+// n_dims = head_dim/2 and sections {n_dims/2, n_dims/2, 0, 0} (X freqs on
+// pairs 0..15 via position block 0, Y freqs on 16..31 via block 1). We bridge
+// the interleaved↔split-half difference by reordering head_dim once before the
+// kernel so that new[c]=old[2c] (real) and new[c+n_dims]=old[2c+1] (imag);
+// the kernel then applies the identical rotation to the identical (real,imag)
+// pair with the identical frequency, so the per-pair result matches
+// sam3_apply_rope exactly (up to f32 rounding).
+//
+// We intentionally do NOT undo the head_dim reorder afterwards. RoPE is applied
+// to Q and K only; the attention score Q·Kᵀ is a head_dim dot product, which is
+// invariant under any permutation of head_dim applied consistently to both Q
+// and K, and V (hence the attention output basis) is untouched. So leaving both
+// Q and K in the reordered basis yields numerically identical attention output
+// while saving the reorder-back copy.
+//
+// freq_scale scales the integer positions to the RoPE grid: windowed blocks run
+// at the native pretrain grid (1.0), while global blocks operate on the full
+// n_img_embd grid but their stored freqs_cis interpolate positions back to the
+// pretrain grid (pretrain_grid/feat_grid = 24/72 = pretrain_image_size/image_size).
+// ggml applies theta = freq_scale·pos·base^(…), so this reproduces the stored
+// table's scale_pos exactly (verified element-wise against freqs_cis).
+//
+// x:        [head_dim, n_head, N, B] (ggml rope layout — positions vary on ne2)
+// rope_pos: I32 [4*N] axial positions (block 0 = x/col, block 1 = y/row)
+static struct ggml_tensor* sam3_apply_rope_vision(struct ggml_context* ctx,
+                                                  struct ggml_tensor* x,
+                                                  struct ggml_tensor* rope_pos,
+                                                  float freq_scale) {
+    const int64_t HD   = x->ne[0];  // head_dim, 64
+    const int64_t NH   = x->ne[1];  // heads
+    const int64_t N    = x->ne[2];  // tokens (positions)
+    const int64_t B    = x->ne[3];  // batch (or batch*windows)
+    const int64_t half = HD / 2;    // 32
+
+    // Interleaved → split-half reorder of head_dim: view head_dim as
+    // [parity=2, pair=half], transpose to [pair=half, parity=2], so the
+    // contiguous result has all real parts (even old indices) first, then all
+    // imag parts (odd old indices): new[c]=old[2c], new[c+half]=old[2c+1].
+    auto* r = ggml_reshape_3d(ctx, x, 2, half, NH * N * B);
+    r = ggml_cont(ctx, ggml_permute(ctx, r, 1, 0, 2, 3));  // [half, 2, NH*N*B]
+    r = ggml_reshape_4d(ctx, r, HD, NH, N, B);
+
+    // ggml vision RoPE: n_dims = head_dim/2, two equal axial sections.
+    int sections[4] = {(int)(half / 2), (int)(half / 2), 0, 0};
+    r = ggml_rope_multi(ctx, r, rope_pos, /*freq_factors=*/nullptr,
+                        /*n_dims=*/(int)half, sections, GGML_ROPE_TYPE_VISION,
+                        /*n_ctx_orig=*/0, /*freq_base=*/10000.0f, freq_scale,
+                        /*ext_factor=*/0.0f, /*attn_factor=*/1.0f,
+                        /*beta_fast=*/0.0f, /*beta_slow=*/0.0f);
+    return r;  // [head_dim, n_head, N, B], head_dim in split-half basis
+}
+
 // Single ViT block forward: pre-norm → attn (window or global, with RoPE) → residual → pre-norm → MLP → residual
 // x: [E, W, H, B] in ggml layout (following sam.cpp convention)
 static struct ggml_tensor* sam3_vit_block_forward(struct ggml_context* ctx,
                                                   struct ggml_tensor* x,
                                                   const sam3_vit_block& blk,
                                                   const sam3_hparams& hp,
-                                                  int block_idx) {
+                                                  int block_idx,
+                                                  struct ggml_tensor* rope_pos) {
     const int E = hp.vit_embed_dim;     // 1024
     const int NH = hp.vit_num_heads;    // 16
     const int HD = hp.vit_head_dim();   // 64
@@ -3755,24 +3819,44 @@ static struct ggml_tensor* sam3_vit_block_forward(struct ggml_context* ctx,
         auto* V = ggml_view_3d(ctx, cur, E, W_cur * H_cur, B_cur,
                                cur->nb[1], cur->nb[2], 2 * cur->nb[3]);
 
+        // [E, N, B_cur] → [HD, NH, N, B_cur] (ggml rope layout: positions on ne2).
         Q = ggml_reshape_4d(ctx, Q, HD, NH, W_cur * H_cur, B_cur);
-        Q = ggml_cont(ctx, ggml_permute(ctx, Q, 0, 2, 1, 3));
-        Q = ggml_reshape_3d(ctx, Q, HD, W_cur * H_cur, NH * B_cur);
-
         K = ggml_reshape_4d(ctx, K, HD, NH, W_cur * H_cur, B_cur);
+
+        if (blk.freqs_cis && rope_pos) {
+            // Fused vision RoPE applied in [HD, NH, N, B_cur] layout. Leaves Q/K
+            // in a reordered head_dim basis (see sam3_apply_rope_vision) — the
+            // attention output is unchanged because Q·Kᵀ is invariant to a
+            // head_dim permutation shared by Q and K.
+            //
+            // Global blocks span the full n_img_embd grid but interpolate RoPE
+            // positions back to the WS×WS pretrain grid (scale = WS/n_img_embd);
+            // windowed blocks are native (scale = 1.0).
+            const int64_t rope_side = is_global ? hp.n_img_embd() : WS;
+            const float rope_freq_scale = (float)WS / (float)rope_side;
+            Q = sam3_apply_rope_vision(ctx, Q, rope_pos, rope_freq_scale);
+            K = sam3_apply_rope_vision(ctx, K, rope_pos, rope_freq_scale);
+        }
+
+        // Permute to token-major [HD, N, NH, B_cur] for flash attention.
+        Q = ggml_cont(ctx, ggml_permute(ctx, Q, 0, 2, 1, 3));
         K = ggml_cont(ctx, ggml_permute(ctx, K, 0, 2, 1, 3));
-        K = ggml_reshape_3d(ctx, K, HD, W_cur * H_cur, NH * B_cur);
 
-        V = ggml_reshape_4d(ctx, V, HD, NH, W_cur * H_cur, B_cur);
-        V = ggml_permute(ctx, V, 0, 2, 1, 3);  // [HD, N, NH, B_cur] non-contiguous view; flash_attn uses strides
-
-        if (blk.freqs_cis) {
+        if (blk.freqs_cis && !rope_pos) {
+            // Fallback: original interleaved complex-multiply RoPE in
+            // [HD, N, NH*B_cur] layout (used only if no position tensor is
+            // supplied by the caller).
+            Q = ggml_reshape_3d(ctx, Q, HD, W_cur * H_cur, NH * B_cur);
+            K = ggml_reshape_3d(ctx, K, HD, W_cur * H_cur, NH * B_cur);
             Q = sam3_apply_rope(ctx, Q, blk.freqs_cis);
             K = sam3_apply_rope(ctx, K, blk.freqs_cis);
         }
 
         Q = ggml_reshape_4d(ctx, Q, HD, W_cur * H_cur, NH, B_cur);
         K = ggml_reshape_4d(ctx, K, HD, W_cur * H_cur, NH, B_cur);
+
+        V = ggml_reshape_4d(ctx, V, HD, NH, W_cur * H_cur, B_cur);
+        V = ggml_permute(ctx, V, 0, 2, 1, 3);  // [HD, N, NH, B_cur] non-contiguous view; flash_attn uses strides
 
         float scale = 1.0f / sqrtf((float)HD);
         auto* attn_out = ggml_flash_attn_ext(ctx, Q, K, V, nullptr, scale, 0.0f, 0.0f);
@@ -3843,9 +3927,28 @@ static struct ggml_tensor* sam3_build_vit_graph(struct ggml_context* ctx,
 
     struct ggml_tensor * x = sam3_build_vit_prefix_graph(ctx, input, model);
 
+    // Axial position tensors for the fused vision RoPE (filled after graph
+    // allocation in sam3_encode_image). Global-attention blocks span the full
+    // n_img_embd × n_img_embd token grid; windowed blocks span WS × WS. Each is
+    // an I32 [4*N] tensor: block 0 = x (column), block 1 = y (row), blocks 2/3
+    // unused (vision RoPE reads only two sections). One tensor per resolution is
+    // shared by all blocks at that resolution.
+    const int64_t n_side_g = hp.n_img_embd();
+    const int64_t n_tok_g  = n_side_g * n_side_g;
+    const int64_t n_side_w = hp.vit_window_size;
+    const int64_t n_tok_w  = n_side_w * n_side_w;
+    auto* rope_pos_global = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 4 * n_tok_g);
+    ggml_set_name(rope_pos_global, "rope_pos_global");
+    ggml_set_input(rope_pos_global);
+    auto* rope_pos_window = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 4 * n_tok_w);
+    ggml_set_name(rope_pos_window, "rope_pos_window");
+    ggml_set_input(rope_pos_window);
+
     // ── 32 transformer blocks ─────────────────────────────────────────────
     for (int i = 0; i < hp.vit_depth; ++i) {
-        x = sam3_vit_block_forward(ctx, x, model.vit.blocks[i], hp, i);
+        struct ggml_tensor* rope_pos =
+            hp.is_global_attn(i) ? rope_pos_global : rope_pos_window;
+        x = sam3_vit_block_forward(ctx, x, model.vit.blocks[i], hp, i, rope_pos);
     }
 
     // Output: [E, W, H, 1] = [1024, 72, 72, 1]
@@ -6117,6 +6220,26 @@ bool sam3_encode_image(sam3_state& state,
     SAM3_LOG(2, "%s: graph allocated, %d nodes\n", __func__, ggml_graph_n_nodes(graph));
 
     ggml_backend_tensor_set(inp, img_data.data(), 0, img_data.size() * sizeof(float));
+
+    // Fill the fused vision-RoPE axial position tensors (created in
+    // sam3_build_vit_graph). Token n at spatial (col, row) with col = n % side,
+    // row = n / side; block 0 holds x (col), block 1 holds y (row), matching
+    // sam3_compute_axial_cis (X freqs on head_dim pairs 0..15, Y on 16..31).
+    {
+        auto fill_rope_pos = [&](const char* name, int side) {
+            struct ggml_tensor* t = ggml_get_tensor(ctx0, name);
+            if (!t) return;
+            const int n = side * side;
+            std::vector<int32_t> pos(4 * n, 0);
+            for (int i = 0; i < n; ++i) {
+                pos[i]     = i % side;  // block 0: x / column
+                pos[n + i] = i / side;  // block 1: y / row
+            }
+            ggml_backend_tensor_set(t, pos.data(), 0, pos.size() * sizeof(int32_t));
+        };
+        fill_rope_pos("rope_pos_global", model.hparams.n_img_embd());
+        fill_rope_pos("rope_pos_window", model.hparams.vit_window_size);
+    }
 
     {
 #if SAM3_LOG_LEVEL >= 1
