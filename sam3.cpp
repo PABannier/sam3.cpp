@@ -3667,6 +3667,25 @@ static void sam3_get_1d_sine_pe(float* out, float pos_ind, int dim,
 // All ViT graph functions use the sam.cpp convention:
 //   ne[0] = embed_dim (E=1024), ne[1] = spatial W, ne[2] = spatial H, ne[3] = batch
 
+// Crop the per-position RoPE freqs of a global-attention block to the effective
+// grid (supports encode_img_size overrides).  freqs_cis is [2, half, N] with
+// N = grid_native^2 in row-major token order (p = w + grid*h).  Returns a strided
+// view covering the top-left grid_eff x grid_eff positions of the native grid.
+static struct ggml_tensor* sam3_crop_global_freqs(struct ggml_context* ctx,
+                                                  struct ggml_tensor* freqs,
+                                                  int64_t grid_native,
+                                                  int64_t grid_eff) {
+    if (grid_eff >= grid_native) {
+        return freqs;
+    }
+    const int64_t half = freqs->ne[1];
+    auto* fr4 = ggml_reshape_4d(ctx, freqs, 2, half, grid_native, grid_native);
+    auto* view = ggml_view_4d(ctx, fr4, 2, half, grid_eff, grid_eff,
+                              fr4->nb[0], fr4->nb[1], fr4->nb[2], fr4->nb[3]);
+    auto* cont = ggml_cont(ctx, view);
+    return ggml_reshape_3d(ctx, cont, 2, half, grid_eff * grid_eff);
+}
+
 // Apply RoPE to Q and K tensors using complex multiplication.
 // x shape: [head_dim, N, num_heads*B] in ggml layout
 // freqs_cis shape: [2, 32, N] in ggml layout — stored as (cos,sin) interleaved pairs
@@ -3720,8 +3739,7 @@ static struct ggml_tensor* sam3_apply_rope(struct ggml_context* ctx,
 }
 
 // Helper: flash attention with fallback to manual SDPA for unsupported dimensions
-// CUDA flash attention only supports: 40, 64, 72, 80, 96, 112, 128, 192, 256, 320, 512, 576
-// Many SAM3 components use HD=32 which requires manual SDPA fallback
+// CUDA flash attention only supports: 32, 40, 64, 72, 80, 96, 112, 128, 192, 256, 320, 512, 576
 static struct ggml_tensor* sam3_flash_attn_with_fallback(
     struct ggml_context* ctx,
     struct ggml_tensor* Q,      // [HD, N_q, NH, B]
@@ -3732,14 +3750,25 @@ static struct ggml_tensor* sam3_flash_attn_with_fallback(
     int64_t HD,                 // head dimension
     int64_t n_heads) {
     // Check if flash attention is supported for this configuration
-    const bool use_flash_attn = (HD == 40 || HD == 64 || HD == 72 || HD == 80 ||
+    const bool use_flash_attn = (HD == 32 || HD == 40 || HD == 64 || HD == 72 || HD == 80 ||
                                   HD == 96 || HD == 112 || HD == 128 || HD == 192 ||
                                   HD == 256 || HD == 320 || HD == 512 || HD == 576);
 
     if (use_flash_attn) {
-        return ggml_flash_attn_ext(ctx, Q, K, V, mask, scale, 0.0f, 0.0f);
+        // Backend flash attention kernels require a contiguous F16 mask shared across
+        // all heads (ne[2] == 1). Masks built by sam3_expand_token_attn_bias broadcast
+        // the same bias to every head, so a view of the first head slice is numerically
+        // identical and unlocks the fused kernel (previously all masked attention fell
+        // back to manual SDPA).
+        struct ggml_tensor* flash_mask = mask;
+        if (mask != nullptr) {
+            flash_mask = ggml_view_4d(ctx, mask, mask->ne[0], mask->ne[1], 1, mask->ne[3],
+                                      mask->nb[1], mask->nb[2], mask->nb[3], 0);
+            flash_mask = ggml_cont(ctx, flash_mask);
+        }
+        return ggml_flash_attn_ext(ctx, Q, K, V, flash_mask, scale, 0.0f, 0.0f);
     } else {
-        // Manual SDPA for unsupported dimensions (e.g., HD=32)
+        // Manual SDPA for masked attention or unsupported head dimensions
         const int64_t N_q = Q->ne[1];
         const int64_t N_kv = K->ne[1];
         const int64_t B = Q->ne[3];
@@ -3836,8 +3865,12 @@ static struct ggml_tensor* sam3_vit_block_forward(struct ggml_context* ctx,
         V = ggml_permute(ctx, V, 0, 2, 1, 3);  // [HD, N, NH, B_cur] non-contiguous view; flash_attn uses strides
 
         if (blk.freqs_cis) {
-            Q = sam3_apply_rope(ctx, Q, blk.freqs_cis);
-            K = sam3_apply_rope(ctx, K, blk.freqs_cis);
+            struct ggml_tensor* freqs = blk.freqs_cis;
+            if (is_global) {
+                freqs = sam3_crop_global_freqs(ctx, freqs, hp.n_img_embd(), x->ne[1]);
+            }
+            Q = sam3_apply_rope(ctx, Q, freqs);
+            K = sam3_apply_rope(ctx, K, freqs);
         }
 
         Q = ggml_reshape_4d(ctx, Q, HD, W_cur * H_cur, NH, B_cur);
@@ -3881,16 +3914,17 @@ static struct ggml_tensor* sam3_build_vit_prefix_graph(struct ggml_context* ctx,
                                                        const sam3_model& model) {
     const auto& hp = model.hparams;
     const int E = hp.vit_embed_dim;  // 1024
-    const int H = hp.n_img_embd();   // 72
-    const int W = hp.n_img_embd();   // 72
 
     // Patch embedding: ggml conv outputs [W, H, E, 1], permute to [E, W, H, B]
     auto* x = ggml_conv_2d_sk_p0(ctx, model.vit.patch_embed_w, input);
     x = ggml_cont(ctx, ggml_permute(ctx, x, 1, 2, 0, 3));
 
-    // pos_embed [E, 24, 24] is Hiera pretrained resolution — tile 3x3 to [E, 72, 72]
+    // pos_embed [E, 24, 24] is Hiera pretrained resolution — tile to [E, W, H]
+    // using the effective spatial grid of the conv output (supports encode_img_size override).
+    const int64_t W_eff = x->ne[1];
+    const int64_t H_eff = x->ne[2];
     auto* pos_2d = model.vit.pos_embed;
-    auto* pos_target = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, E, W, H, 1);
+    auto* pos_target = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, E, W_eff, H_eff, 1);
     auto* pos_tiled = ggml_repeat(ctx, pos_2d, pos_target);
 
     x = ggml_add(ctx, x, pos_tiled);
@@ -6220,11 +6254,12 @@ bool sam3_encode_image(sam3_state& state,
     // PEs live in a separate buffer so they survive gallocr teardown.
     {
         const int neck_dim = hp.neck_dim;  // 256
+        const int fs = sam3_eff_feat_size(state, hp);  // effective grid (encode_img_size)
         const int scale_sizes[4] = {
-            hp.n_img_embd() * 4,  // 288
-            hp.n_img_embd() * 2,  // 144
-            hp.n_img_embd(),      //  72
-            hp.n_img_embd() / 2,  //  36
+            fs * 4,  // 288 at native
+            fs * 2,  // 144 at native
+            fs,      //  72 at native
+            fs / 2,  //  36 at native
         };
 
         size_t pe_total = 0;
@@ -7500,11 +7535,12 @@ bool sam3_encode_image_from_preprocessed(sam3_state& state,
     // Compute sinusoidal PEs
     {
         const int neck_dim = hp.neck_dim;
+        const int fs = sam3_eff_feat_size(state, hp);  // effective grid (encode_img_size)
         const int scale_sizes[4] = {
-            hp.n_img_embd() * 4,
-            hp.n_img_embd() * 2,
-            hp.n_img_embd(),
-            hp.n_img_embd() / 2,
+            fs * 4,
+            fs * 2,
+            fs,
+            fs / 2,
         };
 
         if (state.pe_buf) {
@@ -8861,7 +8897,9 @@ static sam3_ddec_output sam3_build_ddec_graph(
     const int D = hp.neck_dim;            // 256
     const int NQ = hp.ddec_num_queries;   // 200
     const int B = (int)enc_feats->ne[2];  // batch (1)
-    const int feat_hw = hp.n_img_embd();  // 72
+    // Grid size of the encoded image — derive from the actual rpb_coords tensor
+    // (sized from the effective feat_size, which encode_img_size may override).
+    const int feat_hw = rpb_coords ? (int)rpb_coords->ne[0] : (int)hp.n_img_embd();
 
     // ── Initialize queries from query_embed ──────────────────────────────
     auto* content = ggml_reshape_3d(ctx, model.ddec.query_embed, D, NQ, 1);
@@ -9101,8 +9139,9 @@ static struct ggml_tensor* sam3_build_seg_head_graph(
     // enc: [D, N_spatial, B]
     ggml_set_name(enc, "seg_enc_after_ca");
 
-    // Replace lowest-res FPN feat with spatial portion of encoder output
-    const int64_t feat_hw = model.hparams.n_img_embd();  // 72
+    // Replace lowest-res FPN feat with spatial portion of encoder output.
+    // Grid size derived from the actual encoder token count (honors encode_img_size).
+    const int64_t feat_hw = (int64_t)std::sqrt((double)enc->ne[1]);
     auto* enc_spatial = ggml_reshape_4d(ctx, enc, D, feat_hw, feat_hw, B);
 #ifndef NDEBUG
     auto* enc_spatial_dbg = ggml_cont(ctx, ggml_permute(ctx, enc_spatial, 2, 0, 1, 3));
@@ -9776,10 +9815,10 @@ sam3_result sam3_segment_pcs(sam3_state& state,
 #endif
     const auto& hp = model.hparams;
     const int D = hp.neck_dim;           // 256
-    const int H = hp.n_img_embd();       // 72
+    const int H = sam3_eff_feat_size(state, hp);  // 72 at native; honors encode_img_size
     const int L = hp.text_ctx_len;       // 32
     const int NQ = hp.ddec_num_queries;  // 200
-    const int N_spatial = H * H;         // 5184
+    const int N_spatial = H * H;         // 5184 at native
     sam3_result result;
 
     // ── Check that image has been encoded ────────────────────────────────
