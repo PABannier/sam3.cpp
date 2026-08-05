@@ -130,3 +130,50 @@ target_link_libraries(test_sam2_video_debug PRIVATE sam3)
 add_executable(test_cuda_inference test_cuda_inference.cpp)
 target_link_libraries(test_cuda_inference PRIVATE sam3)
 
+install(TARGETS
+    test_load
+    test_tokenizer
+    test_vit
+    test_phase5
+    test_phase6
+    test_metal_phase6
+    test_phase3
+    test_phase4
+    test_phase7
+    test_debug_encoder
+    test_preprocess_match
+    test_jpeg_decode
+    test_geom_enc
+    test_debug_fenc
+    test_text_enc_dump
+    test_e2e_pvs
+    test_e2e_pcs
+    test_text_enc_cat
+    test_llama_pcs
+    test_pvs_point
+    test_video_2frame
+    test_video_text
+    test_metal_win
+    test_metal_vit
+    test_metal_encoder_checkpoints
+    test_metal_flash_attn_ext_block15_compare
+    test_metal_vit_upstream_compare
+    test_metal_vit_prefix_compare
+    test_metal_block0_stage_compare
+    test_metal_block_stage_compare
+    test_metal_python_ref_compare
+    test_metal_conv_dw
+    test_metal_profile
+    test_metal_overhead
+    test_v_cont_removal
+    test_metal_real_profile
+    test_metal_conv_transpose_2d_stress
+    test_metal_conv_transpose_2d
+    test_visual_only
+    test_visual_only_compare
+    test_sam2_backbone_compare
+    test_sam2_pe_cache_size
+    test_sam2_video_debug
+    test_cuda_inference
+    RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
+
