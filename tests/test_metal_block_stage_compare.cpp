@@ -1,6 +1,7 @@
 #include "sam3.h"
 #include "test_utils.h"
 
+#include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 #include <map>
