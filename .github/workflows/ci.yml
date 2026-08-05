@@ -18,19 +18,25 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - name: macOS (Clang)
+          - name: macOS (Clang, Metal)
             os: macos-latest
-            cmake_args: ""
+            cmake_args: "-DCMAKE_PREFIX_PATH=/opt/homebrew -DSAM3_BUILD_TESTS=ON"
             build_args: ""
 
-          - name: Linux (GCC)
-            os: ubuntu-latest
-            cmake_args: "-DGGML_METAL=OFF -DSAM3_METAL=OFF"
+          - name: Ubuntu 24.04 (GCC)
+            os: ubuntu-24.04
+            cmake_args: "-DGGML_METAL=OFF -DSAM3_METAL=OFF -DSAM3_BUILD_TESTS=ON"
             build_args: ""
+
+          - name: Ubuntu 24.04 (GCC + CUDA)
+            os: ubuntu-24.04
+            cmake_args: "-DGGML_METAL=OFF -DSAM3_METAL=OFF -DSAM3_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=75 -DCMAKE_CUDA_COMPILER_LAUNCHER=ccache -DSAM3_BUILD_TESTS=ON"
+            build_args: ""
+            cuda: true
 
           - name: Windows (MSVC)
             os: windows-latest
-            cmake_args: "-DGGML_METAL=OFF -DSAM3_METAL=OFF -A x64 -DCMAKE_TOOLCHAIN_FILE=C:/vcpkg/scripts/buildsystems/vcpkg.cmake -DVCPKG_TARGET_TRIPLET=x64-windows"
+            cmake_args: "-DGGML_METAL=OFF -DSAM3_METAL=OFF -DSAM3_BUILD_TESTS=ON -A x64 -DCMAKE_TOOLCHAIN_FILE=C:/vcpkg/scripts/buildsystems/vcpkg.cmake -DVCPKG_TARGET_TRIPLET=x64-windows"
             build_args: "--config Release"
 
     steps:
@@ -39,13 +45,19 @@ jobs:
         with:
           submodules: recursive
 
+      - name: Setup CUDA toolkit
+        if: matrix.cuda
+        uses: Jimver/cuda-toolkit@v0.2.21
+        with:
+          cuda: '12.8'
+
       - name: Install Ninja (Linux)
         if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y ninja-build
+        run: sudo apt-get update && sudo apt-get install -y ninja-build libsdl2-dev libgl1-mesa-dev
 
       - name: Install Ninja (macOS)
         if: runner.os == 'macOS'
-        run: brew install ninja
+        run: brew install ninja sdl2
 
       - name: Install SDL2 (Windows)
         if: runner.os == 'Windows'
@@ -55,7 +67,7 @@ jobs:
       - name: ccache
         uses: hendrikmuhs/ccache-action@v1
         with:
-          key: ci-${{ matrix.os }}
+          key: ci-${{ matrix.name }}
 
       - name: Configure
         run: >
@@ -69,27 +81,39 @@ jobs:
       - name: Build
         run: cmake --build build ${{ matrix.build_args }} --parallel
 
-      - name: Verify build artifacts
+      - name: Install and verify package tree
         shell: bash
         run: |
-          if [ -f build/libsam3.a ]; then
-            echo "Found build/libsam3.a"
-          elif [ -f build/Release/sam3.lib ]; then
-            echo "Found build/Release/sam3.lib"
-          elif [ -f build/sam3.lib ]; then
-            echo "Found build/sam3.lib"
+          PREFIX="$RUNNER_TEMP/sam3-install"
+          cmake --install build ${{ matrix.build_args }} --prefix "$PREFIX"
+
+          if [ -f "$PREFIX/lib/libsam3.a" ] || [ -f "$PREFIX/lib/sam3.lib" ]; then
+            echo "libsam3 installed OK"
           else
-            echo "ERROR: sam3 library not found"
+            echo "ERROR: sam3 library not found in install tree"
             exit 1
           fi
 
-          if [ "$RUNNER_OS" = "Windows" ]; then
-            for exe in sam3_image.exe sam3_video.exe; do
-              if [ -f "build/examples/Release/$exe" ]; then
-                echo "Found build/examples/Release/$exe"
-              else
-                echo "ERROR: $exe not built (GUI examples were silently skipped — likely SDL2 not found)"
-                exit 1
-              fi
-            done
+          if [ -f "$PREFIX/include/sam3.h" ]; then
+            echo "sam3.h installed OK"
+          else
+            echo "ERROR: sam3.h not found in install tree"
+            exit 1
           fi
+
+          if [ -f "$PREFIX/bin/sam3_image" ] || [ -f "$PREFIX/bin/sam3_image.exe" ]; then
+            echo "GUI examples installed OK"
+          else
+            echo "ERROR: sam3_image not found in install tree (SDL2 missing?)"
+            exit 1
+          fi
+
+          if [ -f "$PREFIX/bin/test_load" ] || [ -f "$PREFIX/bin/test_load.exe" ]; then
+            echo "tests installed OK"
+          else
+            echo "ERROR: test_load not found in install tree"
+            exit 1
+          fi
+
+          echo "Installed binaries:"
+          find "$PREFIX/bin" -maxdepth 1 -type f -printf "%f\n" | sort
