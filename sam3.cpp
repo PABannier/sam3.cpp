@@ -11900,9 +11900,19 @@ sam3_result sam3_track_frame(sam3_tracker& tracker, sam3_state& state,
             ml.last_seen = fi;
             auto r2 = sam3_bilinear_interpolate(p2.mask_logits.data(),
                                                 p2.mask_w, p2.mask_h, state.orig_width, state.orig_height);
+            // Store the propagated mask so pending masklets participate in
+            // sam3_match_detections on this frame (otherwise every PCS
+            // detection creates a fresh pending masklet and IDs churn every
+            // frame; after hotstart_delay they all become duplicate actives).
+            pm[id].width = state.orig_width;
+            pm[id].height = state.orig_height;
+            pm[id].data.resize(state.orig_width * state.orig_height);
             int fg2 = 0;
-            for (auto v : r2)
-                if (v > 0.0f) fg2++;
+            for (int p = 0; p < (int)r2.size(); ++p) {
+                bool f = r2[p] > 0.0f;
+                pm[id].data[p] = f ? 255 : 0;
+                if (f) fg2++;
+            }
             float c2 = (float)fg2 / (state.orig_width * state.orig_height);
             ml.mds_sum += (c2 > 0.001f && p2.obj_score > 0.0f) ? 1 : -1;
             sam3_encode_memory(tracker, state, model, id,

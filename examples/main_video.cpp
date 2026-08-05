@@ -117,6 +117,7 @@ struct vapp_state {
 
     // Tracking
     char                    text_prompt[256] = {};
+    std::string             applied_prompt;      // prompt used by the current tracker
     sam3_video_params       track_params;
     sam3_result             result;
     bool                    tracker_created = false;
@@ -231,6 +232,7 @@ static void create_tracker(vapp_state& app) {
         app.tracker = sam3_create_tracker(*app.model, app.track_params);
     }
     app.tracker_created = (app.tracker != nullptr);
+    app.applied_prompt = app.text_prompt;
     snprintf(app.status, sizeof(app.status), app.tracker_created
              ? "Tracker created. Press Play or add instances."
              : "Failed to create tracker.");
@@ -341,6 +343,29 @@ static void clear_init_prompts(vapp_state& app) {
     app.init_neg_points.clear();
     app.init_box = {0, 0, 0, 0};
     app.has_init_box = false;
+}
+
+// Full reset: stop playback, drop the tracker, re-create it from the current
+// mode/prompt, and re-encode the first frame.  Used by the Reset button and
+// whenever the text prompt changes.
+static void reset_all(vapp_state& app) {
+    app.playing = false;
+    app.tracker_created = false;
+    app.frame_encoded = false;
+    app.tracker.reset();
+    app.result = {};
+    app.frame_index = 0;
+    app.timeline.clear();
+    app.timeline_max_frame = -1;
+    clear_init_prompts(app);
+    if (app.visual_only && app.init_mode == VMODE_TEXT)
+        app.init_mode = VMODE_BOX;
+    create_tracker(app);
+    if (app.tracker_created && !app.video_path.empty()) {
+        decode_and_track(app, 0);
+    } else if (!app.video_path.empty()) {
+        app.frame = sam3_decode_video_frame(app.video_path, 0);
+    }
 }
 
 static void export_frame_masks(const vapp_state& app) {
@@ -609,6 +634,14 @@ int main(int argc, char** argv) {
             ImGui::SameLine();
             ImGui::SetNextItemWidth(200);
             ImGui::InputText("##prompt", app.text_prompt, sizeof(app.text_prompt));
+            // Re-apply the tracker once the user finishes editing, so the new
+            // prompt takes effect without having to press Reset manually.
+            if (ImGui::IsItemDeactivatedAfterEdit() &&
+                app.tracker_created && app.applied_prompt != app.text_prompt) {
+                reset_all(app);
+                snprintf(app.status, sizeof(app.status), "Prompt changed to \"%s\". Tracker re-created.",
+                         app.text_prompt);
+            }
         }
 
         // Playback buttons
@@ -629,24 +662,7 @@ int main(int argc, char** argv) {
         }
         ImGui::SameLine();
         if (ImGui::Button("Reset")) {
-            app.playing = false;
-            app.tracker_created = false;
-            app.frame_encoded = false;
-            app.tracker.reset();
-            app.result = {};
-            app.frame_index = 0;
-            app.timeline.clear();
-            app.timeline_max_frame = -1;
-            clear_init_prompts(app);
-            if (app.visual_only && app.init_mode == VMODE_TEXT)
-                app.init_mode = VMODE_BOX;
-            // Re-create tracker and encode first frame
-            create_tracker(app);
-            if (app.tracker_created && !app.video_path.empty()) {
-                decode_and_track(app, 0);
-            } else if (!app.video_path.empty()) {
-                app.frame = sam3_decode_video_frame(app.video_path, 0);
-            }
+            reset_all(app);
             snprintf(app.status, sizeof(app.status), "Reset. Ready to annotate.");
         }
 
