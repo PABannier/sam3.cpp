@@ -53,15 +53,15 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           submodules: recursive
 
       - name: Setup CUDA toolkit
         if: matrix.cuda
-        uses: Jimver/cuda-toolkit@v0.2.21
+        uses: Jimver/cuda-toolkit@v0.2.35
         with:
-          cuda: '12.8'
+          cuda: '12.8.0'
 
       - name: Install Ninja (Linux)
         if: runner.os == 'Linux'
@@ -72,7 +72,7 @@ jobs:
         run: brew install ninja
 
       - name: ccache
-        uses: hendrikmuhs/ccache-action@v1
+        uses: hendrikmuhs/ccache-action@v1.2.23
         with:
           key: release-${{ matrix.pkg }}
 
@@ -93,7 +93,7 @@ jobs:
         run: cmake --build build ${{ matrix.build_args }} --target package
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: ${{ matrix.pkg }}
           path: build/${{ matrix.pkg }}.${{ matrix.ext }}
@@ -107,12 +107,12 @@ jobs:
 
     steps:
       - name: Download all artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v6
         with:
           path: artifacts
 
       - name: Create GitHub Release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           tag_name: ${{ github.ref_name }}
           name: sam3.cpp ${{ github.ref_name }}

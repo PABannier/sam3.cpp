@@ -12,6 +12,7 @@
  *       ~/Documents/sam2/notebooks/videos/bedroom 210 350
  */
 #include "sam3.h"
+#include "test_utils.h"
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -60,7 +61,7 @@ int main(int argc, char** argv) {
     float point_y = (argc > 4) ? atof(argv[4]) : 350.0f;
 
     const char* dump_dir = "/tmp/debug_sam2_cpp";
-    mkdir(dump_dir, 0755);
+    SAM3_MKDIR(dump_dir);
 
     const int N_FRAMES = argc > 5 ? atoi(argv[5]) : 5;
     int encode_img_size = (argc > 6) ? atoi(argv[6]) : 0;

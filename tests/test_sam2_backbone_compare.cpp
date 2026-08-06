@@ -3,6 +3,7 @@
 // Usage: SAM2_DUMP_DIR=/tmp/debug_sam2_cpp test_sam2_backbone_compare <model.ggml> <preprocessed.bin> <output_dir>
 
 #include "sam3.h"
+#include "test_utils.h"
 #include <cstdio>
 #include <fstream>
 #include <vector>
@@ -14,7 +15,7 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    mkdir(argv[3], 0755);
+    SAM3_MKDIR(argv[3]);
 
     std::ifstream fin(argv[2], std::ios::binary);
     fin.seekg(0, std::ios::end);

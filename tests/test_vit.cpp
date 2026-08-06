@@ -1,4 +1,7 @@
+#define _USE_MATH_DEFINES
+
 #include "sam3.h"
+#include "test_fs.h"
 
 #include <cassert>
 #include <cmath>
@@ -331,11 +334,7 @@ static bool test_encode_image(const std::string & model_path,
 
     int n_fail_enc = 0;
     std::string dump_dir = ref_dir + "/cpp_out";
-    {
-        // Create dump dir
-        std::string cmd = "mkdir -p " + dump_dir;
-        (void)system(cmd.c_str());
-    }
+    ensure_dir(dump_dir);
 
     // Helper to compare intermediate tensors.
     // ggml layout [E, W, H], Python ref is [1, H, W, E] (NHWC)

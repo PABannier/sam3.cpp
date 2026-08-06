@@ -20,36 +20,40 @@ jobs:
         include:
           - name: macOS (Clang, Metal)
             os: macos-latest
+            key: macos
             cmake_args: "-DCMAKE_PREFIX_PATH=/opt/homebrew -DSAM3_BUILD_TESTS=ON"
             build_args: ""
 
           - name: Ubuntu 24.04 (GCC)
             os: ubuntu-24.04
+            key: ubuntu
             cmake_args: "-DGGML_METAL=OFF -DSAM3_METAL=OFF -DSAM3_BUILD_TESTS=ON"
             build_args: ""
 
           - name: Ubuntu 24.04 (GCC + CUDA)
             os: ubuntu-24.04
+            key: ubuntu-cuda
             cmake_args: "-DGGML_METAL=OFF -DSAM3_METAL=OFF -DSAM3_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=75 -DCMAKE_CUDA_COMPILER_LAUNCHER=ccache -DSAM3_BUILD_TESTS=ON"
             build_args: ""
             cuda: true
 
           - name: Windows (MSVC)
             os: windows-latest
+            key: windows
             cmake_args: "-DGGML_METAL=OFF -DSAM3_METAL=OFF -DSAM3_BUILD_TESTS=ON -A x64 -DCMAKE_TOOLCHAIN_FILE=C:/vcpkg/scripts/buildsystems/vcpkg.cmake -DVCPKG_TARGET_TRIPLET=x64-windows"
             build_args: "--config Release"
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           submodules: recursive
 
       - name: Setup CUDA toolkit
         if: matrix.cuda
-        uses: Jimver/cuda-toolkit@v0.2.21
+        uses: Jimver/cuda-toolkit@v0.2.35
         with:
-          cuda: '12.8'
+          cuda: '12.8.0'
 
       - name: Install Ninja (Linux)
         if: runner.os == 'Linux'
@@ -65,9 +69,9 @@ jobs:
         run: vcpkg install sdl2:x64-windows
 
       - name: ccache
-        uses: hendrikmuhs/ccache-action@v1
+        uses: hendrikmuhs/ccache-action@v1.2.23
         with:
-          key: ci-${{ matrix.name }}
+          key: ci-${{ matrix.key }}
 
       - name: Configure
         run: >
@@ -116,4 +120,4 @@ jobs:
           fi
 
           echo "Installed binaries:"
-          find "$PREFIX/bin" -maxdepth 1 -type f -printf "%f\n" | sort
+          ls -1 "$PREFIX/bin" | sort
