@@ -6217,6 +6217,18 @@ bool sam3_encode_image(sam3_state& state,
         return false;
     }
 
+    // Free the previous frame's encode graph right after the new one has been
+    // reserved and computed, so only one encode graph buffer exists at a time
+    // (this saves one graph's worth of VRAM, ~315 MiB at encode_img_size=672).
+    if (state.galloc) {
+        ggml_gallocr_free(state.galloc);
+        state.galloc = nullptr;
+    }
+    if (state.ctx) {
+        ggml_free(state.ctx);
+        state.ctx = nullptr;
+    }
+
     SAM3_LOG(2, "%s: graph allocated, %d nodes\n", __func__, ggml_graph_n_nodes(graph));
 
     ggml_backend_tensor_set(inp, img_data.data(), 0, img_data.size() * sizeof(float));
@@ -6237,9 +6249,6 @@ bool sam3_encode_image(sam3_state& state,
                  __func__, compute_ms, state.n_threads);
 #endif
     }
-
-    if (state.galloc) ggml_gallocr_free(state.galloc);
-    if (state.ctx) ggml_free(state.ctx);
 
     state.ctx = ctx0;
     state.galloc = galloc;
@@ -10253,10 +10262,14 @@ sam3_result sam3_segment_pcs(sam3_state& state,
     ** ── Post-processing: thresholding + NMS + mask resize ────────────
     */
     std::vector<sam3_detection> dets;
+    // Enforce a minimum detection threshold: accepting every query (e.g. a
+    // score_threshold of 0) floods the tracker with spurious instances that
+    // exhaust GPU memory. Real detections are well above 0.3.
+    const float eff_threshold = std::max(0.3f, params.score_threshold);
     for (int q = 0; q < NQ; ++q) {
         float class_prob = 1.0f / (1.0f + expf(-scores_data[q]));
         float score = class_prob * presence_prob;
-        if (score < params.score_threshold) continue;
+        if (score < eff_threshold) continue;
 
         sam3_detection det;
         float cx = boxes_data[0 + q * 4];
@@ -10280,8 +10293,8 @@ sam3_result sam3_segment_pcs(sam3_state& state,
         dets.push_back(std::move(det));
     }
 
-    SAM3_LOG(2, "%s: %zu detections above threshold %.2f (presence=%.3f, logit=%.3f)\n",
-             __func__, dets.size(), params.score_threshold, presence_prob, presence_logit);
+    SAM3_LOG(1, "%s: %zu detections above threshold %.2f (presence=%.3f, logit=%.3f)\n",
+             __func__, dets.size(), eff_threshold, presence_prob, presence_logit);
 
     auto keep = sam3_nms(dets, params.nms_threshold);
     for (int i = 0; i < (int)keep.size(); ++i) {
@@ -11589,6 +11602,37 @@ static std::vector<std::pair<int, int>> sam3_match_detections(
     return matches;
 }
 
+static void sam3_free_owned_buffer(sam3_tracker& tracker, ggml_backend_buffer_t buffer) {
+    if (!buffer) return;
+    auto& ob = tracker.owned_buffers;
+    for (auto it = ob.begin(); it != ob.end(); ++it) {
+        if (*it == buffer) {
+            ob.erase(it);
+            break;
+        }
+    }
+    ggml_backend_buffer_free(buffer);
+}
+
+static void sam3_free_memory_slot(sam3_tracker& tracker, const sam3_memory_slot& slot) {
+    if (slot.spatial_feats) sam3_free_owned_buffer(tracker, slot.spatial_feats->buffer);
+    if (slot.spatial_pe)    sam3_free_owned_buffer(tracker, slot.spatial_pe->buffer);
+}
+
+static void sam3_drop_instance(sam3_tracker& tracker, int inst_id) {
+    auto mb = tracker.mem_banks.find(inst_id);
+    if (mb != tracker.mem_banks.end()) {
+        for (const auto& slot : mb->second) sam3_free_memory_slot(tracker, slot);
+        tracker.mem_banks.erase(mb);
+    }
+    auto pb = tracker.ptr_banks.find(inst_id);
+    if (pb != tracker.ptr_banks.end()) {
+        for (const auto& entry : pb->second)
+            if (entry.second) sam3_free_owned_buffer(tracker, entry.second->buffer);
+        tracker.ptr_banks.erase(pb);
+    }
+}
+
 static void sam3_update_tracker(sam3_tracker& tracker, int frame_idx) {
     for (auto it = tracker.pending.begin(); it != tracker.pending.end();) {
         int age = frame_idx - it->first_frame;
@@ -11597,17 +11641,35 @@ static void sam3_update_tracker(sam3_tracker& tracker, int frame_idx) {
             tracker.masklets.push_back(std::move(*it));
             it = tracker.pending.erase(it);
         } else if (age >= tracker.params.hotstart_delay) {
+            // Free the GPU buffers of the rejected pending instance, otherwise
+            // every unmatched detection leaks its memory bank forever.
+            sam3_drop_instance(tracker, it->instance_id);
             it = tracker.pending.erase(it);
         } else
             ++it;
     }
     for (auto it = tracker.masklets.begin(); it != tracker.masklets.end();) {
         if (frame_idx - it->last_seen > tracker.params.max_keep_alive) {
-            tracker.mem_banks.erase(it->instance_id);
-            tracker.ptr_banks.erase(it->instance_id);
+            sam3_drop_instance(tracker, it->instance_id);
             it = tracker.masklets.erase(it);
         } else
             ++it;
+    }
+
+    // Bound the number of pending (pre-confirmation) instances. Every pending
+    // instance owns GPU memory-bank buffers, so an unbounded PCS (e.g. many
+    // spurious detections per frame) would exhaust VRAM during the hotstart
+    // window. Drop the lowest-scoring pending instances once the cap is hit.
+    const size_t kMaxPending = 12;
+    if (tracker.pending.size() > kMaxPending) {
+        std::sort(tracker.pending.begin(), tracker.pending.end(),
+                  [](const sam3_masklet& a, const sam3_masklet& b) {
+                      return a.last_score > b.last_score;
+                  });
+        while (tracker.pending.size() > kMaxPending) {
+            sam3_drop_instance(tracker, tracker.pending.back().instance_id);
+            tracker.pending.pop_back();
+        }
     }
 }
 
@@ -11766,11 +11828,15 @@ static bool sam3_encode_memory(
             bool removed = false;
             for (auto it = bk.begin(); it != bk.end(); ++it)
                 if (!it->is_cond_frame) {
+                    sam3_free_memory_slot(tracker, *it);
                     bk.erase(it);
                     removed = true;
                     break;
                 }
-            if (!removed) bk.erase(bk.begin() + 1);
+            if (!removed) {
+                sam3_free_memory_slot(tracker, bk[1]);
+                bk.erase(bk.begin() + 1);
+            }
         }
         ggml_gallocr_free(ga);
         ggml_free(ctx0);
@@ -11807,11 +11873,15 @@ static bool sam3_encode_memory(
         bool removed = false;
         for (auto it = bk.begin(); it != bk.end(); ++it)
             if (!it->is_cond_frame) {
+                sam3_free_memory_slot(tracker, *it);
                 bk.erase(it);
                 removed = true;
                 break;
             }
-        if (!removed) bk.erase(bk.begin() + 1);
+        if (!removed) {
+            sam3_free_memory_slot(tracker, bk[1]);
+            bk.erase(bk.begin() + 1);
+        }
     }
     ggml_gallocr_free(ga);
     ggml_free(ctx0);
@@ -11834,7 +11904,10 @@ static void sam3_store_obj_ptr(
     ggml_backend_tensor_set(pt, pd, 0, D * sizeof(float));
     auto& bk = tracker.ptr_banks[inst_id];
     bk.push_back({frame_idx, pt});
-    while ((int)bk.size() > model.hparams.max_obj_ptrs) bk.erase(bk.begin());
+    while ((int)bk.size() > model.hparams.max_obj_ptrs) {
+        sam3_free_owned_buffer(tracker, bk.front().second->buffer);
+        bk.erase(bk.begin());
+    }
 }
 
 sam3_tracker_ptr sam3_create_tracker(const sam3_model& model,
