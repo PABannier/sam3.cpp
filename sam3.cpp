@@ -11932,9 +11932,22 @@ sam3_result sam3_track_frame(sam3_tracker& tracker, sam3_state& state,
         return sam3_result{};
     }
 
+    if (!sam3_encode_image(state, model, frame)) return sam3_result{};
+    return sam3_track_frame_encoded(tracker, state, model);
+}
+
+// Track on an already-encoded frame (state must have been filled by
+// sam3_encode_image). Lets callers share a single encode across several
+// trackers / prompts instead of re-encoding the image per prompt.
+sam3_result sam3_track_frame_encoded(sam3_tracker& tracker, sam3_state& state,
+                                     const sam3_model& model) {
+    if (model.hparams.visual_only) {
+        fprintf(stderr, "%s: ERROR: track_frame_encoded not available on visual-only model\n", __func__);
+        return sam3_result{};
+    }
+
     sam3_result result;
     const int D = model.hparams.neck_dim;
-    if (!sam3_encode_image(state, model, frame)) return result;
     int fi = tracker.frame_index;
     fprintf(stderr, "%s: frame %d (%zu active + %zu pending)\n",
             __func__, fi, tracker.masklets.size(), tracker.pending.size());
