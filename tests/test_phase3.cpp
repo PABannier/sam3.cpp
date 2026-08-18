@@ -1,3 +1,5 @@
+#define _USE_MATH_DEFINES
+
 // Phase 3 Numerical Audit — test ViT backbone, neck, sinusoidal PE, RoPE
 // against Python reference tensors dumped by dump_phase3_reference.py.
 //
@@ -11,6 +13,7 @@
 //      Compares intermediate and final outputs against Python references.
 
 #include "sam3.h"
+#include "test_fs.h"
 
 #include <algorithm>
 #include <cassert>
@@ -289,10 +292,7 @@ static void test_encode_image(const std::string & model_path,
     fprintf(stderr, "  Image encoding completed successfully\n");
 
     std::string dump_dir = ref_dir + "/cpp_out_phase3";
-    {
-        std::string cmd = "mkdir -p " + dump_dir;
-        (void)system(cmd.c_str());
-    }
+    ensure_dir(dump_dir);
 
     // ── Helper: dump and compare a state tensor ──────────────────────────
     // C++ tensors are in ggml layout. We need to transpose to PyTorch layout.
@@ -491,10 +491,7 @@ static void test_encode_from_preprocessed(const std::string & model_path,
     }
 
     std::string dump_dir = ref_dir + "/cpp_out_from_preproc";
-    {
-        std::string cmd = "mkdir -p " + dump_dir;
-        (void)system(cmd.c_str());
-    }
+    ensure_dir(dump_dir);
 
     // ── Compare ViT output ────────────────────────────────────────────────
     fprintf(stderr, "\n  --- ViT Output (same input) ---\n");

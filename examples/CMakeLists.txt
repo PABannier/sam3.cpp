@@ -10,6 +10,9 @@ target_link_libraries(sam3_benchmark PRIVATE sam3)
 add_executable(sam3_profile_edgetam profile_edgetam.cpp)
 target_link_libraries(sam3_profile_edgetam PRIVATE sam3)
 
+install(TARGETS sam3_quantize sam3_benchmark sam3_profile_edgetam
+    RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
+
 # SDL2 + ImGui are optional — build only if SDL2 is found.
 find_package(SDL2 QUIET)
 
@@ -21,6 +24,9 @@ if(SDL2_FOUND)
 
     add_executable(sam3_video main_video.cpp)
     target_link_libraries(sam3_video PRIVATE sam3 imgui-sdl2 SDL2::SDL2)
+
+    install(TARGETS sam3_image sam3_video
+        RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
 else()
     message(STATUS "SDL2 not found — skipping GUI examples")
 endif()

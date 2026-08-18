@@ -1,4 +1,5 @@
 #include "sam3.h"
+#include "test_utils.h"
 
 #include <cstdio>
 #include <string>
@@ -15,7 +16,7 @@ int main(int argc, char ** argv) {
     const std::string output_dir = argv[2];
 
     // Create output directory
-    mkdir(output_dir.c_str(), 0755);
+    SAM3_MKDIR(output_dir.c_str());
 
     // Load tokenizer from embedded data in model file
     if (!sam3_test_load_tokenizer(model_path)) {

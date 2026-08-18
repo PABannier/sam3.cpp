@@ -12,6 +12,10 @@
 #include "ggml-metal.h"
 #endif
 
+#ifdef GGML_USE_CUDA
+#include "ggml-cuda.h"
+#endif
+
 /* stb (implementation compiled here -- order is pinned) */
 #define STB_IMAGE_IMPLEMENTATION
 #include "stb_image.h"
@@ -3276,8 +3280,14 @@ std::shared_ptr<sam3_model> sam3_load_model(const sam3_params& params) {
     }
 
     // ── Init backend ─────────────────────────────────────────────────────
-#ifdef GGML_USE_METAL
+#ifdef GGML_USE_CUDA
     if (params.use_gpu) {
+        fprintf(stderr, "%s: using CUDA backend\n", __func__);
+        model->backend = ggml_backend_cuda_init(0); // device 0
+    }
+#endif
+#ifdef GGML_USE_METAL
+    if (!model->backend && params.use_gpu) {
         fprintf(stderr, "%s: using Metal backend\n", __func__);
         model->backend = ggml_backend_metal_init();
     }
@@ -3657,6 +3667,25 @@ static void sam3_get_1d_sine_pe(float* out, float pos_ind, int dim,
 // All ViT graph functions use the sam.cpp convention:
 //   ne[0] = embed_dim (E=1024), ne[1] = spatial W, ne[2] = spatial H, ne[3] = batch
 
+// Crop the per-position RoPE freqs of a global-attention block to the effective
+// grid (supports encode_img_size overrides).  freqs_cis is [2, half, N] with
+// N = grid_native^2 in row-major token order (p = w + grid*h).  Returns a strided
+// view covering the top-left grid_eff x grid_eff positions of the native grid.
+static struct ggml_tensor* sam3_crop_global_freqs(struct ggml_context* ctx,
+                                                  struct ggml_tensor* freqs,
+                                                  int64_t grid_native,
+                                                  int64_t grid_eff) {
+    if (grid_eff >= grid_native) {
+        return freqs;
+    }
+    const int64_t half = freqs->ne[1];
+    auto* fr4 = ggml_reshape_4d(ctx, freqs, 2, half, grid_native, grid_native);
+    auto* view = ggml_view_4d(ctx, fr4, 2, half, grid_eff, grid_eff,
+                              fr4->nb[0], fr4->nb[1], fr4->nb[2], fr4->nb[3]);
+    auto* cont = ggml_cont(ctx, view);
+    return ggml_reshape_3d(ctx, cont, 2, half, grid_eff * grid_eff);
+}
+
 // Apply RoPE to Q and K tensors using complex multiplication.
 // x shape: [head_dim, N, num_heads*B] in ggml layout
 // freqs_cis shape: [2, 32, N] in ggml layout — stored as (cos,sin) interleaved pairs
@@ -3707,6 +3736,75 @@ static struct ggml_tensor* sam3_apply_rope(struct ggml_context* ctx,
     // Interleave back: [2, half, N, nheads_B]
     auto* out = ggml_concat(ctx, out_re, out_im, 0);
     return ggml_reshape_3d(ctx, ggml_cont(ctx, out), head_dim, N, nheads_B);
+}
+
+// Helper: flash attention with fallback to manual SDPA for unsupported dimensions
+// CUDA flash attention only supports: 32, 40, 64, 72, 80, 96, 112, 128, 192, 256, 320, 512, 576
+static struct ggml_tensor* sam3_flash_attn_with_fallback(
+    struct ggml_context* ctx,
+    struct ggml_tensor* Q,      // [HD, N_q, NH, B]
+    struct ggml_tensor* K,      // [HD, N_kv, NH, B]
+    struct ggml_tensor* V,      // [HD, N_kv, NH, B] (can be non-contiguous)
+    struct ggml_tensor* mask,   // optional mask for flash_attn_ext
+    float scale,
+    int64_t HD,                 // head dimension
+    int64_t n_heads) {
+    // Check if flash attention is supported for this configuration
+    const bool use_flash_attn = (HD == 32 || HD == 40 || HD == 64 || HD == 72 || HD == 80 ||
+                                  HD == 96 || HD == 112 || HD == 128 || HD == 192 ||
+                                  HD == 256 || HD == 320 || HD == 512 || HD == 576);
+
+    if (use_flash_attn) {
+        // Backend flash attention kernels require a contiguous F16 mask shared across
+        // all heads (ne[2] == 1). Masks built by sam3_expand_token_attn_bias broadcast
+        // the same bias to every head, so a view of the first head slice is numerically
+        // identical and unlocks the fused kernel (previously all masked attention fell
+        // back to manual SDPA).
+        struct ggml_tensor* flash_mask = mask;
+        if (mask != nullptr) {
+            flash_mask = ggml_view_4d(ctx, mask, mask->ne[0], mask->ne[1], 1, mask->ne[3],
+                                      mask->nb[1], mask->nb[2], mask->nb[3], 0);
+            flash_mask = ggml_cont(ctx, flash_mask);
+        }
+        return ggml_flash_attn_ext(ctx, Q, K, V, flash_mask, scale, 0.0f, 0.0f);
+    } else {
+        // Manual SDPA for masked attention or unsupported head dimensions
+        const int64_t N_q = Q->ne[1];
+        const int64_t N_kv = K->ne[1];
+        const int64_t B = Q->ne[3];
+
+        // Ensure tensors are contiguous before reshaping
+        Q = ggml_cont(ctx, Q);
+        K = ggml_cont(ctx, K);
+        V = ggml_cont(ctx, V);
+
+        auto* Q3 = ggml_reshape_3d(ctx, Q, HD, N_q, n_heads * B);
+        auto* K3 = ggml_reshape_3d(ctx, K, HD, N_kv, n_heads * B);
+        auto* V3 = ggml_reshape_3d(ctx, V, HD, N_kv, n_heads * B);
+
+        // QK^T: ggml_mul_mat(K, Q) → K^T @ Q → [N_kv, N_q, NH*B]
+        auto* attn_scores = ggml_mul_mat(ctx, K3, Q3);
+
+        // Apply mask and scale in one step if mask provided
+        if (mask) {
+            // For masked attention, use soft_max_ext which handles scale and mask together
+            attn_scores = ggml_soft_max_ext(ctx, attn_scores, mask, scale, 0.0f);
+        } else {
+            attn_scores = ggml_scale(ctx, attn_scores, scale);
+            attn_scores = ggml_soft_max(ctx, attn_scores);
+        }
+
+        // attn @ V: transpose V then multiply
+        auto* VT = ggml_permute(ctx, V3, 1, 0, 2, 3);  // [N_kv, HD, NH*B]
+        VT = ggml_cont(ctx, VT);
+        auto* out3 = ggml_mul_mat(ctx, VT, attn_scores);  // [HD, N_q, NH*B]
+
+        // Reshape back to 4D and permute to match flash_attn_ext output
+        auto* out = ggml_reshape_4d(ctx, out3, HD, N_q, n_heads, B);
+        out = ggml_cont(ctx, ggml_permute(ctx, out, 0, 2, 1, 3));  // [HD, NH, N_q, B]
+
+        return out;
+    }
 }
 
 // Single ViT block forward: pre-norm → attn (window or global, with RoPE) → residual → pre-norm → MLP → residual
@@ -3767,8 +3865,12 @@ static struct ggml_tensor* sam3_vit_block_forward(struct ggml_context* ctx,
         V = ggml_permute(ctx, V, 0, 2, 1, 3);  // [HD, N, NH, B_cur] non-contiguous view; flash_attn uses strides
 
         if (blk.freqs_cis) {
-            Q = sam3_apply_rope(ctx, Q, blk.freqs_cis);
-            K = sam3_apply_rope(ctx, K, blk.freqs_cis);
+            struct ggml_tensor* freqs = blk.freqs_cis;
+            if (is_global) {
+                freqs = sam3_crop_global_freqs(ctx, freqs, hp.n_img_embd(), x->ne[1]);
+            }
+            Q = sam3_apply_rope(ctx, Q, freqs);
+            K = sam3_apply_rope(ctx, K, freqs);
         }
 
         Q = ggml_reshape_4d(ctx, Q, HD, W_cur * H_cur, NH, B_cur);
@@ -3812,16 +3914,17 @@ static struct ggml_tensor* sam3_build_vit_prefix_graph(struct ggml_context* ctx,
                                                        const sam3_model& model) {
     const auto& hp = model.hparams;
     const int E = hp.vit_embed_dim;  // 1024
-    const int H = hp.n_img_embd();   // 72
-    const int W = hp.n_img_embd();   // 72
 
     // Patch embedding: ggml conv outputs [W, H, E, 1], permute to [E, W, H, B]
     auto* x = ggml_conv_2d_sk_p0(ctx, model.vit.patch_embed_w, input);
     x = ggml_cont(ctx, ggml_permute(ctx, x, 1, 2, 0, 3));
 
-    // pos_embed [E, 24, 24] is Hiera pretrained resolution — tile 3x3 to [E, 72, 72]
+    // pos_embed [E, 24, 24] is Hiera pretrained resolution — tile to [E, W, H]
+    // using the effective spatial grid of the conv output (supports encode_img_size override).
+    const int64_t W_eff = x->ne[1];
+    const int64_t H_eff = x->ne[2];
     auto* pos_2d = model.vit.pos_embed;
-    auto* pos_target = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, E, W, H, 1);
+    auto* pos_target = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, E, W_eff, H_eff, 1);
     auto* pos_tiled = ggml_repeat(ctx, pos_2d, pos_target);
 
     x = ggml_add(ctx, x, pos_tiled);
@@ -4396,7 +4499,7 @@ static struct ggml_tensor* sam2_hiera_block_forward(struct ggml_context* ctx,
     V = ggml_permute(ctx, V, 0, 2, 1, 3);  // non-contiguous OK for flash_attn
 
     float scale = 1.0f / sqrtf((float)head_dim);
-    auto* attn_out = ggml_flash_attn_ext(ctx, Q, K, V, nullptr, scale, 0, 0);
+    auto* attn_out = sam3_flash_attn_with_fallback(ctx, Q, K, V, nullptr, scale, head_dim, NH);
 
     // Recombine: flash_attn output is [HD, N_q, NH, B_win]
     // → reshape to [C_out, N_q, B_win]
@@ -5519,7 +5622,7 @@ static struct ggml_tensor* edgetam_perceiver_layer_forward(
         k = ggml_reshape_4d(ctx, k, D, N_lat, 1, batch);
         v = ggml_reshape_4d(ctx, v, D, N_lat, 1, batch);
 
-        auto* attn = ggml_flash_attn_ext(ctx, q, k, v, nullptr, scale, 0.0f, 0.0f);
+        auto* attn = sam3_flash_attn_with_fallback(ctx, q, k, v, nullptr, scale, D, 1);
         attn = ggml_reshape_3d(ctx, attn, D, N_lat, batch);
 
         auto* sa_out = ggml_mul_mat(ctx, layer.sa_out_w, attn);
@@ -6114,6 +6217,18 @@ bool sam3_encode_image(sam3_state& state,
         return false;
     }
 
+    // Free the previous frame's encode graph right after the new one has been
+    // reserved and computed, so only one encode graph buffer exists at a time
+    // (this saves one graph's worth of VRAM, ~315 MiB at encode_img_size=672).
+    if (state.galloc) {
+        ggml_gallocr_free(state.galloc);
+        state.galloc = nullptr;
+    }
+    if (state.ctx) {
+        ggml_free(state.ctx);
+        state.ctx = nullptr;
+    }
+
     SAM3_LOG(2, "%s: graph allocated, %d nodes\n", __func__, ggml_graph_n_nodes(graph));
 
     ggml_backend_tensor_set(inp, img_data.data(), 0, img_data.size() * sizeof(float));
@@ -6135,9 +6250,6 @@ bool sam3_encode_image(sam3_state& state,
 #endif
     }
 
-    if (state.galloc) ggml_gallocr_free(state.galloc);
-    if (state.ctx) ggml_free(state.ctx);
-
     state.ctx = ctx0;
     state.galloc = galloc;
     state.backend = model.backend;
@@ -6151,11 +6263,12 @@ bool sam3_encode_image(sam3_state& state,
     // PEs live in a separate buffer so they survive gallocr teardown.
     {
         const int neck_dim = hp.neck_dim;  // 256
+        const int fs = sam3_eff_feat_size(state, hp);  // effective grid (encode_img_size)
         const int scale_sizes[4] = {
-            hp.n_img_embd() * 4,  // 288
-            hp.n_img_embd() * 2,  // 144
-            hp.n_img_embd(),      //  72
-            hp.n_img_embd() / 2,  //  36
+            fs * 4,  // 288 at native
+            fs * 2,  // 144 at native
+            fs,      //  72 at native
+            fs / 2,  //  36 at native
         };
 
         size_t pe_total = 0;
@@ -6821,7 +6934,7 @@ static struct ggml_tensor * sam3_build_vit_attn_core_from_qkv(struct ggml_contex
     K = ggml_reshape_4d(ctx, K, HD, W_cur * H_cur, NH, B_cur);
 
     const float scale = 1.0f / sqrtf((float) HD);
-    struct ggml_tensor * attn_out = ggml_flash_attn_ext(ctx, Q, K, V, nullptr, scale, 0.0f, 0.0f);
+    struct ggml_tensor * attn_out = sam3_flash_attn_with_fallback(ctx, Q, K, V, nullptr, scale, HD, NH);
 
     return ggml_cont(ctx, ggml_reshape_4d(ctx, attn_out, E, W_cur, H_cur, B_cur));
 }
@@ -7431,11 +7544,12 @@ bool sam3_encode_image_from_preprocessed(sam3_state& state,
     // Compute sinusoidal PEs
     {
         const int neck_dim = hp.neck_dim;
+        const int fs = sam3_eff_feat_size(state, hp);  // effective grid (encode_img_size)
         const int scale_sizes[4] = {
-            hp.n_img_embd() * 4,
-            hp.n_img_embd() * 2,
-            hp.n_img_embd(),
-            hp.n_img_embd() / 2,
+            fs * 4,
+            fs * 2,
+            fs,
+            fs / 2,
         };
 
         if (state.pe_buf) {
@@ -7538,7 +7652,7 @@ static struct ggml_tensor* sam3_multihead_attn_fused(
     V = ggml_permute(ctx, V, 0, 2, 1, 3);  // [HD, N_kv, NH, B] non-contiguous; flash_attn uses strides
 
     float scale = 1.0f / sqrtf((float)HD);
-    auto* attn_out = ggml_flash_attn_ext(ctx, Q, K, V, attn_mask, scale, 0.0f, 0.0f);
+    auto* attn_out = sam3_flash_attn_with_fallback(ctx, Q, K, V, attn_mask, scale, HD, n_heads);
 
     auto* merged = ggml_reshape_3d(ctx, attn_out, D, N_q, B);
     merged = ggml_mul_mat(ctx, out_proj_w, merged);
@@ -7721,7 +7835,7 @@ static sam3_geom_result sam3_build_geom_enc_graph(
             V = ggml_permute(ctx, V, 0, 2, 1, 3);
 
             float scale = 1.0f / sqrtf((float)HD);
-            auto* sa_out = ggml_flash_attn_ext(ctx, Q, K, V, nullptr, scale, 0.0f, 0.0f);
+            auto* sa_out = sam3_flash_attn_with_fallback(ctx, Q, K, V, nullptr, scale, HD, n_heads);
             sa_out = ggml_reshape_3d(ctx, sa_out, D, S, 1);
 
             sa_out = ggml_mul_mat(ctx, ly.sa_out_proj_w, sa_out);
@@ -7763,7 +7877,7 @@ static sam3_geom_result sam3_build_geom_enc_graph(
             V = ggml_permute(ctx, V, 0, 2, 1, 3);
 
             float scale = 1.0f / sqrtf((float)HD);
-            auto* ca_out = ggml_flash_attn_ext(ctx, Q, K, V, nullptr, scale, 0.0f, 0.0f);
+            auto* ca_out = sam3_flash_attn_with_fallback(ctx, Q, K, V, nullptr, scale, HD, n_heads);
             ca_out = ggml_reshape_3d(ctx, ca_out, D, S_q, 1);
 
             ca_out = ggml_mul_mat(ctx, ly.ca_out_w, ca_out);
@@ -8071,7 +8185,7 @@ static struct ggml_tensor* sam3_fenc_layer_forward(
         V = ggml_permute(ctx, V, 0, 2, 1, 3);
 
         float scale = 1.0f / sqrtf((float)HD);
-        auto* sa_out = ggml_flash_attn_ext(ctx, Q, K, V, nullptr, scale, 0.0f, 0.0f);
+        auto* sa_out = sam3_flash_attn_with_fallback(ctx, Q, K, V, nullptr, scale, HD, n_heads);
         sa_out = ggml_reshape_3d(ctx, sa_out, D, N, B);
 
         sa_out = ggml_mul_mat(ctx, ly.sa_out_proj_w, sa_out);
@@ -8113,7 +8227,7 @@ static struct ggml_tensor* sam3_fenc_layer_forward(
 
         auto* ca_mask = sam3_expand_token_attn_bias(ctx, prompt_attn_bias, N_q, n_heads, B);
         float scale = 1.0f / sqrtf((float)HD);
-        auto* ca_out = ggml_flash_attn_ext(ctx, Q, K, V, ca_mask, scale, 0.0f, 0.0f);
+        auto* ca_out = sam3_flash_attn_with_fallback(ctx, Q, K, V, ca_mask, scale, HD, n_heads);
         ca_out = ggml_reshape_3d(ctx, ca_out, D, N_q, B);
 
         ca_out = ggml_mul_mat(ctx, ly.ca_out_w, ca_out);
@@ -8489,7 +8603,7 @@ static struct ggml_tensor* sam3_ddec_layer_forward(
         V = ggml_permute(ctx, V, 0, 2, 1, 3);
 
         float scale = 1.0f / sqrtf((float)HD);
-        auto* sa_out = ggml_flash_attn_ext(ctx, Q, K, V, nullptr, scale, 0.0f, 0.0f);
+        auto* sa_out = sam3_flash_attn_with_fallback(ctx, Q, K, V, nullptr, scale, HD, n_heads);
         sa_out = ggml_reshape_3d(ctx, sa_out, D, N, B);
         sa_out = ggml_mul_mat(ctx, ly.sa_out_proj_w, sa_out);
         sa_out = ggml_add(ctx, sa_out, ly.sa_out_proj_b);
@@ -8532,7 +8646,7 @@ static struct ggml_tensor* sam3_ddec_layer_forward(
 
         auto* text_mask = sam3_expand_token_attn_bias(ctx, text_attn_bias, N_q, n_heads, B);
         float scale = 1.0f / sqrtf((float)HD);
-        auto* ca_out = ggml_flash_attn_ext(ctx, Q, K, V, text_mask, scale, 0.0f, 0.0f);
+        auto* ca_out = sam3_flash_attn_with_fallback(ctx, Q, K, V, text_mask, scale, HD, n_heads);
         ca_out = ggml_reshape_3d(ctx, ca_out, D, N_q, B);
         ca_out = ggml_mul_mat(ctx, ly.ca_text_out_w, ca_out);
         ca_out = ggml_add(ctx, ca_out, ly.ca_text_out_b);
@@ -8588,7 +8702,7 @@ static struct ggml_tensor* sam3_ddec_layer_forward(
             ca_out = ggml_mul_mat(ctx, v_t, kq);                 // [HD, N_q, NH, B]
             ca_out = ggml_cont(ctx, ggml_permute(ctx, ca_out, 0, 2, 1, 3));
         } else {
-            ca_out = ggml_flash_attn_ext(ctx, Q, K, V, nullptr, scale, 0.0f, 0.0f);
+            ca_out = sam3_flash_attn_with_fallback(ctx, Q, K, V, nullptr, scale, HD, n_heads);
         }
 
         ca_out = ggml_reshape_3d(ctx, ca_out, D, N_q, B);
@@ -8672,26 +8786,56 @@ static struct ggml_tensor* sam3_dot_product_scoring(
         auto* tp = ggml_cont(ctx, ggml_permute(ctx, text_mlp, 1, 0, 2, 3));  // [T, D, B]
         // Mask: text_valid_mask is [T, 1, B] — broadcast multiply zeros out padding
         tp = ggml_mul(ctx, tp, text_valid_mask);  // [T, D, B] with padding zeroed
-        // Sum over T dimension: pool_1d with SUM kernel=T
-        // ggml_pool_1d AVG divides by T; we want SUM then divide by n_valid.
-        // Use AVG and then scale by T/n_valid? Or use a manual approach.
-        // Simpler: sum via pool_1d with AVG, then scale by T/n_valid.
-        // But n_valid is dynamic. Instead: sum = mean * T, then divide by n_valid.
-        // We pass n_valid as part of the mask: text_valid_mask sums to n_valid.
-        // pool_1d(masked, AVG, T, T, 0) = sum(masked) / T. Multiply by T → sum(masked).
-        // Then divide by n_valid. But n_valid is a scalar we know CPU-side.
-        // For simplicity: compute AVG over ALL T positions (with padding zeroed out).
-        // This gives sum(valid) / T. To get sum(valid) / n_valid, scale by T / n_valid.
-        // We embed the scale factor into the mask: mask = (T / n_valid) for valid, 0 for pad.
-        // Then AVG(mask * features) = sum(valid * T/n_valid) / T = sum(valid) / n_valid. ✓
-        // Caller should set mask values to T/n_valid for valid tokens, 0 for padding.
-        auto* pooled_t = ggml_pool_1d(ctx, tp, GGML_OP_POOL_AVG, (int)T, (int)T, 0);
-        text_pooled = ggml_cont(ctx, ggml_permute(ctx, pooled_t, 1, 0, 2, 3));  // [D, 1, B]
+
+        // Mean pooling without ggml_pool_1d (not supported on CUDA)
+        // Reshape to [D, T*B] then use mul_mat with ones vector to sum over T
+        // Then divide by T to get mean
+        auto* tp_flat = ggml_reshape_2d(ctx, tp, D, T * B);  // [D, T*B]
+
+        // Create a ones vector [T*B, 1] and multiply to sum over second dim
+        // Actually simpler: use ggml_sum_rows which sums over rows
+        // But we need to average. Let's use a scale factor instead.
+        // Reshape back and use ggml_mean if available, or manual approach
+
+        // Manual mean: reshape to [D*B, T], sum each row, divide by T
+        auto* reshaped = ggml_reshape_3d(ctx, tp, T, D, B);  // [T, D, B]
+        reshaped = ggml_cont(ctx, ggml_permute(ctx, reshaped, 1, 0, 2, 3));  // [D, T, B]
+
+        // Sum over dimension 1 (T) then divide: create [D, 1, B]
+        // Use sum_rows which sums dim1, but result needs proper shape
+        // Actually use ggml_view to extract each position and sum manually
+        // Simpler: average by scaling after summing
+        struct ggml_tensor* text_pooled_temp = nullptr;
+        for (int t = 0; t < (int)T; ++t) {
+            auto* slice = ggml_view_3d(ctx, reshaped, D, 1, B,
+                                       reshaped->nb[1], reshaped->nb[2],
+                                       t * reshaped->nb[1]);
+            if (text_pooled_temp == nullptr) {
+                text_pooled_temp = ggml_cont(ctx, slice);
+            } else {
+                text_pooled_temp = ggml_add(ctx, text_pooled_temp, slice);
+            }
+        }
+        text_pooled_temp = ggml_scale(ctx, text_pooled_temp, 1.0f / (float)T);
+        text_pooled = text_pooled_temp;  // [D, 1, B]
     } else {
-        // All tokens valid — simple mean
-        auto* tp = ggml_cont(ctx, ggml_permute(ctx, text_mlp, 1, 0, 2, 3));
-        auto* pooled_t = ggml_pool_1d(ctx, tp, GGML_OP_POOL_AVG, (int)T, (int)T, 0);
-        text_pooled = ggml_cont(ctx, ggml_permute(ctx, pooled_t, 1, 0, 2, 3));
+        // All tokens valid — simple mean using same approach
+        auto* tp = ggml_cont(ctx, ggml_permute(ctx, text_mlp, 1, 0, 2, 3));  // [T, D, B]
+        auto* reshaped = ggml_cont(ctx, ggml_permute(ctx, tp, 1, 0, 2, 3));  // [D, T, B]
+
+        struct ggml_tensor* text_pooled_temp = nullptr;
+        for (int t = 0; t < (int)T; ++t) {
+            auto* slice = ggml_view_3d(ctx, reshaped, D, 1, B,
+                                       reshaped->nb[1], reshaped->nb[2],
+                                       t * reshaped->nb[1]);
+            if (text_pooled_temp == nullptr) {
+                text_pooled_temp = ggml_cont(ctx, slice);
+            } else {
+                text_pooled_temp = ggml_add(ctx, text_pooled_temp, slice);
+            }
+        }
+        text_pooled_temp = ggml_scale(ctx, text_pooled_temp, 1.0f / (float)T);
+        text_pooled = text_pooled_temp;  // [D, 1, B]
     }
     ggml_set_name(text_pooled, "scoring_pooled");
 
@@ -8762,7 +8906,9 @@ static sam3_ddec_output sam3_build_ddec_graph(
     const int D = hp.neck_dim;            // 256
     const int NQ = hp.ddec_num_queries;   // 200
     const int B = (int)enc_feats->ne[2];  // batch (1)
-    const int feat_hw = hp.n_img_embd();  // 72
+    // Grid size of the encoded image — derive from the actual rpb_coords tensor
+    // (sized from the effective feat_size, which encode_img_size may override).
+    const int feat_hw = rpb_coords ? (int)rpb_coords->ne[0] : (int)hp.n_img_embd();
 
     // ── Initialize queries from query_embed ──────────────────────────────
     auto* content = ggml_reshape_3d(ctx, model.ddec.query_embed, D, NQ, 1);
@@ -9002,8 +9148,9 @@ static struct ggml_tensor* sam3_build_seg_head_graph(
     // enc: [D, N_spatial, B]
     ggml_set_name(enc, "seg_enc_after_ca");
 
-    // Replace lowest-res FPN feat with spatial portion of encoder output
-    const int64_t feat_hw = model.hparams.n_img_embd();  // 72
+    // Replace lowest-res FPN feat with spatial portion of encoder output.
+    // Grid size derived from the actual encoder token count (honors encode_img_size).
+    const int64_t feat_hw = (int64_t)std::sqrt((double)enc->ne[1]);
     auto* enc_spatial = ggml_reshape_4d(ctx, enc, D, feat_hw, feat_hw, B);
 #ifndef NDEBUG
     auto* enc_spatial_dbg = ggml_cont(ctx, ggml_permute(ctx, enc_spatial, 2, 0, 1, 3));
@@ -9268,7 +9415,7 @@ static struct ggml_tensor* sam3_build_mem_attn_graph(
             v = ggml_permute(ctx, v, 0, 2, 1, 3);
 
             float scale = 1.0f / sqrtf((float)D);
-            auto* sa_out = ggml_flash_attn_ext(ctx, q, k, v, nullptr, scale, 0.0f, 0.0f);
+            auto* sa_out = sam3_flash_attn_with_fallback(ctx, q, k, v, nullptr, scale, D, 1);
             sa_out = ggml_reshape_3d(ctx, sa_out, D, N, 1);
             sa_out = ggml_add(ctx, ggml_mul_mat(ctx, ly.sa_out_w, sa_out), ly.sa_out_b);
             x = ggml_add(ctx, x, sa_out);
@@ -9313,7 +9460,7 @@ static struct ggml_tensor* sam3_build_mem_attn_graph(
             v = ggml_permute(ctx, v, 0, 2, 1, 3);
 
             float scale = 1.0f / sqrtf((float)D);
-            auto* ca_out = ggml_flash_attn_ext(ctx, q, k, v, nullptr, scale, 0.0f, 0.0f);
+            auto* ca_out = sam3_flash_attn_with_fallback(ctx, q, k, v, nullptr, scale, D, 1);
             ca_out = ggml_reshape_3d(ctx, ca_out, D, N, 1);
             ca_out = ggml_add(ctx, ggml_mul_mat(ctx, ly.ca_out_w, ca_out), ly.ca_out_b);
             x = ggml_add(ctx, x, ca_out);
@@ -9671,15 +9818,16 @@ sam3_result sam3_segment_pcs(sam3_state& state,
         return sam3_result{};
     }
 
+
 #if SAM3_LOG_LEVEL >= 1
     auto t_start = std::chrono::high_resolution_clock::now();
 #endif
     const auto& hp = model.hparams;
     const int D = hp.neck_dim;           // 256
-    const int H = hp.n_img_embd();       // 72
+    const int H = sam3_eff_feat_size(state, hp);  // 72 at native; honors encode_img_size
     const int L = hp.text_ctx_len;       // 32
     const int NQ = hp.ddec_num_queries;  // 200
-    const int N_spatial = H * H;         // 5184
+    const int N_spatial = H * H;         // 5184 at native
     sam3_result result;
 
     // ── Check that image has been encoded ────────────────────────────────
@@ -10114,10 +10262,14 @@ sam3_result sam3_segment_pcs(sam3_state& state,
     ** ── Post-processing: thresholding + NMS + mask resize ────────────
     */
     std::vector<sam3_detection> dets;
+    // Enforce a minimum detection threshold: accepting every query (e.g. a
+    // score_threshold of 0) floods the tracker with spurious instances that
+    // exhaust GPU memory. Real detections are well above 0.3.
+    const float eff_threshold = std::max(0.3f, params.score_threshold);
     for (int q = 0; q < NQ; ++q) {
         float class_prob = 1.0f / (1.0f + expf(-scores_data[q]));
         float score = class_prob * presence_prob;
-        if (score < params.score_threshold) continue;
+        if (score < eff_threshold) continue;
 
         sam3_detection det;
         float cx = boxes_data[0 + q * 4];
@@ -10141,8 +10293,8 @@ sam3_result sam3_segment_pcs(sam3_state& state,
         dets.push_back(std::move(det));
     }
 
-    SAM3_LOG(2, "%s: %zu detections above threshold %.2f (presence=%.3f, logit=%.3f)\n",
-             __func__, dets.size(), params.score_threshold, presence_prob, presence_logit);
+    SAM3_LOG(1, "%s: %zu detections above threshold %.2f (presence=%.3f, logit=%.3f)\n",
+             __func__, dets.size(), eff_threshold, presence_prob, presence_logit);
 
     auto keep = sam3_nms(dets, params.nms_threshold);
     for (int i = 0; i < (int)keep.size(); ++i) {
@@ -10205,45 +10357,10 @@ static struct ggml_tensor* sam3_sam_attention(
     V = ggml_reshape_4d(ctx, V, HD, n_heads, N_kv, B);
     V = ggml_cont(ctx, ggml_permute(ctx, V, 0, 2, 1, 3));  // [HD, N_kv, NH, B] contiguous
 
-    // Attention
+    // Attention with automatic fallback for unsupported dimensions
     float scale = 1.0f / sqrtf((float)HD);
-    auto* out = ggml_flash_attn_ext(ctx, Q, K, V, nullptr, scale, 0.0f, 0.0f);
-    // out: [HD, NH, N_q, B] (flash_attn_ext swaps dims 1,2 vs input)
-
-#if 0  // Manual SDPA (for debugging only)
-    auto* Q3 = ggml_reshape_3d(ctx, Q, HD, N_q, n_heads * B);
-    auto* K3 = ggml_reshape_3d(ctx, K, HD, N_kv, n_heads * B);
-    auto* V3 = ggml_reshape_3d(ctx, V, HD, N_kv, n_heads * B);
-    // QK^T: ggml_mul_mat(K, Q) → K^T @ Q → [N_kv, N_q, NH*B]
-    auto* attn_scores = ggml_mul_mat(ctx, K3, Q3);
-    attn_scores = ggml_scale(ctx, attn_scores, scale);
-    attn_scores = ggml_soft_max(ctx, attn_scores);
-
-    // attn @ V: need attn^T [N_q, N_kv] and V^T [HD, N_kv]
-    // ggml_mul_mat(attn^T, V) = (attn^T)^T @ V = attn @ V = [N_q, HD]... no.
-    // ggml_mul_mat(A, B) = A^T @ B where A=[K, M], B=[K, N] → [M, N]
-    // Want: output[q, d] = sum_k attn[q, k] * V[k, d]
-    // = (V^T @ attn^T)^T... let me think differently.
-    // attn_scores is [N_kv, N_q, NH*B]. For each head:
-    //   attn[k, q] = attn_scores[k, q]  (col q has the weights for query q)
-    // V3 is [HD, N_kv, NH*B].
-    // Want: out[d, q] = sum_k V[d, k] * attn[k, q] = V @ attn
-    // = ggml_mul_mat? mul_mat(A, B) = A^T B with A=[K, M], B=[K, N] → [M, N]
-    // V has ne=[HD, N_kv, ...]. attn has ne=[N_kv, N_q, ...].
-    // If A=V3 (ne0=HD, ne1=N_kv) and B=attn_scores (ne0=N_kv, ne1=N_q):
-    // Shared dim ne0: V3 ne0=HD ≠ attn ne0=N_kv. Mismatch!
-    //
-    // Need to transpose V: V^T is [N_kv, HD]. Then A=V^T, B=attn_scores.
-    // A ne0=N_kv, B ne0=N_kv → shared. A^T B = V @ attn → [HD, N_q]. ✓
-    auto* VT = ggml_permute(ctx, V3, 1, 0, 2, 3);  // [N_kv, HD, NH*B]
-    VT = ggml_cont(ctx, VT);
-    auto* out3 = ggml_mul_mat(ctx, VT, attn_scores);  // [HD, N_q, NH*B]
-
-    // Reshape back to 4D: [HD, N_q, NH, B]
-    auto* out = ggml_reshape_4d(ctx, out3, HD, N_q, n_heads, B);
-    // Permute to [HD, NH, N_q, B] to match flash_attn_ext output convention
-    out = ggml_cont(ctx, ggml_permute(ctx, out, 0, 2, 1, 3));
-#endif
+    auto* out = sam3_flash_attn_with_fallback(ctx, Q, K, V, nullptr, scale, HD, n_heads);
+    // out: [HD, NH, N_q, B]
 
     // Merge heads: [ID=HD*NH, N_q, B]
     auto* merged = ggml_reshape_3d(ctx, out, ID, N_q, B);
@@ -11485,6 +11602,37 @@ static std::vector<std::pair<int, int>> sam3_match_detections(
     return matches;
 }
 
+static void sam3_free_owned_buffer(sam3_tracker& tracker, ggml_backend_buffer_t buffer) {
+    if (!buffer) return;
+    auto& ob = tracker.owned_buffers;
+    for (auto it = ob.begin(); it != ob.end(); ++it) {
+        if (*it == buffer) {
+            ob.erase(it);
+            break;
+        }
+    }
+    ggml_backend_buffer_free(buffer);
+}
+
+static void sam3_free_memory_slot(sam3_tracker& tracker, const sam3_memory_slot& slot) {
+    if (slot.spatial_feats) sam3_free_owned_buffer(tracker, slot.spatial_feats->buffer);
+    if (slot.spatial_pe)    sam3_free_owned_buffer(tracker, slot.spatial_pe->buffer);
+}
+
+static void sam3_drop_instance(sam3_tracker& tracker, int inst_id) {
+    auto mb = tracker.mem_banks.find(inst_id);
+    if (mb != tracker.mem_banks.end()) {
+        for (const auto& slot : mb->second) sam3_free_memory_slot(tracker, slot);
+        tracker.mem_banks.erase(mb);
+    }
+    auto pb = tracker.ptr_banks.find(inst_id);
+    if (pb != tracker.ptr_banks.end()) {
+        for (const auto& entry : pb->second)
+            if (entry.second) sam3_free_owned_buffer(tracker, entry.second->buffer);
+        tracker.ptr_banks.erase(pb);
+    }
+}
+
 static void sam3_update_tracker(sam3_tracker& tracker, int frame_idx) {
     for (auto it = tracker.pending.begin(); it != tracker.pending.end();) {
         int age = frame_idx - it->first_frame;
@@ -11493,17 +11641,35 @@ static void sam3_update_tracker(sam3_tracker& tracker, int frame_idx) {
             tracker.masklets.push_back(std::move(*it));
             it = tracker.pending.erase(it);
         } else if (age >= tracker.params.hotstart_delay) {
+            // Free the GPU buffers of the rejected pending instance, otherwise
+            // every unmatched detection leaks its memory bank forever.
+            sam3_drop_instance(tracker, it->instance_id);
             it = tracker.pending.erase(it);
         } else
             ++it;
     }
     for (auto it = tracker.masklets.begin(); it != tracker.masklets.end();) {
         if (frame_idx - it->last_seen > tracker.params.max_keep_alive) {
-            tracker.mem_banks.erase(it->instance_id);
-            tracker.ptr_banks.erase(it->instance_id);
+            sam3_drop_instance(tracker, it->instance_id);
             it = tracker.masklets.erase(it);
         } else
             ++it;
+    }
+
+    // Bound the number of pending (pre-confirmation) instances. Every pending
+    // instance owns GPU memory-bank buffers, so an unbounded PCS (e.g. many
+    // spurious detections per frame) would exhaust VRAM during the hotstart
+    // window. Drop the lowest-scoring pending instances once the cap is hit.
+    const size_t kMaxPending = 12;
+    if (tracker.pending.size() > kMaxPending) {
+        std::sort(tracker.pending.begin(), tracker.pending.end(),
+                  [](const sam3_masklet& a, const sam3_masklet& b) {
+                      return a.last_score > b.last_score;
+                  });
+        while (tracker.pending.size() > kMaxPending) {
+            sam3_drop_instance(tracker, tracker.pending.back().instance_id);
+            tracker.pending.pop_back();
+        }
     }
 }
 
@@ -11662,11 +11828,15 @@ static bool sam3_encode_memory(
             bool removed = false;
             for (auto it = bk.begin(); it != bk.end(); ++it)
                 if (!it->is_cond_frame) {
+                    sam3_free_memory_slot(tracker, *it);
                     bk.erase(it);
                     removed = true;
                     break;
                 }
-            if (!removed) bk.erase(bk.begin() + 1);
+            if (!removed) {
+                sam3_free_memory_slot(tracker, bk[1]);
+                bk.erase(bk.begin() + 1);
+            }
         }
         ggml_gallocr_free(ga);
         ggml_free(ctx0);
@@ -11703,11 +11873,15 @@ static bool sam3_encode_memory(
         bool removed = false;
         for (auto it = bk.begin(); it != bk.end(); ++it)
             if (!it->is_cond_frame) {
+                sam3_free_memory_slot(tracker, *it);
                 bk.erase(it);
                 removed = true;
                 break;
             }
-        if (!removed) bk.erase(bk.begin() + 1);
+        if (!removed) {
+            sam3_free_memory_slot(tracker, bk[1]);
+            bk.erase(bk.begin() + 1);
+        }
     }
     ggml_gallocr_free(ga);
     ggml_free(ctx0);
@@ -11730,7 +11904,10 @@ static void sam3_store_obj_ptr(
     ggml_backend_tensor_set(pt, pd, 0, D * sizeof(float));
     auto& bk = tracker.ptr_banks[inst_id];
     bk.push_back({frame_idx, pt});
-    while ((int)bk.size() > model.hparams.max_obj_ptrs) bk.erase(bk.begin());
+    while ((int)bk.size() > model.hparams.max_obj_ptrs) {
+        sam3_free_owned_buffer(tracker, bk.front().second->buffer);
+        bk.erase(bk.begin());
+    }
 }
 
 sam3_tracker_ptr sam3_create_tracker(const sam3_model& model,
@@ -11755,9 +11932,22 @@ sam3_result sam3_track_frame(sam3_tracker& tracker, sam3_state& state,
         return sam3_result{};
     }
 
+    if (!sam3_encode_image(state, model, frame)) return sam3_result{};
+    return sam3_track_frame_encoded(tracker, state, model);
+}
+
+// Track on an already-encoded frame (state must have been filled by
+// sam3_encode_image). Lets callers share a single encode across several
+// trackers / prompts instead of re-encoding the image per prompt.
+sam3_result sam3_track_frame_encoded(sam3_tracker& tracker, sam3_state& state,
+                                     const sam3_model& model) {
+    if (model.hparams.visual_only) {
+        fprintf(stderr, "%s: ERROR: track_frame_encoded not available on visual-only model\n", __func__);
+        return sam3_result{};
+    }
+
     sam3_result result;
     const int D = model.hparams.neck_dim;
-    if (!sam3_encode_image(state, model, frame)) return result;
     int fi = tracker.frame_index;
     fprintf(stderr, "%s: frame %d (%zu active + %zu pending)\n",
             __func__, fi, tracker.masklets.size(), tracker.pending.size());
@@ -11796,9 +11986,19 @@ sam3_result sam3_track_frame(sam3_tracker& tracker, sam3_state& state,
             ml.last_seen = fi;
             auto r2 = sam3_bilinear_interpolate(p2.mask_logits.data(),
                                                 p2.mask_w, p2.mask_h, state.orig_width, state.orig_height);
+            // Store the propagated mask so pending masklets participate in
+            // sam3_match_detections on this frame (otherwise every PCS
+            // detection creates a fresh pending masklet and IDs churn every
+            // frame; after hotstart_delay they all become duplicate actives).
+            pm[id].width = state.orig_width;
+            pm[id].height = state.orig_height;
+            pm[id].data.resize(state.orig_width * state.orig_height);
             int fg2 = 0;
-            for (auto v : r2)
-                if (v > 0.0f) fg2++;
+            for (int p = 0; p < (int)r2.size(); ++p) {
+                bool f = r2[p] > 0.0f;
+                pm[id].data[p] = f ? 255 : 0;
+                if (f) fg2++;
+            }
             float c2 = (float)fg2 / (state.orig_width * state.orig_height);
             ml.mds_sum += (c2 > 0.001f && p2.obj_score > 0.0f) ? 1 : -1;
             sam3_encode_memory(tracker, state, model, id,

@@ -245,6 +245,12 @@ sam3_result sam3_track_frame(sam3_tracker     & tracker,
                              const sam3_model & model,
                              const sam3_image & frame);
 
+/* Track on an already-encoded frame (state filled by sam3_encode_image).
+   Lets callers share a single encode across several trackers / prompts. */
+sam3_result sam3_track_frame_encoded(sam3_tracker     & tracker,
+                                     sam3_state       & state,
+                                     const sam3_model & model);
+
 /* Refine a tracked instance with interactive point prompts. */
 bool sam3_refine_instance(sam3_tracker                   & tracker,
                           sam3_state                     & state,

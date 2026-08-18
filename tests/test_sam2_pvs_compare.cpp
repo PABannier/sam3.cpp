@@ -4,6 +4,7 @@
 //   Default: orig 1200x1198, point at (600, 599)
 
 #include "sam3.h"
+#include "test_utils.h"
 #include <cstdio>
 #include <cstdlib>
 #include <fstream>
@@ -25,7 +26,7 @@ int main(int argc, char** argv) {
     float point_x = (argc > 6) ? atof(argv[6]) : 600.0f;
     float point_y = (argc > 7) ? atof(argv[7]) : 599.0f;
 
-    mkdir(argv[3], 0755);
+    SAM3_MKDIR(argv[3]);
 
     std::ifstream fin(argv[2], std::ios::binary);
     fin.seekg(0, std::ios::end);

@@ -1,0 +1,20 @@
+@PACKAGE_INIT@
+
+# Find all dependencies before creating any target.
+include(CMakeFindDependencyMacro)
+find_dependency(ggml)
+
+set_and_check(SAM3_INCLUDE_DIR "@PACKAGE_SAM3_INCLUDE_INSTALL_DIR@")
+set_and_check(SAM3_LIB_DIR     "@PACKAGE_SAM3_LIB_INSTALL_DIR@")
+
+if(NOT TARGET sam3::sam3)
+    add_library(sam3::sam3 STATIC IMPORTED)
+    set_target_properties(sam3::sam3
+        PROPERTIES
+            IMPORTED_LOCATION "${SAM3_LIB_DIR}/${CMAKE_STATIC_LIBRARY_PREFIX}sam3${CMAKE_STATIC_LIBRARY_SUFFIX}"
+            INTERFACE_INCLUDE_DIRECTORIES "${SAM3_INCLUDE_DIR}"
+            INTERFACE_LINK_LIBRARIES "ggml::all"
+            INTERFACE_COMPILE_FEATURES cxx_std_14)
+endif()
+
+check_required_components(sam3)
