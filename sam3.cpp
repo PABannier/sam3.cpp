@@ -47,14 +47,6 @@
 
 #include "stb_image_write.h"
 
-/* Logging: 0=silent, 1=summary timing, 2=verbose progress. Override with
-   -DSAM3_LOG_LEVEL=0 at build time for zero-overhead silent builds. */
-#ifndef SAM3_LOG_LEVEL
-#define SAM3_LOG_LEVEL 1
-#endif
-#define SAM3_LOG(level, ...) \
-    do { if ((level) <= SAM3_LOG_LEVEL) fprintf(stderr, __VA_ARGS__); } while (0)
-
 
 /*****************************************************************************
 ** Constants
@@ -6038,14 +6030,9 @@ bool sam3_encode_image(sam3_state& state,
         return sam2_encode_image_hiera(state, model, image);
     }
 
-#if SAM3_LOG_LEVEL >= 1
     auto t_start = std::chrono::high_resolution_clock::now();
-#endif
     const auto& hp = model.hparams;
     const int img_size = sam3_eff_img_size(state, hp);
-
-    SAM3_LOG(2, "%s: encoding %dx%d image → %dx%d\n", __func__,
-             image.width, image.height, img_size, img_size);
 
     state.orig_width = image.width;
     state.orig_height = image.height;
@@ -6114,25 +6101,19 @@ bool sam3_encode_image(sam3_state& state,
         return false;
     }
 
-    SAM3_LOG(2, "%s: graph allocated, %d nodes\n", __func__, ggml_graph_n_nodes(graph));
-
     ggml_backend_tensor_set(inp, img_data.data(), 0, img_data.size() * sizeof(float));
 
     {
-#if SAM3_LOG_LEVEL >= 1
         auto t0 = std::chrono::high_resolution_clock::now();
-#endif
         if (!sam3_graph_compute(model.backend, graph, state.n_threads)) {
             ggml_gallocr_free(galloc);
             ggml_free(ctx0);
             return false;
         }
-#if SAM3_LOG_LEVEL >= 1
         auto t1 = std::chrono::high_resolution_clock::now();
         double compute_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
-        SAM3_LOG(1, "%s: graph computed in %.1f ms (%d threads)\n",
-                 __func__, compute_ms, state.n_threads);
-#endif
+        fprintf(stderr, "%s: graph computed in %.1f ms (%d threads)\n",
+                __func__, compute_ms, state.n_threads);
     }
 
     if (state.galloc) ggml_gallocr_free(state.galloc);
@@ -6207,11 +6188,9 @@ bool sam3_encode_image(sam3_state& state,
     // Invalidate PE cache so it's re-populated on next PVS call if needed
     state.pe_cache_valid = false;
 
-#if SAM3_LOG_LEVEL >= 1
     auto t_end = std::chrono::high_resolution_clock::now();
     double total_ms = std::chrono::duration<double, std::milli>(t_end - t_start).count();
-    SAM3_LOG(1, "%s: image encoded successfully in %.1f ms\n", __func__, total_ms);
-#endif
+    fprintf(stderr, "%s: image encoded successfully in %.1f ms\n", __func__, total_ms);
     return true;
 }
 
@@ -9671,9 +9650,7 @@ sam3_result sam3_segment_pcs(sam3_state& state,
         return sam3_result{};
     }
 
-#if SAM3_LOG_LEVEL >= 1
     auto t_start = std::chrono::high_resolution_clock::now();
-#endif
     const auto& hp = model.hparams;
     const int D = hp.neck_dim;           // 256
     const int H = hp.n_img_embd();       // 72
@@ -9695,9 +9672,6 @@ sam3_result sam3_segment_pcs(sam3_state& state,
         fprintf(stderr, "%s: failed to tokenize text prompt\n", __func__);
         return result;
     }
-
-    SAM3_LOG(2, "%s: text='%s', %zu tokens\n", __func__,
-             params.text_prompt.c_str(), token_ids.size());
 
     // ── Helper: run a sub-graph with its own context and allocator ──────
     // Each stage below follows this exact pattern:
@@ -9804,8 +9778,6 @@ sam3_result sam3_segment_pcs(sam3_state& state,
         ggml_free(ctx);
     }
 
-    SAM3_LOG(2, "%s: text encoder done\n", __func__);
-
     /*
     ** ── SUB-GRAPH 2: Geometry Encoder ────────────────────────────────
     */
@@ -9859,14 +9831,11 @@ sam3_result sam3_segment_pcs(sam3_state& state,
         ggml_free(ctx);
     }
 
-    SAM3_LOG(2, "%s: geometry encoder done\n", __func__);
-
     // Build combined prompt on CPU: [text_feats, geo_feats] → [D * T]
     std::vector<float> combined_prompt_cpu(D * T);
     memcpy(combined_prompt_cpu.data(), text_feats_cpu.data(), D * L * sizeof(float));
     memcpy(combined_prompt_cpu.data() + D * L, geo_feats_cpu.data(), D * N_geo * sizeof(float));
 
-    SAM3_LOG(2, "%s: starting fusion encoder\n", __func__);
     /*
     ** ── SUB-GRAPH 3: Fusion Encoder ──────────────────────────────────
     */
@@ -9915,15 +9884,10 @@ sam3_result sam3_segment_pcs(sam3_state& state,
         }
         ggml_backend_tensor_get(out, fenc_output_cpu.data(), 0, D * N_spatial * sizeof(float));
 
-        SAM3_LOG(2, "%s: fenc_out[0..4] = [%.6f, %.6f, %.6f, %.6f, %.6f]\n",
-                 __func__, fenc_output_cpu[0], fenc_output_cpu[1], fenc_output_cpu[2],
-                 fenc_output_cpu[3], fenc_output_cpu[4]);
-
         ggml_gallocr_free(alloc);
         ggml_free(ctx);
     }
 
-    SAM3_LOG(2, "%s: fusion encoder done\n", __func__);
     /*
     ** ── SUB-GRAPH 4: DETR Decoder + Scoring ──────────────────────────
     */
@@ -10017,7 +9981,6 @@ sam3_result sam3_segment_pcs(sam3_state& state,
 
     float presence_prob = 1.0f / (1.0f + expf(-presence_logit));
 
-    SAM3_LOG(2, "%s: DETR decoder done\n", __func__);
     /*
     ** ── SUB-GRAPH 5: Segmentation Head ───────────────────────────────
     */
@@ -10063,8 +10026,6 @@ sam3_result sam3_segment_pcs(sam3_state& state,
 
         auto* graph = ggml_new_graph_custom(ctx, 32768, false);
         ggml_build_forward_expand(graph, out);
-
-        SAM3_LOG(2, "%s: seg head graph: %d nodes\n", __func__, ggml_graph_n_nodes(graph));
 
         auto* alloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(model.backend));
         if (!ggml_gallocr_reserve(alloc, graph) || !ggml_gallocr_alloc_graph(alloc, graph)) {
@@ -10141,22 +10102,15 @@ sam3_result sam3_segment_pcs(sam3_state& state,
         dets.push_back(std::move(det));
     }
 
-    SAM3_LOG(2, "%s: %zu detections above threshold %.2f (presence=%.3f, logit=%.3f)\n",
-             __func__, dets.size(), params.score_threshold, presence_prob, presence_logit);
-
     auto keep = sam3_nms(dets, params.nms_threshold);
     for (int i = 0; i < (int)keep.size(); ++i) {
         dets[keep[i]].instance_id = i + 1;
         result.detections.push_back(std::move(dets[keep[i]]));
     }
 
-    SAM3_LOG(2, "%s: %zu detections after NMS\n", __func__, result.detections.size());
-
-#if SAM3_LOG_LEVEL >= 1
     auto t_end = std::chrono::high_resolution_clock::now();
     double total_ms = std::chrono::duration<double, std::milli>(t_end - t_start).count();
-    SAM3_LOG(1, "%s: completed in %.1f ms\n", __func__, total_ms);
-#endif
+    fprintf(stderr, "%s: completed in %.1f ms\n", __func__, total_ms);
 
     return result;
 }
@@ -10765,9 +10719,7 @@ static sam3_dec_result sam3_build_sam_dec_graph(
 sam3_result sam3_segment_pvs(sam3_state& state,
                              const sam3_model& model,
                              const sam3_pvs_params& params) {
-#if SAM3_LOG_LEVEL >= 1
     auto t_start = std::chrono::high_resolution_clock::now();
-#endif
     const auto& hp = model.hparams;
     const int D = hp.sam_embed_dim;                      // 256
     const int H = sam3_eff_feat_size(state, hp);
@@ -10784,10 +10736,6 @@ sam3_result sam3_segment_pvs(sam3_state& state,
         fprintf(stderr, "%s: no prompts provided (need at least one point or box)\n", __func__);
         return result;
     }
-
-    SAM3_LOG(2, "%s: %zu pos points, %zu neg points, box=%s, multimask=%s\n",
-             __func__, params.pos_points.size(), params.neg_points.size(),
-             params.use_box ? "yes" : "no", params.multimask ? "yes" : "no");
 
     // ── Build computation graph ──────────────────────────────────────────
     const size_t buf_size = ggml_tensor_overhead() * 8192 + ggml_graph_overhead() * 2;
@@ -10861,8 +10809,6 @@ sam3_result sam3_segment_pvs(sam3_state& state,
         ggml_free(ctx0);
         return result;
     }
-
-    SAM3_LOG(2, "%s: graph allocated, %d nodes\n", __func__, ggml_graph_n_nodes(graph));
 
     // Set default obj_score when pred_obj_scores=False (older SAM2 models)
     if (!model.sam_dec.obj_score_token) {
@@ -10958,20 +10904,16 @@ sam3_result sam3_segment_pvs(sam3_state& state,
 
     // ── Compute ──────────────────────────────────────────────────────────
     {
-#if SAM3_LOG_LEVEL >= 1
         auto t0 = std::chrono::high_resolution_clock::now();
-#endif
         if (!sam3_graph_compute(model.backend, graph, state.n_threads)) {
             ggml_gallocr_free(galloc);
             ggml_free(ctx0);
             return result;
         }
-#if SAM3_LOG_LEVEL >= 1
         auto t1 = std::chrono::high_resolution_clock::now();
         double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
-        SAM3_LOG(1, "%s: graph computed in %.1f ms (%d threads)\n",
-                 __func__, ms, state.n_threads);
-#endif
+        fprintf(stderr, "%s: graph computed in %.1f ms (%d threads)\n",
+                __func__, ms, state.n_threads);
     }
 
     // ── Dump decoder outputs if SAM2_DUMP_DIR set ──────────────────────
@@ -11041,10 +10983,6 @@ sam3_result sam3_segment_pvs(sam3_state& state,
     std::vector<float> sam_token_data(D);
     ggml_backend_tensor_get(dec_out.sam_token, sam_token_data.data(), 0, D * sizeof(float));
 
-    SAM3_LOG(2, "%s: obj_score=%.4f (logit=%.4f), iou=[%.3f, %.3f, %.3f, %.3f]\n",
-             __func__, obj_score, obj_logit,
-             iou_data[0], iou_data[1], iou_data[2], iou_data[3]);
-
     // ── Select masks based on multimask mode ─────────────────────────────
     // Python: if multimask_output → masks[:, 1:, :, :], iou_pred[:, 1:]
     //         else                → masks[:, 0:1, :, :], iou_pred[:, 0:1]
@@ -11099,17 +11037,13 @@ sam3_result sam3_segment_pvs(sam3_state& state,
         result.detections.push_back(std::move(det));
     }
 
-    SAM3_LOG(2, "%s: %zu masks returned\n", __func__, result.detections.size());
-
     // ── Cleanup ──────────────────────────────────────────────────────────
     ggml_gallocr_free(galloc);
     ggml_free(ctx0);
 
-#if SAM3_LOG_LEVEL >= 1
     auto t_end = std::chrono::high_resolution_clock::now();
     double total_ms = std::chrono::duration<double, std::milli>(t_end - t_start).count();
-    SAM3_LOG(1, "%s: completed in %.1f ms\n", __func__, total_ms);
-#endif
+    fprintf(stderr, "%s: completed in %.1f ms\n", __func__, total_ms);
 
     return result;
 }
@@ -11162,14 +11096,9 @@ static void sam3_ensure_tracker_pe_caches(sam3_tracker& tracker, const sam3_hpar
                 tracker.cached_axial_cis_k16_reord[0 + i * 2 + n * D] = rope_k16_raw[n * D + i * 2 + 0];
                 tracker.cached_axial_cis_k16_reord[1 + i * 2 + n * D] = rope_k16_raw[n * D + i * 2 + 1];
             }
-        SAM3_LOG(2, "%s: EdgeTAM K16 RoPE cache: %zu floats\n", __func__,
-                 tracker.cached_axial_cis_k16_reord.size());
     }
 
     tracker.pe_caches_valid = true;
-    SAM3_LOG(2, "%s: tracker PE caches populated (%.1f KB)\n", __func__,
-             (tracker.cached_sinpe_256.size() + tracker.cached_sinpe_64.size() +
-              tracker.cached_axial_cis_reord.size()) * sizeof(float) / 1024.0f);
 }
 
 static sam3_prop_output sam3_propagate_single(
@@ -11966,7 +11895,6 @@ sam3_result sam3_track_frame(sam3_tracker& tracker, sam3_state& state,
         sam3_remove_sprinkles(d.mask.data.data(), d.mask.width, d.mask.height, tracker.params.fill_hole_area);
     }
     tracker.frame_index++;
-    SAM3_LOG(2, "%s: frame %d done — %zu tracked\n", __func__, fi, result.detections.size());
     return result;
 }
 
@@ -12010,7 +11938,6 @@ bool sam3_refine_instance(sam3_tracker& tracker, sam3_state& state,
         std::fill(op.begin(), op.end(), 0.0f);
     }
     sam3_store_obj_ptr(tracker, model, instance_id, op.data(), fi);
-    SAM3_LOG(2, "%s: refined instance %d\n", __func__, instance_id);
     return true;
 }
 
@@ -12083,7 +12010,6 @@ int sam3_tracker_add_instance(sam3_tracker& tracker, sam3_state& state,
     ml.mds_sum = 1;
     tracker.masklets.push_back(std::move(ml));
 
-    SAM3_LOG(2, "%s: added instance #%d (score=%.3f)\n", __func__, inst_id, det.score);
     return inst_id;
 }
 
@@ -12254,8 +12180,6 @@ sam3_result sam3_propagate_frame(
                               tracker.params.fill_hole_area);
     }
     tracker.frame_index++;
-    SAM3_LOG(2, "%s: frame %d done — %zu tracked\n",
-             __func__, fi, result.detections.size());
     return result;
 }
 
