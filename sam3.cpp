@@ -3403,11 +3403,6 @@ sam3_state_ptr sam3_create_state(const sam3_model& model,
     return state;
 }
 
-void sam3_state_set_orig_dims(sam3_state& state, int w, int h) {
-    state.orig_width = w;
-    state.orig_height = h;
-}
-
 void sam3_free_state(sam3_state& state) {
     if (state.galloc) {
         ggml_gallocr_free(state.galloc);
@@ -6902,19 +6897,6 @@ static struct ggml_tensor* sam3_inverse_sigmoid(struct ggml_context* ctx, struct
     auto* one_minus = ggml_scale_bias(ctx, x, -1.0f, 1.0f);
     auto* log_1mx = ggml_log(ctx, one_minus);
     return ggml_sub(ctx, log_x, log_1mx);
-}
-
-// Box refinement MLP (3 layers: D→D→D→4 with ReLU)
-static struct ggml_tensor* sam3_bbox_mlp(struct ggml_context* ctx,
-                                         struct ggml_tensor* x,
-                                         struct ggml_tensor* w[3],
-                                         struct ggml_tensor* b[3]) {
-    for (int j = 0; j < 3; ++j) {
-        x = ggml_mul_mat(ctx, w[j], x);
-        x = ggml_add(ctx, x, b[j]);
-        if (j < 2) x = ggml_relu(ctx, x);
-    }
-    return x;
 }
 
 // Build sinusoidal positional embedding for 4D reference points in the ggml graph.
