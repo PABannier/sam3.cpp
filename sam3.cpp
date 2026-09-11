@@ -101,12 +101,9 @@ struct sam3_hparams {
 
     int32_t ddec_layers       = 6;
     int32_t ddec_heads        = 8;
-    int32_t ddec_ffn_dim      = 2048;
     int32_t ddec_num_queries  = 200;
 
     int32_t geom_layers        = 3;
-    int32_t n_presence_tokens  = 1;
-    int32_t n_geom_queries     = 4;
 
     int32_t sam_embed_dim     = 256;
     int32_t sam_dec_depth     = 2;
@@ -118,7 +115,6 @@ struct sam3_hparams {
     int32_t num_maskmem     = 7;
     int32_t max_obj_ptrs    = 16;
 
-    int32_t n_amb_experts   = 2;
 
     int32_t visual_only     = 0;  // 1 = no text encoder / detector path
 
@@ -141,19 +137,9 @@ struct sam3_hparams {
     // ── SAM2-specific memory/tracking flags ─────────────────────────────
     int32_t sigmoid_scale_x100                  = 2000;
     int32_t sigmoid_bias_x100                   = -1000;
-    int32_t use_high_res_features               = 1;
-    int32_t use_obj_ptrs_in_encoder             = 1;
     int32_t pred_obj_scores                     = 1;
     int32_t use_multimask_token_for_obj_ptr     = 1;
-    int32_t directly_add_no_mem_embed           = 1;
-    int32_t non_overlap_masks_for_mem_enc       = 1;
-    int32_t binarize_mask_from_pts              = 0;
-    int32_t multimask_output_for_tracking       = 1;
-    int32_t multimask_min_pt_num                = 0;
-    int32_t multimask_max_pt_num                = 1;
     int32_t fixed_no_obj_ptr                    = 1;
-    int32_t iou_prediction_use_sigmoid          = 1;
-    int32_t use_mask_input_as_output            = 1;
     int32_t multimask_output_in_sam             = 1;
     int32_t is_sam2_1                           = 1;  // 0 = SAM2.0, 1 = SAM2.1
 
@@ -172,8 +158,6 @@ struct sam3_hparams {
     int32_t perceiver_ff_mult         = 0;
 
     int32_t mem_attn_ca_type          = 0;   // 0=RoPEv1, 1=RoPEv2
-    int32_t mem_attn_ca_q_size        = 32;
-    int32_t mem_attn_ca_k_size        = 32;
 
     // ── SAM3 derived helpers ────────────────────────────────────────────
     int32_t n_img_embd() const { return img_size / patch_size; }            // 72
@@ -1480,6 +1464,7 @@ static std::vector<int32_t> sam3_tokenize(sam3_bpe_tokenizer& tok,
 
 static bool sam3_load_hparams(std::ifstream& fin, sam3_hparams& hp) {
     auto rd = [&](int32_t& v) { fin.read(reinterpret_cast<char*>(&v), 4); };
+    auto skip = [&](int n) { fin.seekg(4 * n, std::ios::cur); };
     rd(hp.img_size);
     rd(hp.patch_size);
     rd(hp.vit_embed_dim);
@@ -1505,11 +1490,10 @@ static bool sam3_load_hparams(std::ifstream& fin, sam3_hparams& hp) {
     rd(hp.fenc_ffn_dim);
     rd(hp.ddec_layers);
     rd(hp.ddec_heads);
-    rd(hp.ddec_ffn_dim);
+    skip(1);  // ddec_ffn_dim
     rd(hp.ddec_num_queries);
     rd(hp.geom_layers);
-    rd(hp.n_presence_tokens);
-    rd(hp.n_geom_queries);
+    skip(2);  // n_presence_tokens, n_geom_queries
     rd(hp.sam_embed_dim);
     rd(hp.sam_dec_depth);
     rd(hp.sam_n_multimask);
@@ -1518,7 +1502,7 @@ static bool sam3_load_hparams(std::ifstream& fin, sam3_hparams& hp) {
     rd(hp.mem_attn_layers);
     rd(hp.num_maskmem);
     rd(hp.max_obj_ptrs);
-    rd(hp.n_amb_experts);
+    skip(1);  // n_amb_experts
     rd(hp.visual_only);
     return !fin.fail();
 }
@@ -1547,6 +1531,7 @@ static void sam3_print_hparams(const sam3_hparams& hp) {
 
 static bool edgetam_load_extra_hparams(std::ifstream& fin, sam3_hparams& hp) {
     auto rd = [&](int32_t& v) { fin.read(reinterpret_cast<char*>(&v), 4); };
+    auto skip = [&](int n) { fin.seekg(4 * n, std::ios::cur); };
     rd(hp.repvit_num_stages);
     for (int i = 0; i < 4; ++i) rd(hp.repvit_stages[i]);
     for (int i = 0; i < 4; ++i) rd(hp.repvit_channels[i]);
@@ -1558,8 +1543,7 @@ static bool edgetam_load_extra_hparams(std::ifstream& fin, sam3_hparams& hp) {
     rd(hp.perceiver_n_latents_2d);
     rd(hp.perceiver_ff_mult);
     rd(hp.mem_attn_ca_type);
-    rd(hp.mem_attn_ca_q_size);
-    rd(hp.mem_attn_ca_k_size);
+    skip(2);  // mem_attn_ca_q_size, mem_attn_ca_k_size
     return !fin.fail();
 }
 
@@ -1567,6 +1551,7 @@ static bool edgetam_load_extra_hparams(std::ifstream& fin, sam3_hparams& hp) {
 
 static bool sam2_load_hparams(std::ifstream& fin, sam3_hparams& hp) {
     auto rd = [&](int32_t& v) { fin.read(reinterpret_cast<char*>(&v), 4); };
+    auto skip = [&](int n) { fin.seekg(4 * n, std::ios::cur); };
 
     rd(hp.img_size);
     int32_t backbone_type;
@@ -1601,19 +1586,13 @@ static bool sam2_load_hparams(std::ifstream& fin, sam3_hparams& hp) {
     rd(hp.sigmoid_scale_x100);
     rd(hp.sigmoid_bias_x100);
 
-    rd(hp.use_high_res_features);
-    rd(hp.use_obj_ptrs_in_encoder);
+    skip(2);  // use_high_res_features, use_obj_ptrs_in_encoder
     rd(hp.pred_obj_scores);
     rd(hp.use_multimask_token_for_obj_ptr);
-    rd(hp.directly_add_no_mem_embed);
-    rd(hp.non_overlap_masks_for_mem_enc);
-    rd(hp.binarize_mask_from_pts);
-    rd(hp.multimask_output_for_tracking);
-    rd(hp.multimask_min_pt_num);
-    rd(hp.multimask_max_pt_num);
+    skip(6);  // directly_add_no_mem_embed, non_overlap_masks_for_mem_enc, binarize_mask_from_pts,
+              // multimask_output_for_tracking, multimask_min_pt_num, multimask_max_pt_num
     rd(hp.fixed_no_obj_ptr);
-    rd(hp.iou_prediction_use_sigmoid);
-    rd(hp.use_mask_input_as_output);
+    skip(2);  // iou_prediction_use_sigmoid, use_mask_input_as_output
     rd(hp.multimask_output_in_sam);
     rd(hp.is_sam2_1);
 
