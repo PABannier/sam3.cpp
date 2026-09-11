@@ -202,13 +202,6 @@ Metal is enabled automatically on macOS. To disable it:
 cmake .. -DSAM3_METAL=OFF
 ```
 
-To build tests:
-
-```bash
-cmake .. -DSAM3_BUILD_TESTS=ON
-make -j
-```
-
 ## Usage
 
 ### Image Segmentation (Interactive GUI)

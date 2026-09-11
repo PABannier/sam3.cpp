@@ -75,8 +75,6 @@ Only: ggml (submodule), stb_image/stb_image_write (vendored in `stb/`), C++14 st
 cd build && cmake .. && make -j$(sysctl -n hw.ncpu)
 ```
 
-Tests: `cmake .. -DSAM3_BUILD_TESTS=ON`
-
 ## Benchmarking
 
 `sam3_benchmark` tracks an object across video frames and reports latency for every model × backend combination. Each run is forked into a subprocess so a crash does not kill the suite.

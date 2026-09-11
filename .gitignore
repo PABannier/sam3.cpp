@@ -28,10 +28,6 @@ __pycache__
 
 # Test artifacts
 /tmp/
-tests/output/
-tests/cpp_*
-tests/debug_*
-tests/ref*/
 raw_weights/
 
 # Test data

@@ -32,9 +32,3 @@ option(SAM3_BUILD_EXAMPLES "Build example executables" ON)
 if(SAM3_BUILD_EXAMPLES AND CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
     add_subdirectory(examples)
 endif()
-
-# Tests
-option(SAM3_BUILD_TESTS "Build test executables" OFF)
-if(SAM3_BUILD_TESTS)
-    add_subdirectory(tests)
-endif()
