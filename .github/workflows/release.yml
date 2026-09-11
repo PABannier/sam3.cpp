@@ -90,7 +90,7 @@ jobs:
           cp sam3.h staging/${{ matrix.artifact }}/include/
           cp -r ggml/include/* staging/${{ matrix.artifact }}/include/
 
-          for bin in sam3_quantize sam3_benchmark sam3_profile_edgetam; do
+          for bin in sam3_quantize sam3_benchmark; do
             if [ -f "build/examples/${bin}" ]; then
               cp "build/examples/${bin}" staging/${{ matrix.artifact }}/bin/
             fi
@@ -121,7 +121,7 @@ jobs:
           Get-ChildItem -Path ggml/include -Filter "*.h" | Copy-Item -Destination staging/${{ matrix.artifact }}/include/
 
           # Example binaries
-          foreach ($bin in @("sam3_quantize", "sam3_benchmark", "sam3_profile_edgetam")) {
+          foreach ($bin in @("sam3_quantize", "sam3_benchmark")) {
             $paths = @("build/examples/Release/${bin}.exe", "build/examples/${bin}.exe")
             foreach ($p in $paths) {
               if (Test-Path $p) { Copy-Item $p staging/${{ matrix.artifact }}/bin/; break }

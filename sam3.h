@@ -275,26 +275,3 @@ sam3_image      sam3_load_image(const std::string & path);
 bool            sam3_save_mask(const sam3_mask & mask, const std::string & path);
 sam3_image      sam3_decode_video_frame(const std::string & video_path, int frame_index);
 sam3_video_info sam3_get_video_info(const std::string & video_path);
-
-/*
-** ── Profiling ───────────────────────────────────────────────────────────
-*/
-
-/*
-** Profile the EdgeTAM image encoder (RepViT backbone + FPN neck).
-**
-** Runs the full graph once for a total timing and op summary, then builds
-** and times each stage as a separate sub-graph to produce a per-stage
-** latency breakdown:
-**   - Stem (2 convolutions)
-**   - Stage 0..3 (downsample + RepViT blocks)
-**   - FPN neck (lateral convolutions + top-down fusion)
-**
-** n_warmup iterations are run before n_iter timed iterations.
-** Results are printed to stderr.
-*/
-bool sam3_profile_edgetam_encode(const sam3_model & model,
-                                 const sam3_image & image,
-                                 int                n_threads = 4,
-                                 int                n_warmup  = 2,
-                                 int                n_iter    = 5);
