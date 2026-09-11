@@ -241,20 +241,13 @@ void sam3_tracker_reset(sam3_tracker & tracker);
 ** ── Visual-Only Video Tracking ──────────────────────────────────────────
 */
 
-struct sam3_visual_track_params {
-    float assoc_iou_threshold = 0.1f;
-    int   max_keep_alive      = 30;
-    int   recondition_every   = 16;
-    int   fill_hole_area      = 16;
-};
-
 /*
 ** Create a tracker for visual-only models.  Instances are added manually
-** via sam3_tracker_add_instance().
+** via sam3_tracker_add_instance().  params.text_prompt is ignored.
 */
 sam3_tracker_ptr sam3_create_visual_tracker(
-    const sam3_model               & model,
-    const sam3_visual_track_params & params);
+    const sam3_model        & model,
+    const sam3_video_params & params);
 
 /*
 ** Propagate all tracked instances to the next frame (no detection step).

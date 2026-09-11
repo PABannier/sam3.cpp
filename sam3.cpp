@@ -10839,15 +10839,10 @@ void sam3_tracker_reset(sam3_tracker& tracker) {
 
 sam3_tracker_ptr sam3_create_visual_tracker(
         const sam3_model& model,
-        const sam3_visual_track_params& params) {
-    sam3_video_params vp;
-    vp.text_prompt          = "";  // no PCS detection
-    vp.assoc_iou_threshold  = params.assoc_iou_threshold;
-    vp.max_keep_alive       = params.max_keep_alive;
-    vp.recondition_every    = params.recondition_every;
-    vp.fill_hole_area       = params.fill_hole_area;
+        const sam3_video_params& params) {
     sam3_tracker_ptr tracker(new sam3_tracker());
-    tracker->params = vp;
+    tracker->params = params;
+    tracker->params.text_prompt.clear();  // no PCS detection
     fprintf(stderr, "%s: visual-only tracker created (max_keep_alive=%d)\n",
             __func__, params.max_keep_alive);
     return tracker;

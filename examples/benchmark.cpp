@@ -235,7 +235,7 @@ static BenchWire run_single_benchmark(const std::string & model_path,
     sam3_tracker_ptr tracker;
 
     if (visual_only) {
-        sam3_visual_track_params vtp;
+        sam3_video_params vtp;
         vtp.max_keep_alive    = 100;
         vtp.recondition_every = 16;
         tracker = sam3_create_visual_tracker(*model, vtp);
