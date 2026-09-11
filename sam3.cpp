@@ -10160,41 +10160,6 @@ static struct ggml_tensor* sam3_sam_attention(
     auto* out = ggml_flash_attn_ext(ctx, Q, K, V, nullptr, scale, 0.0f, 0.0f);
     // out: [HD, NH, N_q, B] (flash_attn_ext swaps dims 1,2 vs input)
 
-#if 0  // Manual SDPA (for debugging only)
-    auto* Q3 = ggml_reshape_3d(ctx, Q, HD, N_q, n_heads * B);
-    auto* K3 = ggml_reshape_3d(ctx, K, HD, N_kv, n_heads * B);
-    auto* V3 = ggml_reshape_3d(ctx, V, HD, N_kv, n_heads * B);
-    // QK^T: ggml_mul_mat(K, Q) → K^T @ Q → [N_kv, N_q, NH*B]
-    auto* attn_scores = ggml_mul_mat(ctx, K3, Q3);
-    attn_scores = ggml_scale(ctx, attn_scores, scale);
-    attn_scores = ggml_soft_max(ctx, attn_scores);
-
-    // attn @ V: need attn^T [N_q, N_kv] and V^T [HD, N_kv]
-    // ggml_mul_mat(attn^T, V) = (attn^T)^T @ V = attn @ V = [N_q, HD]... no.
-    // ggml_mul_mat(A, B) = A^T @ B where A=[K, M], B=[K, N] → [M, N]
-    // Want: output[q, d] = sum_k attn[q, k] * V[k, d]
-    // = (V^T @ attn^T)^T... let me think differently.
-    // attn_scores is [N_kv, N_q, NH*B]. For each head:
-    //   attn[k, q] = attn_scores[k, q]  (col q has the weights for query q)
-    // V3 is [HD, N_kv, NH*B].
-    // Want: out[d, q] = sum_k V[d, k] * attn[k, q] = V @ attn
-    // = ggml_mul_mat? mul_mat(A, B) = A^T B with A=[K, M], B=[K, N] → [M, N]
-    // V has ne=[HD, N_kv, ...]. attn has ne=[N_kv, N_q, ...].
-    // If A=V3 (ne0=HD, ne1=N_kv) and B=attn_scores (ne0=N_kv, ne1=N_q):
-    // Shared dim ne0: V3 ne0=HD ≠ attn ne0=N_kv. Mismatch!
-    //
-    // Need to transpose V: V^T is [N_kv, HD]. Then A=V^T, B=attn_scores.
-    // A ne0=N_kv, B ne0=N_kv → shared. A^T B = V @ attn → [HD, N_q]. ✓
-    auto* VT = ggml_permute(ctx, V3, 1, 0, 2, 3);  // [N_kv, HD, NH*B]
-    VT = ggml_cont(ctx, VT);
-    auto* out3 = ggml_mul_mat(ctx, VT, attn_scores);  // [HD, N_q, NH*B]
-
-    // Reshape back to 4D: [HD, N_q, NH, B]
-    auto* out = ggml_reshape_4d(ctx, out3, HD, N_q, n_heads, B);
-    // Permute to [HD, NH, N_q, B] to match flash_attn_ext output convention
-    out = ggml_cont(ctx, ggml_permute(ctx, out, 0, 2, 1, 3));
-#endif
-
     // Merge heads: [ID=HD*NH, N_q, B]
     auto* merged = ggml_reshape_3d(ctx, out, ID, N_q, B);
 
