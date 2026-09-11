@@ -148,7 +148,6 @@ struct vapp_state {
 
     // Model type
     bool                    visual_only = false;
-    sam3_visual_track_params visual_track_params;
 
     // Timeline: per-frame instance presence
     // timeline_instances[frame_index] = list of {instance_id, score}
@@ -218,11 +217,7 @@ static bool screen_to_image(const vapp_state& app, float sx, float sy,
 static void create_tracker(vapp_state& app) {
     if (app.visual_only) {
         // SAM2 / visual-only: use visual tracker (no text detection)
-        app.visual_track_params.assoc_iou_threshold = app.track_params.assoc_iou_threshold;
-        app.visual_track_params.max_keep_alive      = app.track_params.max_keep_alive;
-        app.visual_track_params.recondition_every    = app.track_params.recondition_every;
-        app.visual_track_params.fill_hole_area       = app.track_params.fill_hole_area;
-        app.tracker = sam3_create_visual_tracker(*app.model, app.visual_track_params);
+        app.tracker = sam3_create_visual_tracker(*app.model, app.track_params);
     } else {
         if (app.init_mode == VMODE_TEXT)
             app.track_params.text_prompt = app.text_prompt;
