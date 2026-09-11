@@ -39,10 +39,6 @@ sam3.cpp — a C++14 port of Meta's SAM 3 (Segment Anything Model 3) using ggml 
 
 **Functions that follow this pattern:** `sam3_segment_pcs` (5 sub-graphs), `sam3_segment_pvs`, `sam3_propagate_single`, `sam3_encode_memory`.
 
-## Implementation plan
-
-All work follows the phased plan in `PLAN.md`. Read it before starting any phase. Each phase has concrete steps, verification criteria, and the exact structs/functions to implement.
-
 ## Reference implementations
 
 When lost on how to structure the ggml forward pass, how to build graphs, or how to load weights:
