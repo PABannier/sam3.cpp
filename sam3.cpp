@@ -10298,39 +10298,11 @@ static void sam3_populate_pe_cache(sam3_state& state, const sam3_model& model) {
     const auto& pe = model.sam_pe;
 
     state.pe_gauss_cache.resize(pe_nel);
-    if (pe.pe_gaussian->type == GGML_TYPE_F16) {
-        std::vector<ggml_fp16_t> tmp(pe_nel);
-        ggml_backend_tensor_get(pe.pe_gaussian, tmp.data(), 0, pe_nel * sizeof(ggml_fp16_t));
-        ggml_fp16_to_fp32_row(tmp.data(), state.pe_gauss_cache.data(), pe_nel);
-    } else {
-        ggml_backend_tensor_get(pe.pe_gaussian, state.pe_gauss_cache.data(), 0, pe_nel * sizeof(float));
-    }
-
-    for (int i = 0; i < 4; ++i) {
-        if (pe.point_embed[i]->type == GGML_TYPE_F16) {
-            std::vector<ggml_fp16_t> tmp(D);
-            ggml_backend_tensor_get(pe.point_embed[i], tmp.data(), 0, D * sizeof(ggml_fp16_t));
-            ggml_fp16_to_fp32_row(tmp.data(), state.point_emb_cache[i], D);
-        } else {
-            ggml_backend_tensor_get(pe.point_embed[i], state.point_emb_cache[i], 0, D * sizeof(float));
-        }
-    }
-
-    if (pe.not_a_point_embed->type == GGML_TYPE_F16) {
-        std::vector<ggml_fp16_t> tmp(D);
-        ggml_backend_tensor_get(pe.not_a_point_embed, tmp.data(), 0, D * sizeof(ggml_fp16_t));
-        ggml_fp16_to_fp32_row(tmp.data(), state.not_a_point_cache, D);
-    } else {
-        ggml_backend_tensor_get(pe.not_a_point_embed, state.not_a_point_cache, 0, D * sizeof(float));
-    }
-
-    if (pe.no_mask_embed->type == GGML_TYPE_F16) {
-        std::vector<ggml_fp16_t> tmp(D);
-        ggml_backend_tensor_get(pe.no_mask_embed, tmp.data(), 0, D * sizeof(ggml_fp16_t));
-        ggml_fp16_to_fp32_row(tmp.data(), state.no_mask_emb_cache, D);
-    } else {
-        ggml_backend_tensor_get(pe.no_mask_embed, state.no_mask_emb_cache, 0, D * sizeof(float));
-    }
+    sam3_read_f32(pe.pe_gaussian, state.pe_gauss_cache.data(), pe_nel);
+    for (int i = 0; i < 4; ++i)
+        sam3_read_f32(pe.point_embed[i], state.point_emb_cache[i], D);
+    sam3_read_f32(pe.not_a_point_embed, state.not_a_point_cache, D);
+    sam3_read_f32(pe.no_mask_embed, state.no_mask_emb_cache, D);
 
     state.dense_pe_cache.resize(D * H * H);
     for (int row = 0; row < H; ++row) {
@@ -11602,14 +11574,7 @@ static bool sam3_encode_memory(
     // Apply no_obj_embed_spatial if occluded (SAM2.1 only — EdgeTAM does not have this)
     if (obj_score <= 0.0f && model.no_obj_embed_spatial) {
         std::vector<float> no_obj_emb(MD);
-        auto* noe = model.no_obj_embed_spatial;
-        if (noe->type == GGML_TYPE_F16) {
-            std::vector<ggml_fp16_t> tmp(MD);
-            ggml_backend_tensor_get(noe, tmp.data(), 0, MD * sizeof(ggml_fp16_t));
-            ggml_fp16_to_fp32_row(tmp.data(), no_obj_emb.data(), MD);
-        } else {
-            ggml_backend_tensor_get(noe, no_obj_emb.data(), 0, MD * sizeof(float));
-        }
+        sam3_read_f32(model.no_obj_embed_spatial, no_obj_emb.data(), MD);
         for (int i = 0; i < MD * H * H; ++i)
             md[i] += no_obj_emb[i % MD];
     }
@@ -11950,14 +11915,7 @@ sam3_result sam3_track_frame(sam3_tracker& tracker, sam3_state& state,
             // Store a dummy object pointer (from no_obj_ptr since we don't
             // have a SAM token from PCS — PCS uses a different decoder)
             std::vector<float> no_ptr(D);
-            auto* nop = model.tensors.at("no_obj_ptr");
-            if (nop->type == GGML_TYPE_F16) {
-                std::vector<ggml_fp16_t> tmp(D);
-                ggml_backend_tensor_get(nop, tmp.data(), 0, D * sizeof(ggml_fp16_t));
-                ggml_fp16_to_fp32_row(tmp.data(), no_ptr.data(), D);
-            } else {
-                ggml_backend_tensor_get(nop, no_ptr.data(), 0, D * sizeof(float));
-            }
+            sam3_read_f32(model.tensors.at("no_obj_ptr"), no_ptr.data(), D);
             sam3_store_obj_ptr(tracker, model, ml.instance_id, no_ptr.data(), fi);
         }
 
