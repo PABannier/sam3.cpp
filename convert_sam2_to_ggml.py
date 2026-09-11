@@ -12,14 +12,12 @@ import argparse
 import struct
 import sys
 import os
-import numpy as np
+from ggml_writer import write_tensor
 
 # ── Constants ──────────────────────────────────────────────────────────────────
 
 MAGIC   = 0x73616D32   # "sam2"
 VERSION = 1
-FTYPE_F32 = 0
-FTYPE_F16 = 1
 
 # ── Default hyperparameters (SAM2.1 HieraL) ─────────────────────────────────
 
@@ -275,47 +273,6 @@ def write_header(fout, ftype: int, n_tensors: int, hparams: dict):
         "is_sam2_1",
     ]:
         fout.write(struct.pack("<i", hp[flag]))
-
-
-def write_tensor(fout, name: str, data: np.ndarray, ftype: int):
-    """Write one tensor record with 32-byte aligned data."""
-    n_dims = len(data.shape)
-    name_bytes = name.encode("utf-8")
-
-    # 1D tensors, embeddings, positions → always f32
-    use_f16 = (ftype == FTYPE_F16 and n_dims >= 2
-               and "embed" not in name
-               and "pos_embed" not in name
-               and "tpos" not in name
-               and "pe_gaussian" not in name
-               and "token" not in name
-               and "no_obj" not in name
-               and "no_mem" not in name
-               and "gamma" not in name)
-
-    dtype_id = FTYPE_F16 if use_f16 else FTYPE_F32
-
-    if use_f16:
-        data = data.astype(np.float16)
-    else:
-        data = data.astype(np.float32)
-
-    fout.write(struct.pack("<i", n_dims))
-    fout.write(struct.pack("<i", len(name_bytes)))
-    fout.write(struct.pack("<i", dtype_id))
-
-    # ggml expects dimensions in reverse order (column-major)
-    for dim in reversed(data.shape):
-        fout.write(struct.pack("<i", dim))
-
-    fout.write(name_bytes)
-
-    # Pad to 32-byte alignment
-    pos = fout.tell()
-    pad = (32 - pos % 32) % 32
-    fout.write(b"\x00" * pad)
-
-    fout.write(data.tobytes())
 
 
 # ── Config parsing ───────────────────────────────────────────────────────────
