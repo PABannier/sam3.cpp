@@ -36,3 +36,6 @@ raw_weights/
 
 # Test data
 data/
+
+# ImGui runtime layout
+imgui.ini
