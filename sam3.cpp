@@ -5879,11 +5879,7 @@ static bool sam2_encode_image_hiera(sam3_state& state,
     }
 
     // Compute
-    if (ggml_backend_is_cpu(model.backend)) {
-        ggml_backend_cpu_set_n_threads(model.backend, state.n_threads);
-    }
-    if (ggml_backend_graph_compute(model.backend, graph) != GGML_STATUS_SUCCESS) {
-        fprintf(stderr, "%s: graph compute failed\n", __func__);
+    if (!sam3_graph_compute(model.backend, graph, state.n_threads)) {
         return false;
     }
 
