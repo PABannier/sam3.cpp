@@ -35,7 +35,6 @@ using sam3_tracker_ptr = std::unique_ptr<sam3_tracker,  sam3_tracker_deleter>;
 
 enum sam3_model_type {
     SAM3_MODEL_SAM3        = 0,  // Full SAM3 (ViT + detector + tracker)
-    SAM3_MODEL_SAM3_VISUAL = 1,  // SAM3 visual-only (ViT + tracker, no text)
     SAM3_MODEL_SAM2        = 2,  // SAM2 (Hiera + tracker, no text/detector)
     SAM3_MODEL_EDGETAM     = 3,  // EdgeTAM (RepViT + Perceiver, no text/detector)
 };
@@ -97,7 +96,6 @@ struct sam3_params {
     std::string model_path;
     int         n_threads       = 4;
     bool        use_gpu         = true;
-    int         seed            = 42;
     int         encode_img_size = 0;  // 0 = model default; override input resolution
 };
 
