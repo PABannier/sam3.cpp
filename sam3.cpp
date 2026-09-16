@@ -5,6 +5,7 @@
 /* ggml */
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
+#include "ggml-cpp.h"
 #include "ggml-cpu.h"
 #include "ggml.h"
 
@@ -4816,7 +4817,8 @@ static bool edgetam_encode_image(sam3_state& state,
         /*.mem_buffer =*/nullptr,
         /*.no_alloc   =*/true,
     };
-    auto* ctx0 = ggml_init(gparams);
+    ggml_context_ptr ctx0_ptr(ggml_init(gparams));
+    auto* ctx0 = ctx0_ptr.get();
     if (!ctx0) {
         fprintf(stderr, "%s: failed to init compute context\n", __func__);
         return false;
@@ -4850,17 +4852,13 @@ static bool edgetam_encode_image(sam3_state& state,
     }
 
     // ── Allocate + compute ───────────────────────────────────────────────
-    auto* galloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(model.backend));
-    if (!ggml_gallocr_reserve(galloc, graph)) {
+    ggml_gallocr_ptr galloc(ggml_gallocr_new(ggml_backend_get_default_buffer_type(model.backend)));
+    if (!ggml_gallocr_reserve(galloc.get(), graph)) {
         fprintf(stderr, "%s: failed to reserve graph memory\n", __func__);
-        ggml_gallocr_free(galloc);
-        ggml_free(ctx0);
         return false;
     }
-    if (!ggml_gallocr_alloc_graph(galloc, graph)) {
+    if (!ggml_gallocr_alloc_graph(galloc.get(), graph)) {
         fprintf(stderr, "%s: failed to alloc graph\n", __func__);
-        ggml_gallocr_free(galloc);
-        ggml_free(ctx0);
         return false;
     }
 
@@ -4870,8 +4868,6 @@ static bool edgetam_encode_image(sam3_state& state,
     // Compute
     if (!sam3_graph_compute(model.backend, graph, state.n_threads)) {
         fprintf(stderr, "%s: graph compute failed\n", __func__);
-        ggml_gallocr_free(galloc);
-        ggml_free(ctx0);
         return false;
     }
 
@@ -4931,9 +4927,6 @@ static bool edgetam_encode_image(sam3_state& state,
         auto pe = sam3_sinusoidal_pe_2d(H, W, hp.neck_dim);
         ggml_backend_tensor_set(state.neck_trk_pe[i], pe.data(), 0, pe.size() * sizeof(float));
     }
-
-    ggml_gallocr_free(galloc);
-    ggml_free(ctx0);
 
     auto t_end = std::chrono::high_resolution_clock::now();
     auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(t_end - t_start).count();
@@ -5633,7 +5626,8 @@ static bool edgetam_perceiver_forward(
     {
         const size_t buf_size = ggml_tensor_overhead() * 4096 + ggml_graph_overhead();
         struct ggml_init_params gparams = {buf_size, nullptr, true};
-        auto* ctx0 = ggml_init(gparams);
+        ggml_context_ptr ctx0_ptr(ggml_init(gparams));
+        auto* ctx0 = ctx0_ptr.get();
         if (!ctx0) {
             fprintf(stderr, "%s: failed to init 1D context\n", __func__);
             return false;
@@ -5668,13 +5662,11 @@ static bool edgetam_perceiver_forward(
         auto* graph = ggml_new_graph_custom(ctx0, 16384, false);
         ggml_build_forward_expand(graph, latents);
 
-        auto* galloc = ggml_gallocr_new(
-            ggml_backend_get_default_buffer_type(model.backend));
-        if (!ggml_gallocr_reserve(galloc, graph) ||
-            !ggml_gallocr_alloc_graph(galloc, graph)) {
+        ggml_gallocr_ptr galloc(ggml_gallocr_new(
+            ggml_backend_get_default_buffer_type(model.backend)));
+        if (!ggml_gallocr_reserve(galloc.get(), graph) ||
+            !ggml_gallocr_alloc_graph(galloc.get(), graph)) {
             fprintf(stderr, "%s: 1D graph alloc failed\n", __func__);
-            ggml_gallocr_free(galloc);
-            ggml_free(ctx0);
             return false;
         }
 
@@ -5688,16 +5680,11 @@ static bool edgetam_perceiver_forward(
 
         if (!sam3_graph_compute(model.backend, graph, 4)) {
             fprintf(stderr, "%s: 1D graph compute failed\n", __func__);
-            ggml_gallocr_free(galloc);
-            ggml_free(ctx0);
             return false;
         }
 
         ggml_backend_tensor_get(latents, result_1d.data(), 0,
                                 D * N_1d * sizeof(float));
-
-        ggml_gallocr_free(galloc);
-        ggml_free(ctx0);
     }
 
     // ══════════════════════════════════════════════════════════════════════
@@ -5707,7 +5694,8 @@ static bool edgetam_perceiver_forward(
     {
         const size_t buf_size = ggml_tensor_overhead() * 4096 + ggml_graph_overhead();
         struct ggml_init_params gparams = {buf_size, nullptr, true};
-        auto* ctx0 = ggml_init(gparams);
+        ggml_context_ptr ctx0_ptr(ggml_init(gparams));
+        auto* ctx0 = ctx0_ptr.get();
         if (!ctx0) {
             fprintf(stderr, "%s: failed to init 2D context\n", __func__);
             return false;
@@ -5741,13 +5729,11 @@ static bool edgetam_perceiver_forward(
         auto* graph = ggml_new_graph_custom(ctx0, 16384, false);
         ggml_build_forward_expand(graph, lat_out);
 
-        auto* galloc = ggml_gallocr_new(
-            ggml_backend_get_default_buffer_type(model.backend));
-        if (!ggml_gallocr_reserve(galloc, graph) ||
-            !ggml_gallocr_alloc_graph(galloc, graph)) {
+        ggml_gallocr_ptr galloc(ggml_gallocr_new(
+            ggml_backend_get_default_buffer_type(model.backend)));
+        if (!ggml_gallocr_reserve(galloc.get(), graph) ||
+            !ggml_gallocr_alloc_graph(galloc.get(), graph)) {
             fprintf(stderr, "%s: 2D graph alloc failed\n", __func__);
-            ggml_gallocr_free(galloc);
-            ggml_free(ctx0);
             return false;
         }
 
@@ -5761,16 +5747,11 @@ static bool edgetam_perceiver_forward(
 
         if (!sam3_graph_compute(model.backend, graph, 4)) {
             fprintf(stderr, "%s: 2D graph compute failed\n", __func__);
-            ggml_gallocr_free(galloc);
-            ggml_free(ctx0);
             return false;
         }
 
         ggml_backend_tensor_get(lat_out, result_2d.data(), 0,
                                 D * N_2d * sizeof(float));
-
-        ggml_gallocr_free(galloc);
-        ggml_free(ctx0);
     }
 
     // ══════════════════════════════════════════════════════════════════════
@@ -5844,7 +5825,8 @@ static bool sam2_encode_image_hiera(sam3_state& state,
         /*.mem_buffer =*/nullptr,
         /*.no_alloc   =*/true,
     };
-    auto* ctx0 = ggml_init(gparams);
+    ggml_context_ptr ctx0_ptr(ggml_init(gparams));
+    auto* ctx0 = ctx0_ptr.get();
 
     auto* inp = ggml_new_tensor_4d(ctx0, GGML_TYPE_F32, img_size, img_size, 3, 1);
     ggml_set_name(inp, "input_image");
@@ -5874,17 +5856,13 @@ static bool sam2_encode_image_hiera(sam3_state& state,
     }
 
     // ── Allocate + compute ───────────────────────────────────────────────
-    auto* galloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(model.backend));
-    if (!ggml_gallocr_reserve(galloc, graph)) {
+    ggml_gallocr_ptr galloc(ggml_gallocr_new(ggml_backend_get_default_buffer_type(model.backend)));
+    if (!ggml_gallocr_reserve(galloc.get(), graph)) {
         fprintf(stderr, "%s: failed to reserve graph memory\n", __func__);
-        ggml_gallocr_free(galloc);
-        ggml_free(ctx0);
         return false;
     }
-    if (!ggml_gallocr_alloc_graph(galloc, graph)) {
+    if (!ggml_gallocr_alloc_graph(galloc.get(), graph)) {
         fprintf(stderr, "%s: failed to alloc graph\n", __func__);
-        ggml_gallocr_free(galloc);
-        ggml_free(ctx0);
         return false;
     }
 
@@ -5906,8 +5884,6 @@ static bool sam2_encode_image_hiera(sam3_state& state,
     }
     if (ggml_backend_graph_compute(model.backend, graph) != GGML_STATUS_SUCCESS) {
         fprintf(stderr, "%s: graph compute failed\n", __func__);
-        ggml_gallocr_free(galloc);
-        ggml_free(ctx0);
         return false;
     }
 
@@ -5969,9 +5945,6 @@ static bool sam2_encode_image_hiera(sam3_state& state,
         ggml_backend_tensor_set(state.neck_trk_pe[i], pe.data(), 0, pe.size() * sizeof(float));
     }
 
-    ggml_gallocr_free(galloc);
-    ggml_free(ctx0);
-
     auto t_end = std::chrono::high_resolution_clock::now();
     auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(t_end - t_start).count();
     fprintf(stderr, "%s: SAM2 image encoded in %lld ms\n", __func__, ms);
@@ -6021,7 +5994,8 @@ bool sam3_encode_image(sam3_state& state,
         /*.mem_buffer =*/nullptr,
         /*.no_alloc   =*/true,
     };
-    struct ggml_context* ctx0 = ggml_init(gparams);
+    ggml_context_ptr ctx0_ptr(ggml_init(gparams));
+    auto* ctx0 = ctx0_ptr.get();
     if (!ctx0) {
         fprintf(stderr, "%s: failed to init compute context\n", __func__);
         return false;
@@ -6061,19 +6035,15 @@ bool sam3_encode_image(sam3_state& state,
         ggml_build_forward_expand(graph, neck_trk_out[i]);
     }
 
-    auto* galloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(model.backend));
+    ggml_gallocr_ptr galloc(ggml_gallocr_new(ggml_backend_get_default_buffer_type(model.backend)));
 
-    if (!ggml_gallocr_reserve(galloc, graph)) {
+    if (!ggml_gallocr_reserve(galloc.get(), graph)) {
         fprintf(stderr, "%s: failed to reserve graph memory\n", __func__);
-        ggml_gallocr_free(galloc);
-        ggml_free(ctx0);
         return false;
     }
 
-    if (!ggml_gallocr_alloc_graph(galloc, graph)) {
+    if (!ggml_gallocr_alloc_graph(galloc.get(), graph)) {
         fprintf(stderr, "%s: failed to allocate graph\n", __func__);
-        ggml_gallocr_free(galloc);
-        ggml_free(ctx0);
         return false;
     }
 
@@ -6086,8 +6056,6 @@ bool sam3_encode_image(sam3_state& state,
         auto t0 = std::chrono::high_resolution_clock::now();
 #endif
         if (!sam3_graph_compute(model.backend, graph, state.n_threads)) {
-            ggml_gallocr_free(galloc);
-            ggml_free(ctx0);
             return false;
         }
 #if SAM3_LOG_LEVEL >= 1
@@ -6101,8 +6069,8 @@ bool sam3_encode_image(sam3_state& state,
     if (state.galloc) ggml_gallocr_free(state.galloc);
     if (state.ctx) ggml_free(state.ctx);
 
-    state.ctx = ctx0;
-    state.galloc = galloc;
+    state.ctx = ctx0_ptr.release();
+    state.galloc = galloc.release();
     state.backend = model.backend;
     state.vit_output = vit_out;
 
@@ -9721,7 +9689,8 @@ sam3_result sam3_segment_pcs(sam3_state& state,
     {
         const size_t sz = ggml_tensor_overhead() * 16384 + ggml_graph_overhead() * 2;
         struct ggml_init_params gp = {sz, nullptr, true};
-        auto* ctx = ggml_init(gp);
+        ggml_context_ptr ctx_ptr(ggml_init(gp));
+        auto* ctx = ctx_ptr.get();
 
         auto* inp = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, L);
         ggml_set_name(inp, "text_token_ids");
@@ -9734,11 +9703,9 @@ sam3_result sam3_segment_pcs(sam3_state& state,
         ggml_build_forward_expand(graph, out);
 
         auto* causal = ggml_get_tensor(ctx, "causal_mask");
-        auto* alloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(model.backend));
-        if (!ggml_gallocr_reserve(alloc, graph) || !ggml_gallocr_alloc_graph(alloc, graph)) {
+        ggml_gallocr_ptr alloc(ggml_gallocr_new(ggml_backend_get_default_buffer_type(model.backend)));
+        if (!ggml_gallocr_reserve(alloc.get(), graph) || !ggml_gallocr_alloc_graph(alloc.get(), graph)) {
             fprintf(stderr, "%s: text encoder alloc failed\n", __func__);
-            ggml_gallocr_free(alloc);
-            ggml_free(ctx);
             return result;
         }
 
@@ -9746,8 +9713,6 @@ sam3_result sam3_segment_pcs(sam3_state& state,
             ggml_backend_tensor_set(inp, token_ids.data(), 0, L * sizeof(int32_t));
         } else {
             fprintf(stderr, "%s: ERROR: text encoder input tensor has no buffer!\n", __func__);
-            ggml_gallocr_free(alloc);
-            ggml_free(ctx);
             return result;
         }
         if (causal && causal->buffer) {
@@ -9757,14 +9722,9 @@ sam3_result sam3_segment_pcs(sam3_state& state,
         }
 
         if (!sam3_graph_compute(model.backend, graph, state.n_threads)) {
-            ggml_gallocr_free(alloc);
-            ggml_free(ctx);
             return result;
         }
         ggml_backend_tensor_get(out, text_feats_cpu.data(), 0, D * L * sizeof(float));
-
-        ggml_gallocr_free(alloc);
-        ggml_free(ctx);
     }
 
     SAM3_LOG(2, "%s: text encoder done\n", __func__);
@@ -9776,7 +9736,8 @@ sam3_result sam3_segment_pcs(sam3_state& state,
     {
         const size_t sz = ggml_tensor_overhead() * 4096 + ggml_graph_overhead() * 2;
         struct ggml_init_params gp = {sz, nullptr, true};
-        auto* ctx = ggml_init(gp);
+        ggml_context_ptr ctx_ptr(ggml_init(gp));
+        auto* ctx = ctx_ptr.get();
 
         auto* g_img = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, D, N_spatial, 1);
         ggml_set_name(g_img, "geo_img");
@@ -9791,11 +9752,9 @@ sam3_result sam3_segment_pcs(sam3_state& state,
         auto* graph = ggml_new_graph_custom(ctx, 4096, false);
         ggml_build_forward_expand(graph, gr.geo_feats);
 
-        auto* alloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(model.backend));
-        if (!ggml_gallocr_reserve(alloc, graph) || !ggml_gallocr_alloc_graph(alloc, graph)) {
+        ggml_gallocr_ptr alloc(ggml_gallocr_new(ggml_backend_get_default_buffer_type(model.backend)));
+        if (!ggml_gallocr_reserve(alloc.get(), graph) || !ggml_gallocr_alloc_graph(alloc.get(), graph)) {
             fprintf(stderr, "%s: geometry encoder alloc failed\n", __func__);
-            ggml_gallocr_free(alloc);
-            ggml_free(ctx);
             return result;
         }
 
@@ -9811,15 +9770,10 @@ sam3_result sam3_segment_pcs(sam3_state& state,
         }
 
         if (!sam3_graph_compute(model.backend, graph, state.n_threads)) {
-            ggml_gallocr_free(alloc);
-            ggml_free(ctx);
             return result;
         }
         ggml_backend_tensor_get(gr.geo_feats, geo_feats_cpu.data(), 0,
                                 D * N_geo * sizeof(float));
-
-        ggml_gallocr_free(alloc);
-        ggml_free(ctx);
     }
 
     SAM3_LOG(2, "%s: geometry encoder done\n", __func__);
@@ -9837,7 +9791,8 @@ sam3_result sam3_segment_pcs(sam3_state& state,
     {
         const size_t sz = ggml_tensor_overhead() * 16384 + ggml_graph_overhead() * 2;
         struct ggml_init_params gp = {sz, nullptr, true};
-        auto* ctx = ggml_init(gp);
+        ggml_context_ptr ctx_ptr(ggml_init(gp));
+        auto* ctx = ctx_ptr.get();
 
         auto* img = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, D, N_spatial, 1);
         ggml_set_name(img, "fenc_img");
@@ -9858,11 +9813,9 @@ sam3_result sam3_segment_pcs(sam3_state& state,
         auto* graph = ggml_new_graph_custom(ctx, 16384, false);
         ggml_build_forward_expand(graph, out);
 
-        auto* alloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(model.backend));
-        if (!ggml_gallocr_reserve(alloc, graph) || !ggml_gallocr_alloc_graph(alloc, graph)) {
+        ggml_gallocr_ptr alloc(ggml_gallocr_new(ggml_backend_get_default_buffer_type(model.backend)));
+        if (!ggml_gallocr_reserve(alloc.get(), graph) || !ggml_gallocr_alloc_graph(alloc.get(), graph)) {
             fprintf(stderr, "%s: fusion encoder alloc failed\n", __func__);
-            ggml_gallocr_free(alloc);
-            ggml_free(ctx);
             return result;
         }
 
@@ -9872,8 +9825,6 @@ sam3_result sam3_segment_pcs(sam3_state& state,
         ggml_backend_tensor_set(bias, combined_bias_cpu.data(), 0, T * sizeof(float));
 
         if (!sam3_graph_compute(model.backend, graph, state.n_threads)) {
-            ggml_gallocr_free(alloc);
-            ggml_free(ctx);
             return result;
         }
         ggml_backend_tensor_get(out, fenc_output_cpu.data(), 0, D * N_spatial * sizeof(float));
@@ -9881,9 +9832,6 @@ sam3_result sam3_segment_pcs(sam3_state& state,
         SAM3_LOG(2, "%s: fenc_out[0..4] = [%.6f, %.6f, %.6f, %.6f, %.6f]\n",
                  __func__, fenc_output_cpu[0], fenc_output_cpu[1], fenc_output_cpu[2],
                  fenc_output_cpu[3], fenc_output_cpu[4]);
-
-        ggml_gallocr_free(alloc);
-        ggml_free(ctx);
     }
 
     SAM3_LOG(2, "%s: fusion encoder done\n", __func__);
@@ -9897,7 +9845,8 @@ sam3_result sam3_segment_pcs(sam3_state& state,
     {
         const size_t sz = ggml_tensor_overhead() * 32768 + ggml_graph_overhead() * 2;
         struct ggml_init_params gp = {sz, nullptr, true};
-        auto* ctx = ggml_init(gp);
+        ggml_context_ptr ctx_ptr(ggml_init(gp));
+        auto* ctx = ctx_ptr.get();
 
         auto* enc = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, D, N_spatial, 1);
         ggml_set_name(enc, "ddec_enc");
@@ -9933,11 +9882,9 @@ sam3_result sam3_segment_pcs(sam3_state& state,
         ggml_build_forward_expand(graph, dout.presence_score);
         ggml_build_forward_expand(graph, dout.queries);
 
-        auto* alloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(model.backend));
-        if (!ggml_gallocr_reserve(alloc, graph) || !ggml_gallocr_alloc_graph(alloc, graph)) {
+        ggml_gallocr_ptr alloc(ggml_gallocr_new(ggml_backend_get_default_buffer_type(model.backend)));
+        if (!ggml_gallocr_reserve(alloc.get(), graph) || !ggml_gallocr_alloc_graph(alloc.get(), graph)) {
             fprintf(stderr, "%s: DETR decoder alloc failed\n", __func__);
-            ggml_gallocr_free(alloc);
-            ggml_free(ctx);
             return result;
         }
 
@@ -9963,8 +9910,6 @@ sam3_result sam3_segment_pcs(sam3_state& state,
         }
 
         if (!sam3_graph_compute(model.backend, graph, state.n_threads)) {
-            ggml_gallocr_free(alloc);
-            ggml_free(ctx);
             return result;
         }
 
@@ -9973,9 +9918,6 @@ sam3_result sam3_segment_pcs(sam3_state& state,
         ggml_backend_tensor_get(dout.presence_score, &presence_logit, 0, sizeof(float));
         ggml_backend_tensor_get(dout.queries, queries_data.data(), 0,
                                 D * (NQ + 1) * sizeof(float));
-
-        ggml_gallocr_free(alloc);
-        ggml_free(ctx);
     }
 
     float presence_prob = 1.0f / (1.0f + expf(-presence_logit));
@@ -9989,7 +9931,8 @@ sam3_result sam3_segment_pcs(sam3_state& state,
     {
         const size_t sz = ggml_tensor_overhead() * 16384 + ggml_graph_overhead() * 2;
         struct ggml_init_params gp = {sz, nullptr, true};
-        auto* ctx = ggml_init(gp);
+        ggml_context_ptr ctx_ptr(ggml_init(gp));
+        auto* ctx = ctx_ptr.get();
 
         auto* enc_h = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, D, N_spatial, 1);
         ggml_set_name(enc_h, "seg_enc");
@@ -10029,11 +9972,9 @@ sam3_result sam3_segment_pcs(sam3_state& state,
 
         SAM3_LOG(2, "%s: seg head graph: %d nodes\n", __func__, ggml_graph_n_nodes(graph));
 
-        auto* alloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(model.backend));
-        if (!ggml_gallocr_reserve(alloc, graph) || !ggml_gallocr_alloc_graph(alloc, graph)) {
+        ggml_gallocr_ptr alloc(ggml_gallocr_new(ggml_backend_get_default_buffer_type(model.backend)));
+        if (!ggml_gallocr_reserve(alloc.get(), graph) || !ggml_gallocr_alloc_graph(alloc.get(), graph)) {
             fprintf(stderr, "%s: segmentation head alloc failed\n", __func__);
-            ggml_gallocr_free(alloc);
-            ggml_free(ctx);
             return result;
         }
 
@@ -10063,14 +10004,9 @@ sam3_result sam3_segment_pcs(sam3_state& state,
         ggml_backend_tensor_set(tab, combined_bias_cpu.data(), 0, T * sizeof(float));
 
         if (!sam3_graph_compute(model.backend, graph, state.n_threads)) {
-            ggml_gallocr_free(alloc);
-            ggml_free(ctx);
             return result;
         }
         ggml_backend_tensor_get(out, all_masks.data(), 0, all_masks.size() * sizeof(float));
-
-        ggml_gallocr_free(alloc);
-        ggml_free(ctx);
     }
 
     /*
@@ -10716,7 +10652,8 @@ sam3_result sam3_segment_pvs(sam3_state& state,
         /*.mem_buffer =*/nullptr,
         /*.no_alloc   =*/true,
     };
-    struct ggml_context* ctx0 = ggml_init(gparams);
+    ggml_context_ptr ctx0_ptr(ggml_init(gparams));
+    auto* ctx0 = ctx0_ptr.get();
     if (!ctx0) {
         fprintf(stderr, "%s: failed to init compute context\n", __func__);
         return result;
@@ -10768,17 +10705,13 @@ sam3_result sam3_segment_pvs(sam3_state& state,
     ggml_build_forward_expand(graph, dec_out.obj_score);
     ggml_build_forward_expand(graph, dec_out.sam_token);
 
-    auto* galloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(model.backend));
-    if (!ggml_gallocr_reserve(galloc, graph)) {
+    ggml_gallocr_ptr galloc(ggml_gallocr_new(ggml_backend_get_default_buffer_type(model.backend)));
+    if (!ggml_gallocr_reserve(galloc.get(), graph)) {
         fprintf(stderr, "%s: failed to reserve graph memory\n", __func__);
-        ggml_gallocr_free(galloc);
-        ggml_free(ctx0);
         return result;
     }
-    if (!ggml_gallocr_alloc_graph(galloc, graph)) {
+    if (!ggml_gallocr_alloc_graph(galloc.get(), graph)) {
         fprintf(stderr, "%s: failed to allocate graph\n", __func__);
-        ggml_gallocr_free(galloc);
-        ggml_free(ctx0);
         return result;
     }
 
@@ -10860,8 +10793,6 @@ sam3_result sam3_segment_pvs(sam3_state& state,
         auto t0 = std::chrono::high_resolution_clock::now();
 #endif
         if (!sam3_graph_compute(model.backend, graph, state.n_threads)) {
-            ggml_gallocr_free(galloc);
-            ggml_free(ctx0);
             return result;
         }
 #if SAM3_LOG_LEVEL >= 1
@@ -10950,10 +10881,6 @@ sam3_result sam3_segment_pvs(sam3_state& state,
     }
 
     SAM3_LOG(2, "%s: %zu masks returned\n", __func__, result.detections.size());
-
-    // ── Cleanup ──────────────────────────────────────────────────────────
-    ggml_gallocr_free(galloc);
-    ggml_free(ctx0);
 
 #if SAM3_LOG_LEVEL >= 1
     auto t_end = std::chrono::high_resolution_clock::now();
@@ -11121,7 +11048,8 @@ static sam3_prop_output sam3_propagate_single(
     // ── Build graph ─────────────────────────────────────────────────────
     const size_t buf_size = ggml_tensor_overhead() * 32768 + ggml_graph_overhead() * 2;
     struct ggml_init_params gparams = {buf_size, nullptr, true};
-    auto* ctx0 = ggml_init(gparams);
+    ggml_context_ptr ctx0_ptr(ggml_init(gparams));
+    auto* ctx0 = ctx0_ptr.get();
     if (!ctx0) return output;
 
     // CRITICAL: create fresh input tensors for state features.
@@ -11197,10 +11125,8 @@ static sam3_prop_output sam3_propagate_single(
     ggml_build_forward_expand(graph, dec.sam_token);
     if (dec.mask_tokens) ggml_build_forward_expand(graph, dec.mask_tokens);
 
-    auto* galloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(model.backend));
-    if (!ggml_gallocr_reserve(galloc, graph) || !ggml_gallocr_alloc_graph(galloc, graph)) {
-        ggml_gallocr_free(galloc);
-        ggml_free(ctx0);
+    ggml_gallocr_ptr galloc(ggml_gallocr_new(ggml_backend_get_default_buffer_type(model.backend)));
+    if (!ggml_gallocr_reserve(galloc.get(), graph) || !ggml_gallocr_alloc_graph(galloc.get(), graph)) {
         return output;
     }
 
@@ -11245,8 +11171,6 @@ static sam3_prop_output sam3_propagate_single(
     }
 
     if (!sam3_graph_compute(model.backend, graph, 4)) {
-        ggml_gallocr_free(galloc);
-        ggml_free(ctx0);
         return output;
     }
 
@@ -11301,8 +11225,6 @@ static sam3_prop_output sam3_propagate_single(
         ggml_backend_tensor_get(dec.sam_token, output.sam_token.data(), 0, D * sizeof(float));
     }
 
-    ggml_gallocr_free(galloc);
-    ggml_free(ctx0);
     return output;
 }
 
@@ -11375,7 +11297,8 @@ static bool sam3_encode_memory(
 
     const size_t bs = ggml_tensor_overhead() * 16384 + ggml_graph_overhead();
     struct ggml_init_params gp = {bs, nullptr, true};
-    auto* ctx0 = ggml_init(gp);
+    ggml_context_ptr ctx0_ptr(ggml_init(gp));
+    auto* ctx0 = ctx0_ptr.get();
     if (!ctx0) return false;
 
     auto* mask_in = ggml_new_tensor_4d(ctx0, GGML_TYPE_F32, INTERPOL, INTERPOL, 1, 1);
@@ -11427,10 +11350,8 @@ static bool sam3_encode_memory(
 
     auto* g = ggml_new_graph_custom(ctx0, 16384, false);
     ggml_build_forward_expand(g, mo);
-    auto* ga = ggml_gallocr_new(ggml_backend_get_default_buffer_type(model.backend));
-    if (!ggml_gallocr_reserve(ga, g) || !ggml_gallocr_alloc_graph(ga, g)) {
-        ggml_gallocr_free(ga);
-        ggml_free(ctx0);
+    ggml_gallocr_ptr ga(ggml_gallocr_new(ggml_backend_get_default_buffer_type(model.backend)));
+    if (!ggml_gallocr_reserve(ga.get(), g) || !ggml_gallocr_alloc_graph(ga.get(), g)) {
         return false;
     }
     ggml_backend_tensor_set(mask_in, m_interp.data(), 0, m_interp.size() * sizeof(float));
@@ -11441,8 +11362,6 @@ static bool sam3_encode_memory(
         ggml_backend_tensor_set(pix_in_raw, pix_data.data(), 0, D * H * H * sizeof(float));
     }
     if (!sam3_graph_compute(model.backend, g, 4)) {
-        ggml_gallocr_free(ga);
-        ggml_free(ctx0);
         return false;
     }
 
@@ -11479,8 +11398,6 @@ static bool sam3_encode_memory(
         if (!edgetam_perceiver_forward(model, md, mem_pos, H, H,
                                         perc_latents, perc_pos)) {
             fprintf(stderr, "%s: perceiver forward failed\n", __func__);
-            ggml_gallocr_free(ga);
-            ggml_free(ctx0);
             return false;
         }
 
@@ -11518,8 +11435,6 @@ static bool sam3_encode_memory(
                 }
             if (!removed) bk.erase(bk.begin() + 1);
         }
-        ggml_gallocr_free(ga);
-        ggml_free(ctx0);
         return true;
     }
 
@@ -11559,8 +11474,6 @@ static bool sam3_encode_memory(
             }
         if (!removed) bk.erase(bk.begin() + 1);
     }
-    ggml_gallocr_free(ga);
-    ggml_free(ctx0);
     return true;
 }
 
