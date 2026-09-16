@@ -14,13 +14,12 @@ import sys
 import os
 import re
 import numpy as np
+from ggml_writer import KEEP_F32, write_tensor
 
 # ── Constants ──────────────────────────────────────────────────────────────────
 
 MAGIC   = 0x73616D33   # "sam3"
 VERSION = 3
-FTYPE_F32 = 0
-FTYPE_F16 = 1
 
 # ── Hyperparameter defaults ───────────────────────────────────────────────────
 
@@ -211,50 +210,6 @@ def write_header(fout, ftype: int, n_tensors: int, visual_only: bool = False):
         fout.write(struct.pack("<i", val))
 
 
-def write_tensor(fout, name: str, data: np.ndarray, ftype: int):
-    """Write one tensor record with 32-byte aligned data."""
-    n_dims = len(data.shape)
-    name_bytes = name.encode("utf-8")
-
-    # Determine storage dtype
-    # 1D tensors, embeddings, and positions → always f32
-    use_f16 = (ftype == FTYPE_F16 and n_dims >= 2
-               and "embed" not in name
-               and "pos_embed" not in name
-               and "tpos" not in name
-               and "pe_gaussian" not in name
-               and "freqs_cis" not in name
-               and "token" not in name
-               and "no_obj" not in name
-               and "no_mem" not in name
-               and "gamma" not in name)
-
-    dtype_id = FTYPE_F16 if use_f16 else FTYPE_F32
-
-    if use_f16:
-        data = data.astype(np.float16)
-    else:
-        data = data.astype(np.float32)
-
-    # Write: n_dims, name_len, dtype, shape (reversed), name, padding, data
-    fout.write(struct.pack("<i", n_dims))
-    fout.write(struct.pack("<i", len(name_bytes)))
-    fout.write(struct.pack("<i", dtype_id))
-
-    # ggml expects dimensions in reverse order (column-major)
-    for dim in reversed(data.shape):
-        fout.write(struct.pack("<i", dim))
-
-    fout.write(name_bytes)
-
-    # Pad to 32-byte alignment
-    pos = fout.tell()
-    pad = (32 - pos % 32) % 32
-    fout.write(b"\x00" * pad)
-
-    fout.write(data.tobytes())
-
-
 # ── Tokenizer embedding ──────────────────────────────────────────────────────
 
 TOK_MAGIC = 0x746F6B00   # "tok\0"
@@ -393,7 +348,7 @@ def main():
         write_header(fout, args.ftype, len(renamed), visual_only=args.visual_only)
 
         for i, (name, data) in enumerate(renamed.items()):
-            write_tensor(fout, name, data, args.ftype)
+            write_tensor(fout, name, data, args.ftype, KEEP_F32 + ("freqs_cis",))
             if (i + 1) % 100 == 0 or i == len(renamed) - 1:
                 print(f"  [{i+1}/{len(renamed)}] {name}  {list(data.shape)}")
 
