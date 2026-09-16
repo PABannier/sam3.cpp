@@ -1,0 +1,10 @@
+prefix=@CMAKE_INSTALL_PREFIX@
+exec_prefix=${prefix}
+libdir=${prefix}/@CMAKE_INSTALL_LIBDIR@
+includedir=${prefix}/@CMAKE_INSTALL_INCLUDEDIR@
+
+Name: sam3
+Description: Segment Anything Model 3 inference library (bundles ggml)
+Version: @PROJECT_VERSION@
+Libs: -L${libdir} -lsam3 -lggml -lggml-cpu -lggml-base
+Cflags: -I${includedir}
