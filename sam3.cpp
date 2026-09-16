@@ -3925,7 +3925,7 @@ static void sam3_build_neck_graph(struct ggml_context* ctx,
 }
 
 /*****************************************************************************
-** Text Encoder — graph building (Phase 4)
+** Text Encoder — graph building
 *****************************************************************************/
 
 // Build a causal (lower-triangular) attention mask for the text encoder.
@@ -9059,7 +9059,7 @@ static struct ggml_tensor* sam3_build_seg_head_graph(
 }
 
 /*****************************************************************************
-** Memory encoder (Phase 7, Step 7.1)
+** Memory encoder
 *****************************************************************************/
 
 // CXBlock: depthwise conv + LayerNorm + pointwise MLP with residual scaling.
@@ -9107,7 +9107,7 @@ static struct ggml_tensor* sam3_cxblock_forward(
 }
 
 /*****************************************************************************
-** Prompt building for memory attention (Phase 7)
+** Prompt building for memory attention
 *****************************************************************************/
 
 struct sam3_prompt_data {
@@ -9213,7 +9213,7 @@ static sam3_prompt_data sam3_build_prompt_and_pos(
 }
 
 /*****************************************************************************
-** Memory attention (Phase 7, Step 7.2)
+** Memory attention
 *****************************************************************************/
 
 // Build memory attention graph.
@@ -9341,7 +9341,7 @@ static struct ggml_tensor* sam3_build_mem_attn_graph(
 }
 
 /*****************************************************************************
-** Object pointer extraction (Phase 7, Step 7.3)
+** Object pointer extraction
 *****************************************************************************/
 
 // Extract object pointer from SAM output token via 3-layer MLP (CPU-side).
@@ -9420,7 +9420,7 @@ static void sam3_extract_obj_ptr_cpu(
 }
 
 /*****************************************************************************
-** Tracker infrastructure (Phase 7, Step 7.4)
+** Tracker infrastructure
 *****************************************************************************/
 
 // Select memory frames for propagation (most recent + evenly spaced).
@@ -9462,7 +9462,7 @@ static float sam3_mask_iou(const uint8_t* a, const uint8_t* b, int n) {
 }
 
 /*****************************************************************************
-** Post-processing: hole filling and sprinkle removal (Phase 7, Step 7.8)
+** Post-processing: hole filling and sprinkle removal
 *****************************************************************************/
 
 // Fill small holes in a binary mask using BFS connected components.
@@ -10264,7 +10264,7 @@ static struct ggml_tensor* sam3_sam_attention(
 }
 
 /*****************************************************************************
-** SAM prompt encoder — graph building (Phase 6, Step 6.1)
+** SAM prompt encoder — graph building
 *****************************************************************************/
 
 // Random Fourier positional encoding for a single (x, y) coordinate
@@ -10435,7 +10435,7 @@ static sam3_pe_result sam3_build_sam_pe(
 }
 
 /*****************************************************************************
-** SAM mask decoder — graph building (Phase 6, Step 6.2)
+** SAM mask decoder — graph building
 *****************************************************************************/
 
 // TwoWayAttentionBlock forward
@@ -10759,7 +10759,7 @@ static sam3_dec_result sam3_build_sam_dec_graph(
 }
 
 /*****************************************************************************
-** Image segmentation — PVS (visual-prompted) (Phase 6, Step 6.3)
+** Image segmentation — PVS (visual-prompted)
 *****************************************************************************/
 
 sam3_result sam3_segment_pvs(sam3_state& state,
@@ -11115,7 +11115,7 @@ sam3_result sam3_segment_pvs(sam3_state& state,
 }
 
 /*****************************************************************************
-** Video tracking (Phase 7)
+** Video tracking
 *****************************************************************************/
 
 struct sam3_prop_output {
