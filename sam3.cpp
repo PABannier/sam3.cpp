@@ -8111,19 +8111,6 @@ static struct ggml_tensor* sam3_inverse_sigmoid(struct ggml_context* ctx, struct
     return ggml_sub(ctx, log_x, log_1mx);
 }
 
-// Box refinement MLP (3 layers: D→D→D→4 with ReLU)
-static struct ggml_tensor* sam3_bbox_mlp(struct ggml_context* ctx,
-                                         struct ggml_tensor* x,
-                                         struct ggml_tensor* w[3],
-                                         struct ggml_tensor* b[3]) {
-    for (int j = 0; j < 3; ++j) {
-        x = ggml_mul_mat(ctx, w[j], x);
-        x = ggml_add(ctx, x, b[j]);
-        if (j < 2) x = ggml_relu(ctx, x);
-    }
-    return x;
-}
-
 // Build sinusoidal positional embedding for 4D reference points in the ggml graph.
 // ref_boxes: [4, NQ, B] — (cx, cy, w, h) after sigmoid, B=1
 // sine_dim_t: [1, 64] — pre-computed angle multipliers (2π / 10000^(2i/128))
