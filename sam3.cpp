@@ -11597,6 +11597,109 @@ sam3_tracker_ptr sam3_create_tracker(const sam3_model& model,
     return tracker;
 }
 
+// Encode a propagated mask into the masklet's memory bank and store its object pointer.
+static void sam3_store_propagated_memory(sam3_tracker& tracker, sam3_state& state,
+                                         const sam3_model& model, int id,
+                                         const sam3_prop_output& p, int fi) {
+    sam3_encode_memory(tracker, state, model, id,
+                       p.mask_logits.data(), p.mask_h, p.mask_w, fi, false, p.obj_score);
+    std::vector<float> op(model.hparams.neck_dim);
+    sam3_extract_obj_ptr_cpu(model, p.sam_token.data(), p.obj_score, op.data());
+    sam3_store_obj_ptr(tracker, model, id, op.data(), fi);
+}
+
+// Propagate each masklet that has memory to frame `fi`: update its score,
+// last_seen and MDS counter, and put its mask (binarized at original resolution)
+// in `pm`. With `po`, the raw outputs are kept for sam3_commit_active_masklets;
+// with nullptr (pending masklets), they are encoded into memory right away.
+static void sam3_propagate_masklets(sam3_tracker& tracker, sam3_state& state,
+                                    const sam3_model& model,
+                                    std::vector<sam3_masklet>& masklets, int fi,
+                                    std::map<int, sam3_mask>& pm,
+                                    std::map<int, sam3_prop_output>* po) {
+    const int W = state.orig_width, H = state.orig_height;
+    for (auto& ml : masklets) {
+        int id = ml.instance_id;
+        auto im = tracker.mem_banks.find(id);
+        if (im == tracker.mem_banks.end() || im->second.empty()) continue;
+        auto p = sam3_propagate_single(tracker, state, model, ml, im->second, tracker.ptr_banks[id]);
+        if (p.mask_logits.empty()) continue;
+        auto rs = sam3_bilinear_interpolate(p.mask_logits.data(), p.mask_w, p.mask_h, W, H);
+        auto& mask = pm[id];
+        mask.width = W;
+        mask.height = H;
+        mask.data.resize(W * H);
+        int fg = 0;
+        for (int i = 0; i < (int)rs.size(); ++i) {
+            bool f = rs[i] > 0.0f;
+            mask.data[i] = f ? 255 : 0;
+            if (f) fg++;
+        }
+        ml.last_score = p.iou_scores[0];
+        ml.last_seen = fi;
+        float cov = (float)fg / (W * H);
+        ml.mds_sum += (cov > 0.001f && p.obj_score > 0.0f) ? 1 : -1;
+        if (po)
+            (*po)[id] = std::move(p);
+        else
+            sam3_store_propagated_memory(tracker, state, model, id, p, fi);
+    }
+}
+
+// Encode the active masklets' propagated masks into memory, then confirm / evict.
+static void sam3_commit_active_masklets(sam3_tracker& tracker, sam3_state& state,
+                                        const sam3_model& model, int fi,
+                                        const std::map<int, sam3_prop_output>& po) {
+    for (auto& ml : tracker.masklets) {
+        auto it = po.find(ml.instance_id);
+        if (it != po.end()) sam3_store_propagated_memory(tracker, state, model, ml.instance_id, it->second, fi);
+    }
+    sam3_update_tracker(tracker, fi);
+}
+
+// Append a detection (with bounding box) for a non-empty mask.
+static void sam3_add_mask_detection(sam3_result& result, int inst_id, float score,
+                                    const sam3_mask& mask) {
+    if (mask.data.empty()) return;
+    sam3_detection det;
+    det.instance_id = inst_id;
+    det.score = score;
+    det.mask = mask;
+    det.mask.instance_id = inst_id;
+    det.mask.iou_score = score;
+    float x0 = 1e9f, y0 = 1e9f, x1 = -1e9f, y1 = -1e9f;
+    for (int p = 0; p < (int)det.mask.data.size(); ++p)
+        if (det.mask.data[p] > 127) {
+            int x = p % det.mask.width, y = p / det.mask.width;
+            x0 = std::min(x0, (float)x);
+            y0 = std::min(y0, (float)y);
+            x1 = std::max(x1, (float)x);
+            y1 = std::max(y1, (float)y);
+        }
+    if (x0 <= x1) det.box = {x0, y0, x1, y1};
+    result.detections.push_back(std::move(det));
+}
+
+static void sam3_add_masklet_detections(sam3_result& result,
+                                        const std::vector<sam3_masklet>& masklets,
+                                        const std::map<int, sam3_mask>& pm) {
+    for (auto& ml : masklets) {
+        auto it = pm.find(ml.instance_id);
+        if (it != pm.end()) sam3_add_mask_detection(result, ml.instance_id, ml.last_score, it->second);
+    }
+}
+
+// Resolve overlaps, fill holes, remove sprinkles, and advance the frame index.
+static void sam3_finish_tracked_frame(sam3_tracker& tracker, sam3_result& result) {
+    sam3_resolve_overlaps(result.detections);
+    for (auto& d : result.detections) {
+        if (d.mask.data.empty()) continue;
+        sam3_fill_holes(d.mask.data.data(), d.mask.width, d.mask.height, tracker.params.fill_hole_area);
+        sam3_remove_sprinkles(d.mask.data.data(), d.mask.width, d.mask.height, tracker.params.fill_hole_area);
+    }
+    tracker.frame_index++;
+}
+
 sam3_result sam3_track_frame(sam3_tracker& tracker, sam3_state& state,
                              const sam3_model& model, const sam3_image& frame) {
     if (model.hparams.visual_only) {
@@ -11612,52 +11715,11 @@ sam3_result sam3_track_frame(sam3_tracker& tracker, sam3_state& state,
     fprintf(stderr, "%s: frame %d (%zu active + %zu pending)\n",
             __func__, fi, tracker.masklets.size(), tracker.pending.size());
 
-    std::map<int, sam3_mask> pm;
+    std::map<int, sam3_mask> pm, pending_pm;
     std::map<int, sam3_prop_output> po;
-    for (auto& ml : tracker.masklets) {
-        int id = ml.instance_id;
-        auto im = tracker.mem_banks.find(id);
-        if (im == tracker.mem_banks.end() || im->second.empty()) continue;
-        po[id] = sam3_propagate_single(tracker, state, model, ml, im->second, tracker.ptr_banks[id]);
-        if (po[id].mask_logits.empty()) continue;
-        auto rs = sam3_bilinear_interpolate(po[id].mask_logits.data(),
-                                            po[id].mask_w, po[id].mask_h, state.orig_width, state.orig_height);
-        pm[id].width = state.orig_width;
-        pm[id].height = state.orig_height;
-        pm[id].data.resize(state.orig_width * state.orig_height);
-        int fg = 0;
-        for (int p = 0; p < (int)rs.size(); ++p) {
-            bool f = rs[p] > 0.0f;
-            pm[id].data[p] = f ? 255 : 0;
-            if (f) fg++;
-        }
-        ml.last_score = po[id].iou_scores[0];
-        ml.last_seen = fi;
-        float cov = (float)fg / (state.orig_width * state.orig_height);
-        ml.mds_sum += (cov > 0.001f && po[id].obj_score > 0.0f) ? 1 : -1;
-    }
-    for (auto& ml : tracker.pending) {
-        int id = ml.instance_id;
-        auto im = tracker.mem_banks.find(id);
-        if (im == tracker.mem_banks.end() || im->second.empty()) continue;
-        auto p2 = sam3_propagate_single(tracker, state, model, ml, im->second, tracker.ptr_banks[id]);
-        if (!p2.mask_logits.empty()) {
-            ml.last_score = p2.iou_scores[0];
-            ml.last_seen = fi;
-            auto r2 = sam3_bilinear_interpolate(p2.mask_logits.data(),
-                                                p2.mask_w, p2.mask_h, state.orig_width, state.orig_height);
-            int fg2 = 0;
-            for (auto v : r2)
-                if (v > 0.0f) fg2++;
-            float c2 = (float)fg2 / (state.orig_width * state.orig_height);
-            ml.mds_sum += (c2 > 0.001f && p2.obj_score > 0.0f) ? 1 : -1;
-            sam3_encode_memory(tracker, state, model, id,
-                               p2.mask_logits.data(), p2.mask_h, p2.mask_w, fi, false, p2.obj_score);
-            std::vector<float> op(D);
-            sam3_extract_obj_ptr_cpu(model, p2.sam_token.data(), p2.obj_score, op.data());
-            sam3_store_obj_ptr(tracker, model, id, op.data(), fi);
-        }
-    }
+    sam3_propagate_masklets(tracker, state, model, tracker.masklets, fi, pm, &po);
+    // Unlike sam3_propagate_frame, propagated pending masks are not kept in pm.
+    sam3_propagate_masklets(tracker, state, model, tracker.pending, fi, pending_pm, nullptr);
     sam3_result nd;
     if (!tracker.params.text_prompt.empty()) {
         sam3_pcs_params pcs;
@@ -11751,45 +11813,10 @@ sam3_result sam3_track_frame(sam3_tracker& tracker, sam3_state& state,
 
         tracker.pending.push_back(std::move(ml));
     }
-    for (auto& ml : tracker.masklets) {
-        int id = ml.instance_id;
-        auto it = po.find(id);
-        if (it == po.end() || it->second.mask_logits.empty()) continue;
-        sam3_encode_memory(tracker, state, model, id,
-                           it->second.mask_logits.data(), it->second.mask_h, it->second.mask_w, fi, false, it->second.obj_score);
-        std::vector<float> op(D);
-        sam3_extract_obj_ptr_cpu(model, it->second.sam_token.data(), it->second.obj_score, op.data());
-        sam3_store_obj_ptr(tracker, model, id, op.data(), fi);
-    }
-    sam3_update_tracker(tracker, fi);
-
-    // Helper: build detection from a mask and add to result
-    auto add_mask_to_result = [&](int inst_id, float score, const sam3_mask& mask) {
-        if (mask.data.empty()) return;
-        sam3_detection det;
-        det.instance_id = inst_id;
-        det.score = score;
-        det.mask = mask;
-        det.mask.instance_id = inst_id;
-        det.mask.iou_score = score;
-        float x0 = 1e9f, y0 = 1e9f, x1 = -1e9f, y1 = -1e9f;
-        for (int p = 0; p < (int)det.mask.data.size(); ++p)
-            if (det.mask.data[p] > 127) {
-                int x = p % det.mask.width, y = p / det.mask.width;
-                x0 = std::min(x0, (float)x);
-                y0 = std::min(y0, (float)y);
-                x1 = std::max(x1, (float)x);
-                y1 = std::max(y1, (float)y);
-            }
-        if (x0 <= x1) det.box = {x0, y0, x1, y1};
-        result.detections.push_back(std::move(det));
-    };
+    sam3_commit_active_masklets(tracker, state, model, fi, po);
 
     // Include confirmed (active) masklet propagation results
-    for (auto& ml : tracker.masklets) {
-        auto it = pm.find(ml.instance_id);
-        if (it != pm.end()) add_mask_to_result(ml.instance_id, ml.last_score, it->second);
-    }
+    sam3_add_masklet_detections(result, tracker.masklets, pm);
 
     // Include pending masklet results: on the detection frame, use the PCS
     // detection mask; on subsequent frames, use the propagated mask.
@@ -11797,25 +11824,19 @@ sam3_result sam3_track_frame(sam3_tracker& tracker, sam3_state& state,
         auto it = pm.find(ml.instance_id);
         if (it != pm.end() && !it->second.data.empty()) {
             // Propagated mask available (frame > detection frame)
-            add_mask_to_result(ml.instance_id, ml.last_score, it->second);
+            sam3_add_mask_detection(result, ml.instance_id, ml.last_score, it->second);
         } else {
             // First detection frame: use the PCS detection's mask+box directly
             auto di = pending_det_idx.find(ml.instance_id);
             if (di != pending_det_idx.end() && di->second < (int)nd.detections.size()) {
                 const auto& det = nd.detections[di->second];
                 if (!det.mask.data.empty()) {
-                    add_mask_to_result(ml.instance_id, ml.last_score, det.mask);
+                    sam3_add_mask_detection(result, ml.instance_id, ml.last_score, det.mask);
                 }
             }
         }
     }
-    sam3_resolve_overlaps(result.detections);
-    for (auto& d : result.detections) {
-        if (d.mask.data.empty()) continue;
-        sam3_fill_holes(d.mask.data.data(), d.mask.width, d.mask.height, tracker.params.fill_hole_area);
-        sam3_remove_sprinkles(d.mask.data.data(), d.mask.width, d.mask.height, tracker.params.fill_hole_area);
-    }
-    tracker.frame_index++;
+    sam3_finish_tracked_frame(tracker, result);
     SAM3_LOG(2, "%s: frame %d done — %zu tracked\n", __func__, fi, result.detections.size());
     return result;
 }
@@ -11983,127 +12004,20 @@ sam3_result sam3_propagate_frame(
         sam3_tracker& tracker, sam3_state& state,
         const sam3_model& model, const sam3_image& frame) {
     sam3_result result;
-    const int D = model.hparams.neck_dim;
     if (!sam3_encode_image(state, model, frame)) return result;
     int fi = tracker.frame_index;
     fprintf(stderr, "%s: frame %d (%zu active + %zu pending)\n",
             __func__, fi, tracker.masklets.size(), tracker.pending.size());
 
-    // ── Propagate active masklets ────────────────────────────────────────
     std::map<int, sam3_mask> pm;
     std::map<int, sam3_prop_output> po;
-    for (auto& ml : tracker.masklets) {
-        int id = ml.instance_id;
-        auto im = tracker.mem_banks.find(id);
-        if (im == tracker.mem_banks.end() || im->second.empty()) continue;
-        po[id] = sam3_propagate_single(tracker, state, model, ml, im->second, tracker.ptr_banks[id]);
-        if (po[id].mask_logits.empty()) continue;
-        auto rs = sam3_bilinear_interpolate(po[id].mask_logits.data(),
-                                            po[id].mask_w, po[id].mask_h,
-                                            state.orig_width, state.orig_height);
-        pm[id].width = state.orig_width;
-        pm[id].height = state.orig_height;
-        pm[id].data.resize(state.orig_width * state.orig_height);
-        int fg = 0;
-        for (int p = 0; p < (int)rs.size(); ++p) {
-            bool f = rs[p] > 0.0f;
-            pm[id].data[p] = f ? 255 : 0;
-            if (f) fg++;
-        }
-        ml.last_score = po[id].iou_scores[0];
-        ml.last_seen = fi;
-        float cov = (float)fg / (state.orig_width * state.orig_height);
-        ml.mds_sum += (cov > 0.001f && po[id].obj_score > 0.0f) ? 1 : -1;
-    }
+    sam3_propagate_masklets(tracker, state, model, tracker.masklets, fi, pm, &po);
+    sam3_propagate_masklets(tracker, state, model, tracker.pending, fi, pm, nullptr);
+    sam3_commit_active_masklets(tracker, state, model, fi, po);
 
-    // ── Propagate pending masklets ───────────────────────────────────────
-    for (auto& ml : tracker.pending) {
-        int id = ml.instance_id;
-        auto im = tracker.mem_banks.find(id);
-        if (im == tracker.mem_banks.end() || im->second.empty()) continue;
-        auto p2 = sam3_propagate_single(tracker, state, model, ml, im->second, tracker.ptr_banks[id]);
-        if (!p2.mask_logits.empty()) {
-            ml.last_score = p2.iou_scores[0];
-            ml.last_seen = fi;
-            auto r2 = sam3_bilinear_interpolate(p2.mask_logits.data(),
-                                                p2.mask_w, p2.mask_h,
-                                                state.orig_width, state.orig_height);
-            int fg2 = 0;
-            for (auto v : r2)
-                if (v > 0.0f) fg2++;
-            float c2 = (float)fg2 / (state.orig_width * state.orig_height);
-            ml.mds_sum += (c2 > 0.001f && p2.obj_score > 0.0f) ? 1 : -1;
-            pm[id].width = state.orig_width;
-            pm[id].height = state.orig_height;
-            pm[id].data.resize(state.orig_width * state.orig_height);
-            for (int p = 0; p < (int)r2.size(); ++p)
-                pm[id].data[p] = r2[p] > 0.0f ? 255 : 0;
-            sam3_encode_memory(tracker, state, model, id,
-                               p2.mask_logits.data(), p2.mask_h, p2.mask_w,
-                               fi, false, p2.obj_score);
-            std::vector<float> op(D);
-            sam3_extract_obj_ptr_cpu(model, p2.sam_token.data(), p2.obj_score, op.data());
-            sam3_store_obj_ptr(tracker, model, id, op.data(), fi);
-        }
-    }
-
-    // ── Encode memory for active masklets ────────────────────────────────
-    for (auto& ml : tracker.masklets) {
-        int id = ml.instance_id;
-        auto it = po.find(id);
-        if (it == po.end() || it->second.mask_logits.empty()) continue;
-        sam3_encode_memory(tracker, state, model, id,
-                           it->second.mask_logits.data(), it->second.mask_h,
-                           it->second.mask_w, fi, false, it->second.obj_score);
-        std::vector<float> op(D);
-        sam3_extract_obj_ptr_cpu(model, it->second.sam_token.data(),
-                                 it->second.obj_score, op.data());
-        sam3_store_obj_ptr(tracker, model, id, op.data(), fi);
-    }
-
-    // ── Update tracker state (confirmation / eviction) ───────────────────
-    sam3_update_tracker(tracker, fi);
-
-    // ── Build result ─────────────────────────────────────────────────────
-    auto add_mask_to_result = [&](int inst_id, float score, const sam3_mask& mask) {
-        if (mask.data.empty()) return;
-        sam3_detection det;
-        det.instance_id = inst_id;
-        det.score = score;
-        det.mask = mask;
-        det.mask.instance_id = inst_id;
-        det.mask.iou_score = score;
-        float x0 = 1e9f, y0 = 1e9f, x1 = -1e9f, y1 = -1e9f;
-        for (int p = 0; p < (int)det.mask.data.size(); ++p)
-            if (det.mask.data[p] > 127) {
-                int x = p % det.mask.width, y = p / det.mask.width;
-                x0 = std::min(x0, (float)x);
-                y0 = std::min(y0, (float)y);
-                x1 = std::max(x1, (float)x);
-                y1 = std::max(y1, (float)y);
-            }
-        if (x0 <= x1) det.box = {x0, y0, x1, y1};
-        result.detections.push_back(std::move(det));
-    };
-
-    for (auto& ml : tracker.masklets) {
-        auto it = pm.find(ml.instance_id);
-        if (it != pm.end()) add_mask_to_result(ml.instance_id, ml.last_score, it->second);
-    }
-    for (auto& ml : tracker.pending) {
-        auto it = pm.find(ml.instance_id);
-        if (it != pm.end()) add_mask_to_result(ml.instance_id, ml.last_score, it->second);
-    }
-
-    sam3_resolve_overlaps(result.detections);
-    for (auto& d : result.detections) {
-        if (d.mask.data.empty()) continue;
-        sam3_fill_holes(d.mask.data.data(), d.mask.width, d.mask.height,
-                        tracker.params.fill_hole_area);
-        sam3_remove_sprinkles(d.mask.data.data(), d.mask.width, d.mask.height,
-                              tracker.params.fill_hole_area);
-    }
-    tracker.frame_index++;
+    sam3_add_masklet_detections(result, tracker.masklets, pm);
+    sam3_add_masklet_detections(result, tracker.pending, pm);
+    sam3_finish_tracked_frame(tracker, result);
     SAM3_LOG(2, "%s: frame %d done — %zu tracked\n",
              __func__, fi, result.detections.size());
     return result;
