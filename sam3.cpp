@@ -3240,7 +3240,10 @@ std::shared_ptr<sam3_model> sam3_load_model(const sam3_params& params) {
     fprintf(stderr, "%s: %s format v%d, ftype %d, %d tensors\n",
             __func__, is_sam2 ? "SAM2" : "SAM3", version, ftype, n_tensors);
 
-    auto model = std::make_shared<sam3_model>();
+    std::shared_ptr<sam3_model> model(new sam3_model(), [](sam3_model* m) {
+        sam3_free_model(*m);
+        delete m;
+    });
     {
         ggml_type wtype;
         switch (ftype) {
