@@ -21,6 +21,10 @@
  *   --cpu-only            Skip Metal runs
  *   --gpu-only            Skip CPU runs
  *   --filter <substr>     Only run models whose filename contains <substr>
+ *   --detect              Detect mode: run sam3_segment_pcs with a text
+ *                         prompt on every frame instead of point tracking
+ *                         (for detector-only models like SAM 3.1)
+ *   --text-prompt <s>     Text prompt for --detect mode  (default: "cat")
  */
 
 #include "sam3.h"
@@ -201,7 +205,9 @@ static BenchWire run_single_benchmark(const std::string & model_path,
                                        int n_frames,
                                        float px, float py,
                                        int n_threads,
-                                       int encode_img_size) {
+                                       int encode_img_size,
+                                       bool detect_mode,
+                                       const std::string & text_prompt) {
     BenchWire wire = {};
 
     auto fail = [&](const char * msg) {
@@ -234,18 +240,20 @@ static BenchWire run_single_benchmark(const std::string & model_path,
     bool visual_only = sam3_is_visual_only(*model);
     sam3_tracker_ptr tracker;
 
-    if (visual_only) {
-        sam3_visual_track_params vtp;
-        vtp.max_keep_alive    = 100;
-        vtp.recondition_every = 16;
-        tracker = sam3_create_visual_tracker(*model, vtp);
-    } else {
-        sam3_video_params vp;
-        vp.hotstart_delay = 0;
-        vp.max_keep_alive = 100;
-        tracker = sam3_create_tracker(*model, vp);
+    if (!detect_mode) {
+        if (visual_only) {
+            sam3_visual_track_params vtp;
+            vtp.max_keep_alive    = 100;
+            vtp.recondition_every = 16;
+            tracker = sam3_create_visual_tracker(*model, vtp);
+        } else {
+            sam3_video_params vp;
+            vp.hotstart_delay = 0;
+            vp.max_keep_alive = 100;
+            tracker = sam3_create_tracker(*model, vp);
+        }
+        if (!tracker) { fail("tracker failed"); return wire; }
     }
-    if (!tracker) { fail("tracker failed"); return wire; }
 
     wire.t_load_ms = (ggml_time_us() - t0) / 1000.0;
 
@@ -254,6 +262,43 @@ static BenchWire run_single_benchmark(const std::string & model_path,
 
     if (!sam3_encode_image(*state, *model, frames[0])) {
         fail("encode f0 failed"); return wire;
+    }
+
+    sam3_result last_result;
+
+    if (detect_mode) {
+        sam3_pcs_params pcs;
+        pcs.text_prompt = text_prompt;
+        pcs.score_threshold = 0.3f;
+        pcs.nms_threshold   = 0.1f;
+        last_result = sam3_segment_pcs(*state, *model, pcs);
+
+        wire.t_frame0_ms = (ggml_time_us() - t0) / 1000.0;
+
+        // Frames 1..N-1: encode + detect
+        double t_detect_sum = 0.0;
+        for (int f = 1; f < n_frames; f++) {
+            t0 = ggml_time_us();
+
+            if (!sam3_encode_image(*state, *model, frames[f])) {
+                fail("encode failed"); return wire;
+            }
+            last_result = sam3_segment_pcs(*state, *model, pcs);
+
+            double dt = (ggml_time_us() - t0) / 1000.0;
+            t_detect_sum += dt;
+
+            fprintf(stderr, "    frame %d/%d  %.0f ms  (%zu det)\n",
+                    f, n_frames - 1, dt, last_result.detections.size());
+        }
+
+        if (n_frames > 1) {
+            wire.t_track_avg_ms = t_detect_sum / (n_frames - 1);
+        }
+        wire.t_total_ms   = wire.t_frame0_ms + t_detect_sum;
+        wire.n_detections = (int)last_result.detections.size();
+        wire.ok           = 1;
+        return wire;
     }
 
     sam3_pvs_params pvs;
@@ -267,7 +312,6 @@ static BenchWire run_single_benchmark(const std::string & model_path,
 
     // Frames 1..N-1: track / propagate
     double t_track_sum = 0.0;
-    sam3_result last_result;
 
     for (int f = 1; f < n_frames; f++) {
         t0 = ggml_time_us();
@@ -306,9 +350,12 @@ static void child_benchmark(const std::string & model_path,
                              float px, float py,
                              int n_threads,
                              int encode_img_size,
+                             bool detect_mode,
+                             const std::string & text_prompt,
                              int write_fd) {
     BenchWire wire = run_single_benchmark(model_path, use_gpu, video_path,
-                                           n_frames, px, py, n_threads, encode_img_size);
+                                           n_frames, px, py, n_threads, encode_img_size,
+                                           detect_mode, text_prompt);
     (void)write(write_fd, &wire, sizeof(wire));
     close(write_fd);
     _exit(wire.ok ? 0 : 1);
@@ -321,7 +368,9 @@ static BenchResult run_benchmark_isolated(const ModelEntry & entry,
                                            int n_frames,
                                            float px, float py,
                                            int n_threads,
-                                           int encode_img_size = 0) {
+                                           int encode_img_size,
+                                           bool detect_mode,
+                                           const std::string & text_prompt) {
     BenchResult res;
     res.model_name = entry.name;
     res.backend    = use_gpu ? "Metal" : "CPU";
@@ -330,7 +379,8 @@ static BenchResult run_benchmark_isolated(const ModelEntry & entry,
 #ifdef _WIN32
     // Windows: run in-process (no crash isolation)
     BenchWire wire = run_single_benchmark(entry.path, use_gpu, video_path,
-                                           n_frames, px, py, n_threads, encode_img_size);
+                                           n_frames, px, py, n_threads, encode_img_size,
+                                           detect_mode, text_prompt);
     if (wire.ok) {
         res.t_load_ms      = wire.t_load_ms;
         res.t_frame0_ms    = wire.t_frame0_ms;
@@ -360,7 +410,8 @@ static BenchResult run_benchmark_isolated(const ModelEntry & entry,
         // Child
         close(pipefd[0]);
         child_benchmark(entry.path, use_gpu, video_path,
-                        n_frames, px, py, n_threads, encode_img_size, pipefd[1]);
+                        n_frames, px, py, n_threads, encode_img_size,
+                        detect_mode, text_prompt, pipefd[1]);
         _exit(1);
     }
 
@@ -399,15 +450,26 @@ static BenchResult run_benchmark_isolated(const ModelEntry & entry,
 
 static void print_table(const std::vector<BenchResult> & results,
                          const std::string & video_path,
-                         float px, float py, int n_frames, int n_threads) {
+                         float px, float py, int n_frames, int n_threads,
+                         bool detect_mode, const std::string & text_prompt) {
     printf("\n");
     printf("=========================================================================================================\n");
-    printf("SAM3.CPP BENCHMARK  —  %d frames, point=(%.1f, %.1f), threads=%d\n", n_frames, px, py, n_threads);
+    if (detect_mode) {
+        printf("SAM3.CPP BENCHMARK (DETECT)  —  %d frames, text='%s', threads=%d\n",
+               n_frames, text_prompt.c_str(), n_threads);
+    } else {
+        printf("SAM3.CPP BENCHMARK  —  %d frames, point=(%.1f, %.1f), threads=%d\n", n_frames, px, py, n_threads);
+    }
     printf("video: %s\n", video_path.c_str());
     printf("=========================================================================================================\n\n");
 
-    printf("  %3s | %-36s | %7s | %6s | %9s | %9s | %13s | %10s | %3s | %s\n",
-           "#", "Model", "Size", "Backend", "Load (ms)", "Init (ms)", "Track/fr (ms)", "Total (ms)", "Det", "Status");
+    if (detect_mode) {
+        printf("  %3s | %-36s | %7s | %6s | %9s | %10s | %11s | %10s | %3s | %s\n",
+               "#", "Model", "Size", "Backend", "Load (ms)", "Det/fr0 (ms)", "Det/fr (ms)", "Total (ms)", "Det", "Status");
+    } else {
+        printf("  %3s | %-36s | %7s | %6s | %9s | %9s | %13s | %10s | %3s | %s\n",
+               "#", "Model", "Size", "Backend", "Load (ms)", "Init (ms)", "Track/fr (ms)", "Total (ms)", "Det", "Status");
+    }
     printf("------+--------------------------------------+---------+--------+-----------+-----------+---------------+------------+-----+--------\n");
 
     for (size_t i = 0; i < results.size(); i++) {
@@ -454,6 +516,8 @@ int main(int argc, char ** argv) {
     int         encode_img_size = 0;
     bool        cpu_only        = false;
     bool        gpu_only        = false;
+    bool        detect_mode     = false;
+    std::string text_prompt     = "cat";
     std::string filter;
 
     for (int i = 1; i < argc; i++) {
@@ -467,6 +531,8 @@ int main(int argc, char ** argv) {
         else if (arg == "--encode-img-size" && i + 1 < argc) { encode_img_size = atoi(argv[++i]); }
         else if (arg == "--cpu-only")  { cpu_only = true; }
         else if (arg == "--gpu-only")  { gpu_only = true; }
+        else if (arg == "--detect")    { detect_mode = true; }
+        else if (arg == "--text-prompt" && i + 1 < argc) { text_prompt = argv[++i]; }
         else if (arg == "--filter"     && i + 1 < argc) { filter = argv[++i]; }
         else if (arg == "--help" || arg == "-h") {
             fprintf(stderr,
@@ -479,6 +545,8 @@ int main(int argc, char ** argv) {
                 "  --n-threads <n>       CPU threads            (default: 4)\n"
                 "  --cpu-only            Skip Metal runs\n"
                 "  --gpu-only            Skip CPU runs\n"
+                "  --detect              Detect mode (text-prompt PCS per frame)\n"
+                "  --text-prompt <s>     Text prompt for --detect (default: cat)\n"
                 "  --filter <substr>     Filter model filenames\n",
                 argv[0]);
             return 0;
@@ -557,7 +625,8 @@ int main(int argc, char ** argv) {
                 i + 1, runs.size(), run.entry->name.c_str(), backend_str);
 
         auto res = run_benchmark_isolated(*run.entry, run.use_gpu, video_path,
-                                           n_frames, px, py, n_threads, encode_img_size);
+                                           n_frames, px, py, n_threads, encode_img_size,
+                                           detect_mode, text_prompt);
         results.push_back(res);
 
         if (res.success) {
@@ -571,7 +640,7 @@ int main(int argc, char ** argv) {
     double t_wall_ms = (ggml_time_us() - t_wall_start) / 1000.0;
 
     // Print table
-    print_table(results, video_path, px, py, n_frames, n_threads);
+    print_table(results, video_path, px, py, n_frames, n_threads, detect_mode, text_prompt);
 
     double t_wall_s = t_wall_ms / 1000.0;
     int mins = (int)(t_wall_s / 60.0);

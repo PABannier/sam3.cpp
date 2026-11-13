@@ -5,7 +5,11 @@
  * Python reference.
  *
  * Usage:
- *   ./test_e2e_pcs <model.ggml> <ref_dir>
+ *   ./test_e2e_pcs [--gpu] [--n-threads N] <model.ggml> <ref_dir>
+ *
+ *   --gpu        request the GPU backend (Metal on macOS; HIP/CUDA when the
+ *                ggml build provides it). Falls back to CPU otherwise.
+ *   --n-threads  CPU thread count (default 4).
  *
  * ref_dir should contain pcs_ref/ with tensors from dump_e2e_pcs.py:
  *   - preprocessed_chw.bin/.shape
@@ -22,8 +26,10 @@
 #include "test_utils.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <string>
 #include <vector>
 
@@ -105,24 +111,47 @@ static metric_row compare_flat(const char * stage, const char * label,
     return compute_full_metrics(cpp.data.data(), ref.data.data(), n, atol);
 }
 
+static double now_ms() {
+    return std::chrono::duration_cast<std::chrono::duration<double, std::milli>>(
+               std::chrono::steady_clock::now().time_since_epoch())
+        .count();
+}
+
 int main(int argc, char ** argv) {
-    if (argc < 3) {
-        fprintf(stderr, "Usage: %s <model.ggml> <ref_dir>\n", argv[0]);
+    bool use_gpu = false;
+    int n_threads = 4;
+    std::vector<std::string> positional;
+    for (int i = 1; i < argc; ++i) {
+        std::string arg = argv[i];
+        if (arg == "--gpu") {
+            use_gpu = true;
+        } else if (arg == "--n-threads" && i + 1 < argc) {
+            n_threads = atoi(argv[++i]);
+        } else if (!arg.empty() && arg[0] == '-') {
+            fprintf(stderr, "Unknown argument: %s\n", arg.c_str());
+            return 1;
+        } else {
+            positional.push_back(arg);
+        }
+    }
+    if (positional.size() < 2) {
+        fprintf(stderr, "Usage: %s [--gpu] [--n-threads N] <model.ggml> <ref_dir>\n", argv[0]);
         fprintf(stderr, "\nref_dir should contain pcs_ref/ from dump_e2e_pcs.py\n");
         return 1;
     }
 
-    const std::string model_path = argv[1];
-    const std::string ref_dir = std::string(argv[2]) + "/pcs_ref";
-    const std::string cpp_out = std::string(argv[2]) + "/pcs_cpp";
+    const std::string model_path = positional[0];
+    const std::string ref_dir = positional[1] + "/pcs_ref";
+    const std::string cpp_out = positional[1] + "/pcs_cpp";
     ensure_dir(cpp_out);
 
     // ═══ Load model ═══
     fprintf(stderr, "\n═══ Loading model ═══\n");
     sam3_params params;
     params.model_path = model_path;
-    params.use_gpu = false;
-    params.n_threads = 4;
+    params.use_gpu = use_gpu;
+    params.n_threads = n_threads;
+    fprintf(stderr, "  use_gpu = %d, n_threads = %d\n", use_gpu, n_threads);
 
     auto model = sam3_load_model(params);
     if (!model) {
@@ -146,12 +175,14 @@ int main(int argc, char ** argv) {
     fprintf(stderr, "  Loaded preprocessed image: %d elements\n", ref_img.numel());
 
     const int img_size = 1008;
+    double t_encode0 = now_ms();
     bool ok = sam3_encode_image_from_preprocessed(*state, *model, ref_img.data.data(), img_size);
+    double t_encode = now_ms() - t_encode0;
     if (!ok) {
         fprintf(stderr, "sam3_encode_image_from_preprocessed failed!\n");
         return 1;
     }
-    fprintf(stderr, "  Image encoded successfully\n");
+    fprintf(stderr, "  Image encoded successfully (%.1f ms)\n", t_encode);
 
     // ═══ Stage 2: Dump ViT block outputs (from state debug tensors) ═══
     fprintf(stderr, "\n═══ Stage 2: ViT Backbone ═══\n");
@@ -240,11 +271,13 @@ int main(int argc, char ** argv) {
     // Run the full phase 5 dump (text encoder + fusion encoder + DETR decoder + seg head)
     const std::string phase5_out = cpp_out + "/phase5";
     ensure_dir(phase5_out);
+    double t_phase5_0 = now_ms();
     if (!sam3_test_dump_phase5(*model, *state, token_ids, phase5_out, params.n_threads)) {
         fprintf(stderr, "  [FAIL] sam3_test_dump_phase5 failed\n");
         return 1;
     }
-    fprintf(stderr, "  Phase 5 tensors dumped to %s\n", phase5_out.c_str());
+    double t_phase5 = now_ms() - t_phase5_0;
+    fprintf(stderr, "  Phase 5 tensors dumped to %s (%.1f ms)\n", phase5_out.c_str(), t_phase5);
 
     // ═══ Compare text encoder ═══
     fprintf(stderr, "\n  --- Text Encoder ---\n");
@@ -333,6 +366,7 @@ int main(int argc, char ** argv) {
     fprintf(stderr, "\n═══ Running sam3_segment_pcs (end-to-end) ═══\n");
 
     // Re-encode image (sam3_test_dump_phase5 may have invalidated state)
+    double t_e2e_0 = now_ms();
     ok = sam3_encode_image_from_preprocessed(*state, *model, ref_img.data.data(), img_size);
     if (!ok) {
         fprintf(stderr, "Failed to re-encode image\n");
@@ -345,6 +379,8 @@ int main(int argc, char ** argv) {
     pcs.nms_threshold = 0.1f;
 
     sam3_result result = sam3_segment_pcs(*state, *model, pcs);
+    double t_e2e = now_ms() - t_e2e_0;
+    fprintf(stderr, "  sam3_segment_pcs total (re-encode + detect): %.1f ms\n", t_e2e);
 
     fprintf(stderr, "\n  C++ detections: %zu\n", result.detections.size());
     for (size_t i = 0; i < result.detections.size(); ++i) {
@@ -451,6 +487,11 @@ int main(int argc, char ** argv) {
     fprintf(stderr, "  TOTAL: %d PASS, %d FAIL, %d SKIP out of %d tensors\n",
             n_pass, n_fail, n_skip, (int)report.size());
     fprintf(stderr, "══════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════\n\n");
+
+    fprintf(stderr, "═══ PERFORMANCE SUMMARY (%s) ═══\n", use_gpu ? "GPU requested" : "CPU");
+    fprintf(stderr, "  Stage 1 (encode ViT + neck):              %10.1f ms\n", t_encode);
+    fprintf(stderr, "  Stage 4-9 (text + fenc + ddec + seg dump):%10.1f ms\n", t_phase5);
+    fprintf(stderr, "  E2E (re-encode + sam3_segment_pcs):       %10.1f ms\n", t_e2e);
 
     // Save mask for visual comparison
     if (!result.detections.empty()) {
