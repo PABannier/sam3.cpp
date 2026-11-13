@@ -9460,6 +9460,23 @@ static void sam3_remove_sprinkles(uint8_t* mask, int w, int h, int area_threshol
     }
 }
 
+// Public post-processing: fill enclosed holes and remove small foreground
+// sprinkles from a binary mask. Pass 0 to disable a stage.
+void sam3_postprocess_mask(sam3_mask & mask, int min_area, int fill_hole_area) {
+    if (mask.data.empty() || mask.width <= 0 || mask.height <= 0) {
+        return;
+    }
+    if ((int) mask.data.size() < mask.width * mask.height) {
+        return;
+    }
+    if (fill_hole_area > 0) {
+        sam3_fill_holes(mask.data.data(), mask.width, mask.height, fill_hole_area);
+    }
+    if (min_area > 0) {
+        sam3_remove_sprinkles(mask.data.data(), mask.width, mask.height, min_area);
+    }
+}
+
 // Resolve overlapping masks: higher-scoring instances take priority.
 static void sam3_resolve_overlaps(std::vector<sam3_detection>& dets) {
     if (dets.size() <= 1) return;
@@ -11946,6 +11963,57 @@ sam3_image sam3_decode_video_frame(const std::string& video_path, int frame_inde
     }
 
     return img;
+}
+
+struct sam3_video_decoder {
+    FILE * pipe = nullptr;
+    int width  = 0;
+    int height = 0;
+    std::vector<uint8_t> buf;
+};
+
+sam3_video_decoder * sam3_video_decoder_open(const std::string& video_path, int width, int height) {
+    if (width <= 0 || height <= 0) return nullptr;
+
+    char cmd[1024];
+    snprintf(cmd, sizeof(cmd),
+             "ffmpeg -nostdin -loglevel error -i \"%s\" "
+             "-f rawvideo -pix_fmt rgb24 pipe:1 2>%s",
+             video_path.c_str(), SAM3_NULL_DEV);
+    FILE* fp = popen(cmd, SAM3_POPEN_READ);
+    if (!fp) return nullptr;
+
+    auto* dec = new sam3_video_decoder();
+    dec->pipe = fp;
+    dec->width = width;
+    dec->height = height;
+    dec->buf.resize(static_cast<size_t>(width) * height * 3);
+    return dec;
+}
+
+bool sam3_video_decoder_read(sam3_video_decoder* dec, sam3_image& frame) {
+    if (!dec || !dec->pipe) return false;
+
+    const size_t need = dec->buf.size();
+    size_t got = 0;
+    while (got < need) {
+        size_t n = fread(dec->buf.data() + got, 1, need - got, dec->pipe);
+        if (n == 0) break;  // EOF or read error
+        got += n;
+    }
+    if (got != need) return false;
+
+    frame.width = dec->width;
+    frame.height = dec->height;
+    frame.channels = 3;
+    frame.data = dec->buf;
+    return true;
+}
+
+void sam3_video_decoder_close(sam3_video_decoder* dec) {
+    if (!dec) return;
+    if (dec->pipe) pclose(dec->pipe);
+    delete dec;
 }
 
 sam3_video_info sam3_get_video_info(const std::string& video_path) {
