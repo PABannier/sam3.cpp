@@ -10,6 +10,15 @@ target_link_libraries(sam3_benchmark PRIVATE sam3)
 add_executable(sam3_profile_edgetam profile_edgetam.cpp)
 target_link_libraries(sam3_profile_edgetam PRIVATE sam3)
 
+# HTTP server (cpp-httplib + nlohmann/json vendored in sam3-server/)
+find_package(Threads REQUIRED)
+add_executable(sam3-server sam3-server/server.cpp)
+target_include_directories(sam3-server PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/sam3-server
+    ${CMAKE_CURRENT_SOURCE_DIR}/..
+)
+target_link_libraries(sam3-server PRIVATE sam3 Threads::Threads)
+
 # SDL2 + ImGui are optional — build only if SDL2 is found.
 find_package(SDL2 QUIET)
 

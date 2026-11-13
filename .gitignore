@@ -37,5 +37,8 @@ raw_weights/
 # Test data
 data/
 
+# Case validation artifacts
+tests/cases/*/cmp.png
+
 # ImGui runtime layout
 imgui.ini

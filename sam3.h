@@ -97,6 +97,7 @@ struct sam3_params {
     int         n_threads       = 4;
     bool        use_gpu         = true;
     int         encode_img_size = 0;  // 0 = model default; override input resolution
+    int         gpu_device      = 0;  // GPU device index (CUDA/HIP)
 };
 
 struct sam3_tensor_info {
@@ -305,6 +306,24 @@ sam3_image      sam3_load_image(const std::string & path);
 bool            sam3_save_mask(const sam3_mask & mask, const std::string & path);
 sam3_image      sam3_decode_video_frame(const std::string & video_path, int frame_index);
 sam3_video_info sam3_get_video_info(const std::string & video_path);
+
+struct sam3_video_decoder;
+
+/*
+** Sequential video reader: one ffmpeg process decodes the stream once and
+** frames are read in order as raw RGB24.  Much cheaper than per-frame random
+** access (which restarts decoding from the beginning for every frame).
+** width/height must match sam3_get_video_info(); read() returns false at
+** end of stream or on decode error.  Close with sam3_video_decoder_close().
+*/
+sam3_video_decoder * sam3_video_decoder_open(const std::string & video_path, int width, int height);
+bool                 sam3_video_decoder_read(sam3_video_decoder * decoder, sam3_image & frame);
+void                 sam3_video_decoder_close(sam3_video_decoder * decoder);
+
+// Binary-mask post-processing: fill enclosed holes with area <= fill_hole_area
+// and remove foreground components with area <= min_area (sprinkle removal).
+// Pass 0 to disable a stage.
+void            sam3_postprocess_mask(sam3_mask & mask, int min_area, int fill_hole_area);
 
 /*****************************************************************************
 ** Test and Debug API
