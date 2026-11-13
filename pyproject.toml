@@ -11,6 +11,8 @@ dependencies = [
     "numpy>=1.24",
     "iopath>=0.1.10",
     "einops>=0.7",
+    "transformers>=4.40",
+    "safetensors>=0.4",
 ]
 
 [tool.hatch.build.targets.wheel]

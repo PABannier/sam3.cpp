@@ -144,6 +144,25 @@ All models are available in GGML format on Hugging Face:
 | sam3-visual | q4_1 | 318 MB | Same |
 | sam3-visual | q4_0 | 289 MB | Same |
 
+### SAM 3.1 (detector-only, converted from transformers weights)
+
+| Variant | Precision | Size | Features |
+|---------|-----------|------|----------|
+| sam3.1 | f32 | 3.4 GB | Text/box-prompted detection (PCS) only — no tracker weights (PVS/tracking APIs return an error) |
+| sam3.1 | f16 | 1.8 GB | Same |
+
+Convert from `transformers` safetensors (e.g. `unsloth/sam3.1`):
+
+```bash
+python convert_sam31_to_ggml.py \
+    --model models/sam3.1/model.safetensors \
+    --tokenizer models/sam3.1 \
+    --output models/sam3.1-f16.ggml
+```
+
+The gated `facebook/sam3.1_multiplex.pt` contains the multi-object tracker; it is not
+supported yet, so the detector-only variant above covers text/box → masks/boxes/scores.
+
 ### SAM 2 / SAM 2.1 (Hiera backbone, 4 sizes)
 
 | Family | Size | Params | f32 | f16 | q8_0 | q4_1 | q4_0 |
@@ -167,15 +186,15 @@ All models are available in GGML format on Hugging Face:
 
 ### Feature Matrix
 
-| Capability | SAM 3 | SAM 3 Visual | SAM 2 / 2.1 | EdgeTAM |
-|-----------|-------|-------------|-------------|---------|
-| Text-prompted detection (PCS) | Yes | - | - | - |
-| Point/box segmentation (PVS) | Yes | Yes | Yes | Yes |
-| Multi-mask output | Yes | Yes | Yes | Yes |
-| Video tracking (memory bank) | Yes | Yes | Yes | Yes |
-| Interactive refinement | Yes | Yes | Yes | Yes |
-| Quantization (Q4/Q8) | Yes | Yes | Yes | Yes |
-| Metal GPU | Yes | Yes | Yes | Yes |
+| Capability | SAM 3 | SAM 3.1 | SAM 3 Visual | SAM 2 / 2.1 | EdgeTAM |
+|-----------|-------|---------|-------------|-------------|---------|
+| Text-prompted detection (PCS) | Yes | Yes | - | - | - |
+| Point/box segmentation (PVS) | Yes | - | Yes | Yes | Yes |
+| Multi-mask output | Yes | - | Yes | Yes | Yes |
+| Video tracking (memory bank) | Yes | - | Yes | Yes | Yes |
+| Interactive refinement | Yes | - | Yes | Yes | Yes |
+| Quantization (Q4/Q8) | Yes | - | Yes | Yes | Yes |
+| Metal GPU | Yes | Yes | Yes | Yes | Yes |
 
 ## Building from Source
 
